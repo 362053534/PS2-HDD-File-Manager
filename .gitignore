@@ -1,3 +1,5 @@
 bin/
 obj/
 TestData/*.img
+CODEX_CONTEXT_FULL.md
+PROJECT_CONTEXT_BACKUP.md
