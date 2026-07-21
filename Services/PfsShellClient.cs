@@ -132,7 +132,7 @@ internal sealed class PfsShellClient
         var extension = Path.GetExtension(originalName);
         var stagingName = IsAscii(originalName)
             ? originalName
-            : "payload" + (IsAscii(extension) ? extension : ".bin");
+            : "payload_" + Guid.NewGuid().ToString("N")[..8] + (IsAscii(extension) ? extension : ".bin");
         var stagingPath = Path.Combine(stagingRoot, stagingName);
         try
         {
