@@ -24,6 +24,12 @@ internal sealed class PfsShellClient
     public Task<ProcessResult> ListPartitionsAsync(string device, CancellationToken cancellationToken) =>
         RunSessionAsync(device, [], "ls", cancellationToken);
 
+    public Task<ProcessResult> CreatePfsPartitionAsync(string device, string name, string size, CancellationToken cancellationToken) =>
+        RunSessionAsync(device, [], $"mkpart {Quote(name)} {Quote(size)} PFS", cancellationToken);
+
+    public Task<ProcessResult> RemovePartitionAsync(string device, string name, CancellationToken cancellationToken) =>
+        RunSessionAsync(device, [], $"rmpart {Quote(name)}", cancellationToken);
+
     public async Task<IReadOnlyList<string>> FilterBrowsablePfsPartitionsAsync(
         string device,
         IReadOnlyList<string> partitions,
@@ -43,7 +49,14 @@ internal sealed class PfsShellClient
     public Task<ProcessResult> ListDirectoryAsync(string device, string partition, string remoteDirectory, CancellationToken cancellationToken) =>
         RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), "ls -l", cancellationToken);
 
-    public async Task<ProcessResult> ExportAsync(string device, string partition, string remoteDirectory, string fileName, string destination, CancellationToken cancellationToken)
+    public async Task<ProcessResult> ExportAsync(
+        string device,
+        string partition,
+        string remoteDirectory,
+        string fileName,
+        string destination,
+        CancellationToken cancellationToken,
+        Func<long, Task>? progress = null)
     {
         if (string.IsNullOrWhiteSpace(fileName))
             throw new ArgumentException("The remote file has no name.");
@@ -60,16 +73,26 @@ internal sealed class PfsShellClient
             var command = string.Equals(stagingName, fileName, StringComparison.Ordinal)
                 ? $"lcd {Quote(stagingRoot)}{Environment.NewLine}get {Quote(stagingName)}"
                 : $"lcd {Quote(stagingRoot)}{Environment.NewLine}rename {Quote(fileName)} {Quote(stagingName)}{Environment.NewLine}get {Quote(stagingName)}{Environment.NewLine}rename {Quote(stagingName)} {Quote(fileName)}";
-            var result = await RunMountedSessionAsync(
+            var exportedPath = Path.Combine(stagingRoot, stagingName);
+            var sessionTask = RunMountedSessionAsync(
                 device,
                 partition,
                 PathParts(remoteDirectory),
                 command,
                 cancellationToken);
+            while (!sessionTask.IsCompleted && progress is not null)
+            {
+                await Task.WhenAny(sessionTask, Task.Delay(350, cancellationToken));
+                if (File.Exists(exportedPath))
+                {
+                    try { await progress(new FileInfo(exportedPath).Length); }
+                    catch (IOException) { }
+                }
+            }
+            var result = await sessionTask;
             if (!IsSuccessfulSession(result))
                 return result;
 
-            var exportedPath = Path.Combine(stagingRoot, stagingName);
             if (!File.Exists(exportedPath))
             {
                 return new ProcessResult(
@@ -77,6 +100,8 @@ internal sealed class PfsShellClient
                     result.StandardOutput,
                     string.Join(Environment.NewLine, new[] { result.StandardError, $"Exported file missing: {stagingName}" }.Where(text => !string.IsNullOrWhiteSpace(text))));
             }
+            if (progress is not null)
+                await progress(new FileInfo(exportedPath).Length);
 
             // 本地目标名按系统 ACP 解码，便于资源管理器显示；shell 侧仍用保真字节名。
             var targetPath = Path.Combine(destination, PfsNameEncoding.ToDisplay(fileName));
@@ -172,7 +197,9 @@ internal sealed class PfsShellClient
             script.AppendLine($"cd {Quote(part)}");
         foreach (var line in command.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n', StringSplitOptions.RemoveEmptyEntries))
             script.AppendLine(line);
-        script.AppendLine("umount");
+        // 仅实际 mount 过时才需要 umount；对 mkpart/rmpart 执行 umount 会产生无意义的错误输出。
+        if (mountPartition is not null)
+            script.AppendLine("umount");
         script.AppendLine("exit");
         // Latin-1 保真传输原始文件名字节；用户可见名称由 PfsNameEncoding.ToDisplay 再按 ACP 解码。
         return await ProcessRunner.RunAsync(
@@ -209,7 +236,7 @@ internal sealed class PfsShellClient
         foreach (var line in UsefulLines(output))
         {
             var trimmed = line.Trim();
-            var listing = Regex.Match(trimmed, @"^(?<mode>[d-][rwx-]{9})\s+\d+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(?<name>.+?)/*$");
+            var listing = Regex.Match(trimmed, @"^(?<mode>[d-][rwx-]{9})\s+(?<size>\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(?<name>.+?)/*$");
             if (!listing.Success)
                 continue;
 
@@ -218,7 +245,8 @@ internal sealed class PfsShellClient
                 continue;
 
             var isDirectory = listing.Groups["mode"].Value.StartsWith('d');
-            entries.Add(new PfsEntry(name, isDirectory, trimmed));
+            _ = long.TryParse(listing.Groups["size"].Value, out var size);
+            entries.Add(new PfsEntry(name, isDirectory, trimmed, size));
         }
 
         return entries

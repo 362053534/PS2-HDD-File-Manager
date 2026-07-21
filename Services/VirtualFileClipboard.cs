@@ -6,7 +6,7 @@ using FormsDataObject = System.Windows.Forms.IDataObject;
 
 namespace PfsExplorerLite.Services;
 
-internal sealed record DeferredPfsFile(string RelativePath, string RemoteDirectory, string Name, bool IsDirectory);
+internal sealed record DeferredPfsFile(string RelativePath, string RemoteDirectory, string Name, bool IsDirectory, long Size = 0);
 
 /// <summary>
 /// Windows Shell virtual-file clipboard source. The file list and contents are resolved only when
@@ -78,7 +78,8 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
                     return;
                 }
 
-                medium = CreateStreamMedium(new ManagedFileStream(_materializeFile(file)));
+                medium = CreateStreamMedium(new ManagedFileStream(() =>
+                    new FileStream(_materializeFile(file), FileMode.Open, FileAccess.Read, FileShare.Read)));
                 return;
             }
 
@@ -265,7 +266,10 @@ internal static class VirtualFileClipboard
         var dataObject = new DataObject();
         dataObject.SetData("FileGroupDescriptorW", autoConvert: false, new MemoryStream(VirtualFileClipboardDataObject.BuildFileGroupDescriptor(files, unicode: true), writable: false));
         dataObject.SetData("FileGroupDescriptor", autoConvert: false, new MemoryStream(VirtualFileClipboardDataObject.BuildFileGroupDescriptor(files, unicode: false), writable: false));
-        dataObject.SetData("FileContents", autoConvert: false, new DeferredReadStream(() => new FileStream(materializeFile(), FileMode.Open, FileAccess.Read, FileShare.Read)));
+        dataObject.SetData(
+            "FileContents",
+            autoConvert: false,
+            new DeferredReadStream(() => new FileStream(materializeFile(), FileMode.Open, FileAccess.Read, FileShare.Read)));
         dataObject.SetData("Preferred DropEffect", autoConvert: false, new MemoryStream(BitConverter.GetBytes(1u), writable: false));
         return dataObject;
     }
@@ -284,9 +288,26 @@ internal static class VirtualFileClipboard
 internal sealed class DeferredReadStream : Stream
 {
     private readonly Func<Stream> _factory;
+    private Task<Stream>? _factoryTask;
     private Stream? _inner;
     public DeferredReadStream(Func<Stream> factory) => _factory = factory;
-    private Stream Inner => _inner ??= _factory();
+    private Stream Inner => _inner ??= WaitForFactory();
+
+    private Stream WaitForFactory()
+    {
+        var task = _factoryTask ??= Task.Run(_factory);
+        // OLE 有时会在主 STA 线程读取虚拟流。同步等待期间继续派发窗口消息，
+        // 让主窗体能重绘 PFS 导出进度，而不是整窗显示“未响应”。
+        if (Application.MessageLoop)
+        {
+            while (!task.IsCompleted)
+            {
+                Application.DoEvents();
+                Thread.Sleep(15);
+            }
+        }
+        return task.GetAwaiter().GetResult();
+    }
     public override bool CanRead => true;
     public override bool CanSeek => true;
     public override bool CanWrite => false;
@@ -310,6 +331,7 @@ internal sealed class ManagedFileStream : IStream
     private readonly Stream _stream;
     public ManagedFileStream(string path) => _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
     private ManagedFileStream(Stream stream) => _stream = stream;
+    internal ManagedFileStream(Func<Stream> factory) => _stream = new DeferredReadStream(factory);
     public static ManagedFileStream Empty() => new(new MemoryStream());
 
     public void Read(byte[] pv, int cb, IntPtr pcbRead)

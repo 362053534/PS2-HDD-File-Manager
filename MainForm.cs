@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Diagnostics;
 using PfsExplorerLite.Models;
 using PfsExplorerLite.Services;
 
@@ -15,8 +16,13 @@ internal sealed class MainForm : Form
     private readonly PfsShellClient _pfs;
     private readonly NbdClient _nbd;
     private readonly DiskDiscovery _diskDiscovery;
+    private readonly ApaSpaceReader _apaSpaceReader;
+    private readonly ApaPartitionTableReader _apaPartitionTableReader;
+    private readonly PfsSpaceReader _pfsSpaceReader;
     private readonly ComboBox _deviceCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 549 };
+    private readonly Button _refreshDisksButton = new() { Text = "刷新", AutoSize = true, Margin = new Padding(4) };
     private readonly TextBox _pathBox = new() { ReadOnly = true, Width = 510, Text = "/" };
+    private readonly Label _diskSpaceLabel = new() { AutoSize = true, Padding = new Padding(8, 3, 0, 0), Text = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—" };
     private readonly ListView _entries = new BrowserListView { View = View.Details, FullRowSelect = true, MultiSelect = true, LabelEdit = true, Dock = DockStyle.Fill };
     private readonly ContextMenuStrip _entryMenu = new();
     private readonly ToolStripMenuItem _copyMenuItem = new("复制");
@@ -24,12 +30,21 @@ internal sealed class MainForm : Form
     private readonly ToolStripMenuItem _renameMenuItem = new("重命名");
     private readonly ToolStripMenuItem _pasteMenuItem = new("粘贴");
     private readonly ToolStripMenuItem _newDirectoryMenuItem = new("新建目录");
+    private readonly ToolStripMenuItem _newPartitionMenuItem = new("新建 PFS 分区");
+    private readonly ToolStripMenuItem _deletePartitionMenuItem = new("删除 PFS 分区");
     private readonly ToolStripMenuItem _refreshMenuItem = new("刷新");
     private readonly ToolStripSeparator _entryMenuSeparator = new();
     private readonly ToolStripSeparator _entryMenuSeparator2 = new();
     private readonly TextBox _log = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, Dock = DockStyle.Fill, Font = new Font(FontFamily.GenericMonospace, 9F) };
+    private readonly StatusStrip _statusBar = new();
+    private readonly ToolStripStatusLabel _statusLabel = new() { Text = "就绪", Spring = true, TextAlign = ContentAlignment.MiddleLeft };
+    private readonly ToolStripProgressBar _progressBar = new() { Visible = false, AutoSize = false, Width = 260 };
+    private readonly ToolStripStatusLabel _transferSpeedLabel = new() { Visible = false, AutoSize = false, Width = 110, TextAlign = ContentAlignment.MiddleRight };
     private string _currentPath = "/";
     private string? _activePartition;
+    private int _busyDepth;
+    private int _fileTransferDepth;
+    private Dictionary<Control, bool>? _busyControlStates;
 
     public MainForm()
     {
@@ -37,6 +52,9 @@ internal sealed class MainForm : Form
         _pfs = new PfsShellClient(toolsDirectory);
         _nbd = new NbdClient(toolsDirectory);
         _diskDiscovery = new DiskDiscovery(toolsDirectory);
+        _apaSpaceReader = new ApaSpaceReader();
+        _apaPartitionTableReader = new ApaPartitionTableReader();
+        _pfsSpaceReader = new PfsSpaceReader();
 
         Text = "PS2 HDD File Manager v1.0 — 峰哥原创，免费发布";
         MinimumSize = new Size(960, 660);
@@ -46,6 +64,7 @@ internal sealed class MainForm : Form
         AllowDragDropFromLowerIntegrityProcessWide();
         BuildUi();
         Shown += async (_, _) => await RefreshDisksAsync();
+        FormClosed += (_, _) => _nbd.Dispose();
     }
 
     private void BuildUi()
@@ -151,6 +170,8 @@ internal sealed class MainForm : Form
         _renameMenuItem.Click += async (_, _) => await RenameSelectedAsync();
         _pasteMenuItem.Click += async (_, _) => await PasteImportAsync();
         _newDirectoryMenuItem.Click += async (_, _) => await CreateDirectoryAsync();
+        _newPartitionMenuItem.Click += async (_, _) => await CreatePfsPartitionAsync();
+        _deletePartitionMenuItem.Click += async (_, _) => await DeleteSelectedPartitionAsync();
         _refreshMenuItem.Click += async (_, _) => await RefreshBrowserAsync();
         _entryMenu.Items.AddRange(
         [
@@ -161,33 +182,43 @@ internal sealed class MainForm : Form
             _pasteMenuItem,
             _newDirectoryMenuItem,
             _entryMenuSeparator2,
+            _newPartitionMenuItem,
+            _deletePartitionMenuItem,
             _refreshMenuItem
         ]);
         _entryMenu.Opening += (_, e) =>
         {
             var selected = SelectedEntries();
-            var onItem = selected.Count > 0;
             var inPartition = _activePartition is not null;
-            _copyMenuItem.Visible = onItem;
-            _deleteMenuItem.Visible = onItem;
-            _renameMenuItem.Visible = onItem;
-            _entryMenuSeparator.Visible = onItem;
-            _copyMenuItem.Enabled = onItem;
-            _deleteMenuItem.Enabled = onItem;
+            var onFileItem = inPartition && selected.Count > 0;
+            _copyMenuItem.Visible = onFileItem;
+            _deleteMenuItem.Visible = onFileItem;
+            _renameMenuItem.Visible = onFileItem;
+            _entryMenuSeparator.Visible = onFileItem;
+            _copyMenuItem.Enabled = onFileItem;
+            _deleteMenuItem.Enabled = onFileItem;
             _renameMenuItem.Enabled = selected.Count == 1;
+            _pasteMenuItem.Visible = inPartition;
+            _newDirectoryMenuItem.Visible = inPartition;
             _pasteMenuItem.Enabled = inPartition && ClipboardHasImportableItems();
             _newDirectoryMenuItem.Enabled = inPartition;
+            _entryMenuSeparator2.Visible = inPartition;
+            _newPartitionMenuItem.Visible = !inPartition;
+            _newPartitionMenuItem.Enabled = !inPartition && _deviceCombo.SelectedItem is DeviceItem;
+            _deletePartitionMenuItem.Visible = !inPartition;
+            _deletePartitionMenuItem.Enabled = !inPartition && selected.Count == 1 && _deviceCombo.SelectedItem is DeviceItem;
             e.Cancel = false;
         };
         _entries.ContextMenuStrip = _entryMenu;
         _deviceCombo.SelectionChangeCommitted += async (_, _) => await LoadPartitionsAsync();
+        _refreshDisksButton.Click += async (_, _) => await RefreshDisksAsync();
 
         var sourceBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         sourceBar.Controls.AddRange(
         [
             new Label { Text = "来源：", AutoSize = true, Padding = new Padding(0, 8, 0, 0) },
             _deviceCombo,
-            MakeButton("刷新", async (_, _) => await RefreshDisksAsync()),
+            _refreshDisksButton,
             MakeButton("加载硬盘镜像", SelectImage)
         ]);
 
@@ -219,8 +250,16 @@ internal sealed class MainForm : Form
         logPage.Controls.Add(_log);
         tabs.TabPages.Add(browserPage);
         tabs.TabPages.Add(logPage);
-        Controls.Add(tabs);
+        var tabsHost = new Panel { Dock = DockStyle.Fill };
+        var diskSpaceHost = new Panel { Dock = DockStyle.Top, Height = 28, Padding = new Padding(8, 3, 8, 3) };
+        _diskSpaceLabel.Location = new Point(0, -6);
+        diskSpaceHost.Controls.Add(_diskSpaceLabel);
+        tabsHost.Controls.Add(tabs);
+        tabsHost.Controls.Add(diskSpaceHost);
+        _statusBar.Items.AddRange([_statusLabel, _progressBar, _transferSpeedLabel]);
+        Controls.Add(tabsHost);
         Controls.Add(top);
+        Controls.Add(_statusBar);
     }
 
     private Button MakeButton(string text, EventHandler click) => new Button { Text = text, AutoSize = true, Margin = new Padding(4) }.Also(button => button.Click += click);
@@ -261,6 +300,205 @@ internal sealed class MainForm : Form
         await LoadPartitionsAsync();
     }
 
+    private async Task CreatePfsPartitionAsync()
+    {
+        if (!TryGetDevice(out var device)) return;
+
+        ApaPartitionTable layout;
+        try
+        {
+            layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"拒绝创建分区：无法通过 APA 校验读取分区表。{ex.Message}");
+            ShowWarning("分区表无法通过完整校验，已拒绝写入。请先备份硬盘并修复分区表。");
+            return;
+        }
+
+        var request = PartitionCreatePrompt.Show(this, FormatBytes(layout.FreeBytes), FormatPartitionSize(layout.FreeBytes));
+        if (request is null) return;
+        if (!TryParsePartitionSize(request.Size, out var requestedBytes, out var normalizedSize, out var sizeError))
+        {
+            ShowWarning(sizeError);
+            return;
+        }
+        if (!IsSafeNewPartitionName(request.Name, out var nameError))
+        {
+            ShowWarning(nameError);
+            return;
+        }
+        if (layout.Partitions.Any(partition => !partition.IsSubPartition && partition.Name.Equals(request.Name, StringComparison.OrdinalIgnoreCase)))
+        {
+            ShowWarning($"分区“{request.Name}”已存在。");
+            return;
+        }
+        if (requestedBytes > layout.FreeBytes)
+        {
+            ShowWarning($"APA 未分配空间不足。请求 {FormatBytes(requestedBytes)}，当前只有 {FormatBytes(layout.FreeBytes)}。未执行任何写入。");
+            return;
+        }
+
+        var sourceDisplay = (_deviceCombo.SelectedItem as DeviceItem)?.Display ?? device;
+        if (!PartitionCreateConfirmation.Show(this, sourceDisplay, request.Name, FormatBytes(requestedBytes)))
+            return;
+
+        var created = false;
+        await RunBusyAsync($"正在创建 PFS 分区“{request.Name}” ({normalizedSize})…", async () =>
+        {
+            // 用户打开确认框期间来源可能已改变：再次读取、校验并预检，避免在过期布局上写入。
+            var currentLayout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            if (currentLayout.Partitions.Any(partition => !partition.IsSubPartition && partition.Name.Equals(request.Name, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"分区“{request.Name}”已存在，已取消创建。");
+            if (requestedBytes > currentLayout.FreeBytes)
+                throw new InvalidOperationException("APA 未分配空间已变化且不足，已取消创建。");
+
+            // pfsshell/PS2SDK 负责依照当前硬盘支持的单分区上限，自动创建主分区及所需子分区。
+            var create = await _pfs.CreatePfsPartitionAsync(device, request.Name, normalizedSize, CancellationToken.None);
+            AppendResult(create);
+            if (!PfsShellClient.IsSuccessfulSession(create))
+                throw new InvalidOperationException("pfsshell 未能创建 PFS 分区，请查看诊断输出。");
+
+            var afterCreate = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var createdPartition = afterCreate.Partitions.SingleOrDefault(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(request.Name, StringComparison.OrdinalIgnoreCase));
+            var hasExactSize = createdPartition is not null && createdPartition.Type == 0x0100 && createdPartition.TotalBytes == requestedBytes;
+
+            // pfsshell 在空间碎片或不足时可能保留一个较小但有效的分区；绝不能把它当作成功。
+            if (!hasExactSize)
+            {
+                var actualSize = createdPartition is null ? "未找到" : FormatBytes(createdPartition.TotalBytes);
+                AppendLog($"创建后核验失败：请求 {FormatBytes(requestedBytes)}，实际 {actualSize}。将尝试删除不完整分区。");
+                var rollback = await _pfs.RemovePartitionAsync(device, request.Name, CancellationToken.None);
+                AppendResult(rollback);
+                if (!PfsShellClient.IsSuccessfulSession(rollback))
+                    throw new InvalidOperationException($"新分区容量核验失败，且自动清理失败。请立即停止写入并备份硬盘；诊断中的分区名为“{request.Name}”。");
+                throw new InvalidOperationException($"空间布局无法完整创建 {FormatBytes(requestedBytes)} 的分区；已自动删除未完成分区，未保留任何新分区。");
+            }
+
+            var verifyMount = await _pfs.ListDirectoryAsync(device, request.Name, "/", CancellationToken.None);
+            AppendResult(verifyMount);
+            if (!PfsShellClient.IsSuccessfulSession(verifyMount))
+            {
+                AppendLog("PFS 格式化后无法挂载，将尝试删除新分区。");
+                var rollback = await _pfs.RemovePartitionAsync(device, request.Name, CancellationToken.None);
+                AppendResult(rollback);
+                if (!PfsShellClient.IsSuccessfulSession(rollback))
+                    throw new InvalidOperationException($"新分区无法验证挂载且自动清理失败。请立即停止写入并备份硬盘；诊断中的分区名为“{request.Name}”。");
+                throw new InvalidOperationException("新分区无法通过 PFS 挂载验证，已自动删除。");
+            }
+
+            created = true;
+            AppendLog($"已创建并验证 PFS 分区“{request.Name}”：{FormatBytes(requestedBytes)}。子分区由 PS2SDK 自动管理。");
+        });
+
+        if (created)
+            await LoadPartitionsAsync();
+    }
+
+    private async Task DeleteSelectedPartitionAsync()
+    {
+        if (_activePartition is not null)
+            return;
+        if (!TryGetDevice(out var device))
+            return;
+        if (SelectedEntry() is not { } selected)
+        {
+            ShowWarning("请在分区列表中选择一个要删除的 PFS 分区。");
+            return;
+        }
+
+        var name = selected.Name;
+        if (IsProtectedPartitionName(name))
+        {
+            AppendLog($"拒绝删除系统保留分区“{name}”。");
+            ShowWarning($"“{name}”是系统保留分区，程序禁止删除。");
+            return;
+        }
+
+        ApaPartitionTable layout;
+        ApaPartitionInfo? target;
+        try
+        {
+            layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            target = layout.Partitions.SingleOrDefault(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"拒绝删除分区：无法通过 APA 校验读取分区表。{ex.Message}");
+            ShowWarning("分区表无法通过完整校验，已拒绝删除。请先备份硬盘并修复分区表。");
+            return;
+        }
+
+        if (target is null || target.Type != 0x0100)
+        {
+            AppendLog($"拒绝删除分区“{name}”：目标不是有效的 PFS 主分区。");
+            ShowWarning("目标不是可安全删除的 PFS 主分区，已拒绝操作。");
+            return;
+        }
+
+        var sourceDisplay = (_deviceCombo.SelectedItem as DeviceItem)?.Display ?? device;
+        var size = FormatBytes(target.TotalBytes);
+        if (MessageBox.Show(
+                this,
+                $"将永久删除 PFS 分区“{name}”（{size}）及其全部文件。\n\n来源：{sourceDisplay}\n\n此操作会修改 APA 分区表，删除后无法恢复。确定继续？",
+                "第一次确认：删除 PFS 分区",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning) != DialogResult.Yes)
+            return;
+
+        if (MessageBox.Show(
+                this,
+                $"最后确认：立即删除“{name}”？\n\n程序将使用 pfsshell 的标准 rmpart 操作，并在删除后重新校验 APA 分区表。",
+                "第二次确认：永久删除",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+
+        var deleted = false;
+        await RunBusyAsync($"正在删除 PFS 分区“{name}”…", async () =>
+        {
+            // 两次确认期间不信任旧状态：再次完整校验，防止目标已变化或分区表异常。
+            var beforeDelete = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var currentTarget = beforeDelete.Partitions.SingleOrDefault(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (currentTarget is null || currentTarget.Type != 0x0100 || currentTarget.TotalBytes != target.TotalBytes)
+                throw new InvalidOperationException("删除前分区表状态已变化，已取消删除。");
+            if (IsProtectedPartitionName(currentTarget.Name))
+                throw new InvalidOperationException("目标属于系统保留分区，已取消删除。");
+
+            var result = await _pfs.RemovePartitionAsync(device, name, CancellationToken.None);
+            AppendResult(result);
+
+            // 此版本 pfsshell 的 rmpart 在成功后仍会打印 "No such file" / exit -2。
+            // 因此不能以工具文本作为结论，必须以删除后可通过校验的 APA 表为准。
+            // 删除后只读重扫 APA 链：必须能通过校验、目标必须消失、可用空间必须增加。
+            var afterDelete = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var stillExists = afterDelete.Partitions.Any(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (stillExists || afterDelete.FreeBytes <= beforeDelete.FreeBytes)
+            {
+                var toolState = PfsShellClient.IsSuccessfulSession(result) ? "" : "pfsshell 同时报告了错误。";
+                throw new InvalidOperationException($"删除后的 APA 分区表校验未通过，目标分区仍存在或未分配空间未增加。{toolState}请立即停止写入、保留硬盘现状并查看诊断输出。");
+            }
+
+            deleted = true;
+            if (!PfsShellClient.IsSuccessfulSession(result))
+                AppendLog("pfsshell 的 rmpart 返回了旧版误报，但 APA 分区表复核确认删除已成功。");
+            AppendLog($"已删除并重新校验 PFS 分区“{name}”（{size}）。APA 未分配空间已增加。");
+        });
+
+        if (deleted)
+            await LoadPartitionsAsync();
+    }
+
+    private static bool IsProtectedPartitionName(string name) =>
+        name.Equals("__mbr", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("__net", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("__system", StringComparison.OrdinalIgnoreCase);
+
     private void SelectImageDevice(string imagePath, string displayName)
     {
         AddSourceDevice(imagePath, displayName);
@@ -283,19 +521,30 @@ internal sealed class MainForm : Form
         _activePartition = null;
         _currentPath = "/";
         _pathBox.Text = "PFS 分区（双击查看）";
+        _diskSpaceLabel.Text = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—";
     }
 
     private async Task ConnectNbdAsync(string ipAddress)
     {
         if (string.IsNullOrWhiteSpace(ipAddress)) { ShowWarning("请输入 PS2 的 NBD IP 地址。"); return; }
+        string? mappedDevicePath = null;
         await RunBusyAsync("正在连接 NBD…", async () =>
         {
             var result = await _nbd.MapAsync(ipAddress.Trim(), CancellationToken.None);
             AppendResult(result);
             if (result.ExitCode != 0) throw new InvalidOperationException("WNBD 映射失败，请查看诊断输出。");
-            await RefreshDisksAsync();
-            AppendLog("NBD 已映射。请在来源列表中选择新增的 PS2 APA 硬盘，再读取 PFS 分区。");
+
+            // 不再调用 hdl_dump query：该命令会探测所有 Windows 物理磁盘，可能拖慢或卡住 PS2 NBD Server。
+            var diskNumber = await _nbd.GetMappedDiskNumberAsync(CancellationToken.None);
+            mappedDevicePath = $@"\\.\PhysicalDrive{diskNumber}";
+            AddSourceDevice(mappedDevicePath, $"PS2 NBD · {ipAddress.Trim()} · PhysicalDrive{diskNumber}");
+            _deviceCombo.SelectedIndex = _deviceCombo.Items.Count - 1;
+            ResetPfsExplorer();
+            AppendLog($"NBD 已映射为 PhysicalDrive{diskNumber}，将只读取该硬盘的 PFS 分区。");
         });
+
+        if (mappedDevicePath is not null)
+            await LoadPartitionsAsync();
     }
 
     private async Task DisconnectNbdAsync() => await RunBusyAsync("正在断开 NBD…", async () =>
@@ -316,6 +565,7 @@ internal sealed class MainForm : Form
             var apaPartitions = PfsShellClient.ParsePartitionNames(result.StandardOutput);
             var partitions = await _pfs.FilterBrowsablePfsPartitionsAsync(device, apaPartitions, CancellationToken.None);
             _activePartition = null;
+            await UpdateDiskSpaceAsync(device, null);
             _currentPath = "/";
             _entries.BeginUpdate();
             _entries.Items.Clear();
@@ -370,6 +620,8 @@ internal sealed class MainForm : Form
             _activePartition = entry.Name;
             _currentPath = "/";
             await RefreshDirectoryAsync();
+            if (TryGetDevice(out var device))
+                await UpdateDiskSpaceAsync(device, _activePartition);
             return;
         }
 
@@ -398,12 +650,20 @@ internal sealed class MainForm : Form
         if (!TryGetPfsTarget(out var device, out var partition)) return;
         using var dialog = new FolderBrowserDialog { Description = "选择导出到的本地目录" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
-        await RunBusyAsync($"正在导出 {PfsNameEncoding.ToDisplay(entry.Name)}…", async () =>
+        BeginFileTransfer();
+        try
         {
-            var result = await _pfs.ExportAsync(device, partition, _currentPath, entry.Name, dialog.SelectedPath, CancellationToken.None);
-            AppendResult(result);
-            if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("导出失败，请查看诊断输出。");
-        });
+            await RunBusyAsync($"正在导出 {PfsNameEncoding.ToDisplay(entry.Name)}…", async () =>
+            {
+                var result = await _pfs.ExportAsync(device, partition, _currentPath, entry.Name, dialog.SelectedPath, CancellationToken.None);
+                AppendResult(result);
+                if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("导出失败，请查看诊断输出。");
+            });
+        }
+        finally
+        {
+            EndFileTransfer();
+        }
     }
 
     private async Task ImportFileAsync()
@@ -441,23 +701,58 @@ internal sealed class MainForm : Form
             .ToArray();
         if (items.Length == 0) return;
 
-        var hasConflicts = false;
-        await RunBusyAsync("正在扫描导入冲突…", async () =>
+        BeginFileTransfer();
+        try
         {
-            var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
-            hasConflicts = await HasImportConflictsAsync(items, device, partition, _currentPath, cache);
-        });
+            var hasConflicts = false;
+            await RunBusyAsync("正在扫描导入冲突…", async () =>
+            {
+                var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
+                hasConflicts = await HasImportConflictsAsync(items, device, partition, _currentPath, cache);
+            });
 
-        if (hasConflicts && !OverwriteConfirmation.Show(this))
-            return;
+            if (hasConflicts && !OverwriteConfirmation.Show(this))
+                return;
 
-        await RunBusyAsync($"正在导入 {items.Length} 个项目…", async () =>
+            ImportSpaceBudget? spaceBudget = null;
+            await RunBusyAsync("正在检查当前 PFS 分区剩余空间…", async () =>
+            {
+                var currentSpace = await ReadPfsSpaceAsync(device, partition);
+                var requiredBytes = EstimateImportRequirement(items, currentSpace.ZoneSizeBytes);
+                if (requiredBytes > currentSpace.FreeBytes)
+                {
+                    AppendLog($"导入空间不足：当前分区剩余 {FormatBytes(currentSpace.FreeBytes)}，预计至少需要 {FormatBytes(requiredBytes)}。未启动文件写入。");
+                    throw new InvalidOperationException("剩余空间不足！");
+                }
+
+                spaceBudget = new ImportSpaceBudget(currentSpace);
+                AppendLog($"PFS 导入空间预检通过：当前分区剩余 {FormatBytes(currentSpace.FreeBytes)}，预计占用 {FormatBytes(requiredBytes)}。");
+            });
+            if (spaceBudget is null)
+                return;
+
+            var progress = new ImportProgressState(CountImportFiles(items), SumImportBytes(items));
+            BeginImportProgress(progress);
+            try
+            {
+                await RunBusyAsync($"正在导入 {items.Length} 个项目…", async () =>
+                {
+                    var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var item in items)
+                        await ImportLocalItemAsync(item, device, partition, _currentPath, cache, hasConflicts, progress, spaceBudget);
+                    await RefreshDirectoryAsync();
+                });
+            }
+            finally
+            {
+                EndImportProgress(progress);
+            }
+            await UpdateDiskSpaceAsync(device, partition);
+        }
+        finally
         {
-            var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in items)
-                await ImportLocalItemAsync(item, device, partition, _currentPath, cache, hasConflicts);
-            await RefreshDirectoryAsync();
-        });
+            EndFileTransfer();
+        }
     }
 
     // 允许非提权进程（资源管理器）向本提权窗口拖放文件。
@@ -597,7 +892,8 @@ internal sealed class MainForm : Form
             return false;
 
         var sourcePath = _currentPath;
-        var sourceItems = selected.Select(entry => new PfsClipboardSelection(entry.Name, entry.IsDirectory)).ToArray();
+        var sourceItems = selected.Select(entry => new PfsClipboardSelection(entry.Name, entry.IsDirectory, entry.Size)).ToArray();
+        var exportProgress = new VirtualExportProgressState();
         var stagingDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "PS2-HDD-File-Manager",
@@ -607,17 +903,18 @@ internal sealed class MainForm : Form
         if (sourceItems is [{ IsDirectory: false } singleFile])
         {
             // RelativePath 给资源管理器显示/落盘；Name 保持 ls 保真字节名供 pfsshell 使用。
-            var deferredFile = new DeferredPfsFile(PfsNameEncoding.ToDisplay(singleFile.Name), sourcePath, singleFile.Name, false);
+            var deferredFile = new DeferredPfsFile(PfsNameEncoding.ToDisplay(singleFile.Name), sourcePath, singleFile.Name, false, singleFile.Size);
+            exportProgress.Initialize([deferredFile]);
             dataObject = VirtualFileClipboard.CreateSingleFileDataObject(
                 deferredFile,
-                () => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, deferredFile, stagingDirectory)).GetAwaiter().GetResult());
+                () => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, deferredFile, stagingDirectory, exportProgress)).GetAwaiter().GetResult());
             successLog = "已将 1 个 PFS 文件放入 Windows 延迟传输。目标请求时才会读取 PFS。";
             return true;
         }
 
         dataObject = new VirtualFileClipboardDataObject(
-            () => Task.Run(() => BuildVirtualClipboardFilesAsync(device, partition, sourcePath, sourceItems)).GetAwaiter().GetResult(),
-            file => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory)).GetAwaiter().GetResult(),
+            () => Task.Run(() => BuildVirtualClipboardFilesAsync(device, partition, sourcePath, sourceItems, exportProgress)).GetAwaiter().GetResult(),
+            file => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, exportProgress)).GetAwaiter().GetResult(),
             ex => ReportVirtualClipboardError(ex));
         successLog = $"已将 {sourceItems.Length} 个 PFS 项目放入 Windows 延迟传输。目标请求时才会读取 PFS。";
         return true;
@@ -635,6 +932,7 @@ internal sealed class MainForm : Form
             if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("创建目录失败，请查看诊断输出。");
             await RefreshDirectoryAsync();
         });
+        await UpdateDiskSpaceAsync(device, partition);
     }
 
     private Task RenameSelectedAsync()
@@ -690,6 +988,7 @@ internal sealed class MainForm : Form
             }
             await RefreshDirectoryAsync();
         });
+        await UpdateDiskSpaceAsync(device, partition);
     }
 
     private async Task<bool> HasImportConflictsAsync(
@@ -732,7 +1031,9 @@ internal sealed class MainForm : Form
         string partition,
         string remoteDirectory,
         Dictionary<string, Dictionary<string, PfsEntry>> cache,
-        bool overwrite)
+        bool overwrite,
+        ImportProgressState progress,
+        ImportSpaceBudget spaceBudget)
     {
         var name = LocalItemName(localItem);
         var shellName = PfsNameEncoding.ToShell(name);
@@ -750,16 +1051,18 @@ internal sealed class MainForm : Form
                 await DeleteRemoteFileAsync(device, partition, remoteDirectory, existing.Name);
                 entries.Remove(shellName);
                 existing = null;
+                spaceBudget.NeedsRefresh = true;
             }
             if (existing is null)
             {
+                await ReservePfsSpaceAsync(device, partition, spaceBudget, spaceBudget.ZoneSizeBytes, name, isDirectory: true);
                 await CreateRemoteDirectoryAsync(device, partition, remoteDirectory, name);
                 entries[shellName] = new PfsEntry(shellName, true, string.Empty);
             }
 
             var childRemoteDirectory = CombineRemotePath(remoteDirectory, existing?.Name ?? shellName);
             foreach (var child in Directory.EnumerateFileSystemEntries(localItem))
-                await ImportLocalItemAsync(child, device, partition, childRemoteDirectory, cache, overwrite);
+                await ImportLocalItemAsync(child, device, partition, childRemoteDirectory, cache, overwrite, progress, spaceBudget);
             return;
         }
 
@@ -767,18 +1070,76 @@ internal sealed class MainForm : Form
         {
             await DeleteRemoteDirectoryAsync(device, partition, remoteDirectory, existing.Name, cache);
             entries.Remove(shellName);
+            spaceBudget.NeedsRefresh = true;
         }
         else if (existing is not null)
         {
             await DeleteRemoteFileAsync(device, partition, remoteDirectory, existing.Name);
             entries.Remove(shellName);
+            spaceBudget.NeedsRefresh = true;
         }
 
-        var import = await _pfs.ImportAsync(device, partition, remoteDirectory, localItem, CancellationToken.None);
+        var fileLength = new FileInfo(localItem).Length;
+        var fileRequirement = EstimateFileRequirement(fileLength, spaceBudget.ZoneSizeBytes);
+        await ReservePfsSpaceAsync(device, partition, spaceBudget, fileRequirement, name, isDirectory: false);
+        SetImportProgress(progress, localItem, 0, isCompleted: false);
+        var import = await ImportFileWithProgressAsync(device, partition, remoteDirectory, localItem, fileLength, progress);
         AppendResult(import);
         if (!PfsShellClient.IsSuccessfulSession(import))
             throw new InvalidOperationException($"导入“{name}”失败，请查看诊断输出。");
         entries[shellName] = new PfsEntry(shellName, false, string.Empty);
+        SetImportProgress(progress, localItem, fileLength, isCompleted: true);
+    }
+
+    // pfsshell 没有导出字节进度。导入期间读取 PFS 位图中的可用空间变化，
+    // 即可得到已实际分配（写入）的字节数；这是 uLaunchELF 以已写入字节计进度的同一原则。
+    private async Task<ProcessResult> ImportFileWithProgressAsync(
+        string device,
+        string partition,
+        string remoteDirectory,
+        string localFile,
+        long fileLength,
+        ImportProgressState progress)
+    {
+        PfsSpace? before = null;
+        try
+        {
+            before = await ReadPfsSpaceAsync(device, partition);
+        }
+        catch (Exception ex)
+        {
+            // 进度读取失败不应阻止实际导入；保留活动指示器，等待 pfsshell 完成。
+            AppendLog($"无法读取导入前 PFS 位图，当前文件将只显示活动状态：{ex.Message}");
+        }
+
+        var importTask = _pfs.ImportAsync(device, partition, remoteDirectory, localFile, CancellationToken.None);
+        var reportedBytes = 0L;
+        var progressReadFailed = false;
+
+        while (!importTask.IsCompleted)
+        {
+            await Task.WhenAny(importTask, Task.Delay(TimeSpan.FromSeconds(1)));
+            if (importTask.IsCompleted || before is null)
+                continue;
+
+            try
+            {
+                var current = await ReadPfsSpaceAsync(device, partition);
+                reportedBytes = Math.Clamp(before.FreeBytes - current.FreeBytes, 0, fileLength);
+                SetImportProgress(progress, localFile, reportedBytes, isCompleted: false);
+            }
+            catch (Exception ex)
+            {
+                // NBD 或 USB 在写入时偶尔会暂时拒绝并发读取；只记一次，不中断写入。
+                if (!progressReadFailed)
+                {
+                    AppendLog($"读取 PFS 写入进度暂时失败，将继续等待导入完成：{ex.Message}");
+                    progressReadFailed = true;
+                }
+            }
+        }
+
+        return await importTask;
     }
 
     private async Task<Dictionary<string, PfsEntry>> GetRemoteEntriesAsync(
@@ -796,6 +1157,101 @@ internal sealed class MainForm : Form
             .ToDictionary(entry => entry.Name, StringComparer.OrdinalIgnoreCase);
         cache[remoteDirectory] = entries;
         return entries;
+    }
+
+    private async Task<PfsSpace> ReadPfsSpaceAsync(string device, string partition)
+    {
+        var layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+        var current = layout.Partitions.SingleOrDefault(item =>
+            !item.IsSubPartition && item.Name.Equals(partition, StringComparison.OrdinalIgnoreCase));
+        if (current is null)
+            throw new InvalidOperationException($"无法在 APA 分区表中定位当前分区“{partition}”。");
+        return await _pfsSpaceReader.ReadAsync(device, current, CancellationToken.None);
+    }
+
+    private async Task ReservePfsSpaceAsync(
+        string device,
+        string partition,
+        ImportSpaceBudget budget,
+        long requiredBytes,
+        string name,
+        bool isDirectory)
+    {
+        if (budget.NeedsRefresh)
+            budget.Reset(await ReadPfsSpaceAsync(device, partition));
+
+        if (requiredBytes > budget.AvailableBytes)
+        {
+            var kind = isDirectory ? "目录" : "文件";
+            AppendLog($"导入空间不足：当前分区剩余 {FormatBytes(budget.AvailableBytes)}，{kind}“{name}”预计至少需要 {FormatBytes(requiredBytes)}。未启动该项目的写入。");
+            throw new InvalidOperationException("剩余空间不足！");
+        }
+
+        budget.AvailableBytes -= requiredBytes;
+    }
+
+    private static long EstimateImportRequirement(IEnumerable<string> items, uint zoneSizeBytes)
+    {
+        long required = 0;
+        foreach (var item in items)
+            required = checked(required + EstimateImportRequirement(item, zoneSizeBytes));
+        return required;
+    }
+
+    private static long EstimateImportRequirement(string item, uint zoneSizeBytes)
+    {
+        if (File.Exists(item))
+            return EstimateFileRequirement(new FileInfo(item).Length, zoneSizeBytes);
+        if (!Directory.Exists(item))
+            return 0;
+
+        // 新目录自身和目录项都需要 PFS 元数据；按一个 zone 保守预留。
+        long required = zoneSizeBytes;
+        foreach (var child in Directory.EnumerateFileSystemEntries(item))
+            required = checked(required + EstimateImportRequirement(child, zoneSizeBytes));
+        return required;
+    }
+
+    private static long EstimateFileRequirement(long fileLength, uint zoneSizeBytes)
+    {
+        if (fileLength < 0) throw new ArgumentOutOfRangeException(nameof(fileLength));
+        var zone = (long)zoneSizeBytes;
+        var dataAllocation = fileLength == 0 ? 0 : checked(((fileLength + zone - 1) / zone) * zone);
+        // 额外预留一个 zone，覆盖 inode、目录项与分配粒度开销，避免“刚好放得下”仍触发 ENOSPC。
+        return checked(dataAllocation + zone);
+    }
+
+    private async Task UpdateDiskSpaceAsync(string device, string? partition)
+    {
+        _diskSpaceLabel.Text = "硬盘总计：正在读取…　未分配：正在读取…　当前分区：—　当前分区剩余：—";
+        try
+        {
+            var layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var label = $"硬盘总计：{FormatCapacity(layout.TotalBytes)}　未分配：{FormatCapacity(layout.FreeBytes)}";
+            if (string.IsNullOrWhiteSpace(partition))
+            {
+                _diskSpaceLabel.Text = label + "　当前分区：—　当前分区剩余：—";
+                return;
+            }
+
+            var current = layout.Partitions.SingleOrDefault(item =>
+                !item.IsSubPartition && item.Name.Equals(partition, StringComparison.OrdinalIgnoreCase));
+            if (current is null)
+            {
+                _diskSpaceLabel.Text = label + "　当前分区：无法读取　当前分区剩余：无法读取";
+                AppendLog($"无法在 APA 分区表中定位当前分区：{partition}");
+                return;
+            }
+
+            _diskSpaceLabel.Text = label + $"　当前分区：{FormatCapacity(current.TotalBytes)}　当前分区剩余：正在读取…";
+            var pfsSpace = await _pfsSpaceReader.ReadAsync(device, current, CancellationToken.None);
+            _diskSpaceLabel.Text = label + $"　当前分区：{FormatCapacity(pfsSpace.TotalBytes)}　当前分区剩余：{FormatCapacity(pfsSpace.FreeBytes)}";
+        }
+        catch (Exception ex)
+        {
+            _diskSpaceLabel.Text = "硬盘总计：无法读取　未分配：无法读取　当前分区：无法读取　当前分区剩余：无法读取";
+            AppendLog($"无法读取容量信息：{ex.Message}");
+        }
     }
 
     private async Task DeleteRemoteDirectoryAsync(
@@ -841,7 +1297,8 @@ internal sealed class MainForm : Form
         string device,
         string partition,
         string sourcePath,
-        IReadOnlyList<PfsClipboardSelection> selections)
+        IReadOnlyList<PfsClipboardSelection> selections,
+        VirtualExportProgressState progress)
     {
         var files = new List<DeferredPfsFile>();
         foreach (var selection in selections)
@@ -849,9 +1306,10 @@ internal sealed class MainForm : Form
             if (selection.IsDirectory)
                 await AddVirtualDirectoryAsync(device, partition, CombineRemotePath(sourcePath, selection.Name), PfsNameEncoding.ToDisplay(selection.Name), files);
             else
-                files.Add(new DeferredPfsFile(PfsNameEncoding.ToDisplay(selection.Name), sourcePath, selection.Name, false));
+                files.Add(new DeferredPfsFile(PfsNameEncoding.ToDisplay(selection.Name), sourcePath, selection.Name, false, selection.Size));
         }
         if (files.Count == 0) throw new InvalidOperationException("没有可复制的 PFS 项目。");
+        progress.Initialize(files);
         return files;
     }
 
@@ -872,7 +1330,7 @@ internal sealed class MainForm : Form
             if (entry.IsDirectory)
                 await AddVirtualDirectoryAsync(device, partition, CombineRemotePath(remoteDirectory, entry.Name), childRelativePath, files);
             else
-                files.Add(new DeferredPfsFile(childRelativePath, remoteDirectory, entry.Name, false));
+                files.Add(new DeferredPfsFile(childRelativePath, remoteDirectory, entry.Name, false, entry.Size));
         }
     }
 
@@ -880,18 +1338,44 @@ internal sealed class MainForm : Form
         string device,
         string partition,
         DeferredPfsFile file,
-        string stagingDirectory)
+        string stagingDirectory,
+        VirtualExportProgressState progress)
     {
-        var relativeDirectory = Path.GetDirectoryName(file.RelativePath.Replace('/', Path.DirectorySeparatorChar)) ?? string.Empty;
-        var destination = Path.Combine(stagingDirectory, relativeDirectory);
-        Directory.CreateDirectory(destination);
-        var result = await _pfs.ExportAsync(device, partition, file.RemoteDirectory, file.Name, destination, CancellationToken.None);
-        if (!PfsShellClient.IsSuccessfulSession(result))
-            throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
-        var localPath = Path.Combine(destination, PfsNameEncoding.ToDisplay(file.Name));
-        if (!File.Exists(localPath))
-            throw new InvalidOperationException($"PFS 文件“{file.RelativePath}”未能导出。");
-        return localPath;
+        BeginFileTransfer();
+        var completed = false;
+        try
+        {
+            var relativeDirectory = Path.GetDirectoryName(file.RelativePath.Replace('/', Path.DirectorySeparatorChar)) ?? string.Empty;
+            var destination = Path.Combine(stagingDirectory, relativeDirectory);
+            Directory.CreateDirectory(destination);
+            UpdateVirtualExportProgress(progress, file, 0, isCompleted: false);
+            var result = await _pfs.ExportAsync(
+                device,
+                partition,
+                file.RemoteDirectory,
+                file.Name,
+                destination,
+                CancellationToken.None,
+                bytes =>
+                {
+                    UpdateVirtualExportProgress(progress, file, bytes, isCompleted: false);
+                    return Task.CompletedTask;
+                });
+            if (!PfsShellClient.IsSuccessfulSession(result))
+                throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
+            var localPath = Path.Combine(destination, PfsNameEncoding.ToDisplay(file.Name));
+            if (!File.Exists(localPath))
+                throw new InvalidOperationException($"PFS 文件“{file.RelativePath}”未能导出。");
+            UpdateVirtualExportProgress(progress, file, new FileInfo(localPath).Length, isCompleted: true);
+            completed = true;
+            return localPath;
+        }
+        finally
+        {
+            if (!completed)
+                HideVirtualExportProgress();
+            EndFileTransfer();
+        }
     }
 
     private void ReportVirtualClipboardError(Exception error)
@@ -910,6 +1394,183 @@ internal sealed class MainForm : Form
     {
         if (!Clipboard.ContainsFileDropList()) return false;
         return Clipboard.GetFileDropList().Cast<string>().Any(path => File.Exists(path) || Directory.Exists(path));
+    }
+
+    private static int CountImportFiles(IEnumerable<string> items)
+    {
+        var count = 0;
+        foreach (var item in items)
+        {
+            if (File.Exists(item))
+            {
+                count++;
+                continue;
+            }
+
+            if (Directory.Exists(item))
+                count += Directory.EnumerateFiles(item, "*", SearchOption.AllDirectories).Count();
+        }
+        return count;
+    }
+
+    private static long SumImportBytes(IEnumerable<string> items)
+    {
+        long total = 0;
+        foreach (var item in items)
+        {
+            if (File.Exists(item))
+            {
+                total = checked(total + new FileInfo(item).Length);
+                continue;
+            }
+
+            if (!Directory.Exists(item))
+                continue;
+
+            foreach (var file in Directory.EnumerateFiles(item, "*", SearchOption.AllDirectories))
+                total = checked(total + new FileInfo(file).Length);
+        }
+        return total;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        var value = (double)Math.Max(bytes, 0);
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return $"{value:0.##} {units[unit]}";
+    }
+
+    private static string FormatCapacity(long bytes)
+    {
+        var value = Math.Max(bytes, 0);
+        const long mebibyte = 1024L * 1024;
+        const long gibibyte = 1024L * mebibyte;
+        return value < gibibyte
+            ? $"{value / (double)mebibyte:0.##}MB"
+            : $"{value / (double)gibibyte:0.##}GB";
+    }
+
+    private static string FormatPartitionSize(long bytes)
+    {
+        const long mebibyte = 1024L * 1024;
+        const long gibibyte = 1024L * mebibyte;
+        return bytes >= gibibyte && bytes % gibibyte == 0
+            ? $"{bytes / gibibyte}G"
+            : $"{bytes / mebibyte}M";
+    }
+
+    private static string FormatTransferSpeed(double bytesPerSecond)
+    {
+        const double mebibyte = 1024d * 1024;
+        const double gibibyte = 1024d * mebibyte;
+        return bytesPerSecond < gibibyte
+            ? $"{Math.Max(bytesPerSecond, 0) / mebibyte:0.##} MB/s"
+            : $"{bytesPerSecond / gibibyte:0.##} GB/s";
+    }
+
+    private static bool IsSafeNewPartitionName(string name, out string error)
+    {
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^\+[A-Za-z0-9_.-]{1,31}$"))
+        {
+            error = "分区名必须以 + 开头，后面只能使用英文、数字、点、下划线或连字符；总长度最多 32 个字符。例如：+DATA。";
+            return false;
+        }
+
+        error = string.Empty;
+        return true;
+    }
+
+    private static bool TryParsePartitionSize(string value, out long bytes, out string normalizedSize, out string error)
+    {
+        bytes = 0;
+        normalizedSize = string.Empty;
+        error = string.Empty;
+        var match = System.Text.RegularExpressions.Regex.Match(value.Trim(), @"^(?<value>\d+)\s*(?<unit>[mMgG])$");
+        if (!match.Success)
+        {
+            error = "容量格式应为整数加 M 或 G，例如 512G、128G、512M。";
+            return false;
+        }
+
+        if (!long.TryParse(match.Groups["value"].Value, out var amount) || amount <= 0)
+        {
+            error = "容量必须是正整数。";
+            return false;
+        }
+
+        var unit = char.ToUpperInvariant(match.Groups["unit"].Value[0]);
+        try
+        {
+            bytes = checked(amount * (unit == 'G' ? 1024L * 1024 * 1024 : 1024L * 1024));
+        }
+        catch (OverflowException)
+        {
+            error = "容量数值过大。";
+            return false;
+        }
+
+        const long apaUnit = 128L * 1024 * 1024;
+        const long apaMaximum = 2L * 1024 * 1024 * 1024 * 1024;
+        if (bytes < apaUnit || bytes % apaUnit != 0)
+        {
+            error = "APA/PFS 分区容量必须是 128MiB 的整数倍，最小为 128M。";
+            return false;
+        }
+        if (bytes > apaMaximum)
+        {
+            error = "传统 APA/PFS 的单个逻辑卷最大为 2TiB。";
+            return false;
+        }
+
+        normalizedSize = unit == 'G' ? $"{amount}G" : $"{amount}M";
+        return true;
+    }
+
+    private void BeginImportProgress(ImportProgressState progress)
+    {
+        _progressBar.Minimum = 0;
+        _progressBar.Maximum = 1000;
+        _progressBar.Value = 0;
+        _progressBar.Visible = true;
+        _transferSpeedLabel.Text = "速度：0 MB/s";
+        _transferSpeedLabel.Visible = true;
+        _statusLabel.Text = progress.TotalFiles == 0
+            ? "正在导入目录结构…"
+            : $"准备导入：0 / {FormatBytes(progress.TotalBytes)} · {progress.TotalFiles} 个文件";
+    }
+
+    private void SetImportProgress(ImportProgressState progress, string localFilePath, long currentFileBytes, bool isCompleted)
+    {
+        var fileName = Path.GetFileName(localFilePath);
+        if (isCompleted)
+        {
+            progress.CompletedFiles++;
+            progress.CompletedBytes = Math.Min(progress.TotalBytes, progress.CompletedBytes + currentFileBytes);
+        }
+
+        var displayedBytes = Math.Min(progress.TotalBytes, progress.CompletedBytes + Math.Max(0, currentFileBytes));
+        var fraction = progress.TotalBytes <= 0 ? 0d : (double)displayedBytes / progress.TotalBytes;
+        _progressBar.Value = Math.Clamp((int)Math.Round(fraction * _progressBar.Maximum), 0, _progressBar.Maximum);
+        var elapsedSeconds = Math.Max(progress.Timer.Elapsed.TotalSeconds, 0.001);
+        _transferSpeedLabel.Text = $"速度：{FormatTransferSpeed(displayedBytes / elapsedSeconds)}";
+        var action = isCompleted ? "已导入" : "正在导入";
+        var displayedFileNumber = isCompleted ? progress.CompletedFiles : progress.CompletedFiles + 1;
+        _statusLabel.Text = $"{action}：{FormatBytes(displayedBytes)} / {FormatBytes(progress.TotalBytes)} · {displayedFileNumber} / {progress.TotalFiles} 个文件 · {fileName}";
+    }
+
+    private void EndImportProgress(ImportProgressState progress)
+    {
+        _progressBar.Visible = false;
+        _transferSpeedLabel.Visible = false;
+        _statusLabel.Text = progress.CompletedFiles == progress.TotalFiles
+            ? $"导入完成：{progress.CompletedFiles} 个文件 · {FormatBytes(progress.CompletedBytes)}"
+            : $"导入结束：{progress.CompletedFiles} / {progress.TotalFiles} 个文件 · {FormatBytes(progress.CompletedBytes)}";
     }
 
     private bool TryGetDevice(out string device)
@@ -936,18 +1597,206 @@ internal sealed class MainForm : Form
     private void AppendLog(string message) => _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {message.Trim()}{Environment.NewLine}");
     private void ShowWarning(string message) => MessageBox.Show(this, message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
+    private void UpdateVirtualExportProgress(
+        VirtualExportProgressState progress,
+        DeferredPfsFile file,
+        long currentBytes,
+        bool isCompleted)
+    {
+        var snapshot = progress.Update(file, currentBytes, isCompleted);
+        if (IsDisposed || !IsHandleCreated)
+            return;
+
+        void Update()
+        {
+            if (IsDisposed)
+                return;
+            _progressBar.Minimum = 0;
+            _progressBar.Maximum = 1000;
+            _progressBar.Value = snapshot.TotalBytes <= 0
+                ? (snapshot.IsCompleted ? 1000 : 0)
+                : Math.Clamp((int)Math.Round((double)snapshot.DisplayedBytes / snapshot.TotalBytes * 1000), 0, 1000);
+            _progressBar.Visible = !snapshot.IsCompletedAll;
+            _transferSpeedLabel.Text = $"速度：{FormatTransferSpeed(snapshot.SpeedBytesPerSecond)}";
+            _transferSpeedLabel.Visible = !snapshot.IsCompletedAll;
+            _statusLabel.Text = snapshot.IsCompletedAll
+                ? $"复制到 Windows 完成：{FormatBytes(snapshot.TotalBytes)}"
+                : $"正在复制到 Windows：{FormatBytes(snapshot.DisplayedBytes)} / {FormatBytes(snapshot.TotalBytes)} · {snapshot.CompletedFiles} / {snapshot.TotalFiles} 个文件 · {Path.GetFileName(file.RelativePath)}";
+        }
+
+        if (InvokeRequired)
+            BeginInvoke((Action)Update);
+        else
+            Update();
+    }
+
+    private void HideVirtualExportProgress()
+    {
+        if (IsDisposed || !IsHandleCreated)
+            return;
+
+        void Hide()
+        {
+            if (IsDisposed)
+                return;
+            _progressBar.Visible = false;
+            _transferSpeedLabel.Visible = false;
+        }
+
+        if (InvokeRequired)
+            BeginInvoke((Action)Hide);
+        else
+            Hide();
+    }
+
+    private void BeginFileTransfer()
+    {
+        Interlocked.Increment(ref _fileTransferDepth);
+        UpdateSourceRefreshEnabled();
+    }
+
+    private void EndFileTransfer()
+    {
+        Interlocked.Decrement(ref _fileTransferDepth);
+        UpdateSourceRefreshEnabled();
+    }
+
+    private void UpdateSourceRefreshEnabled()
+    {
+        if (IsDisposed || !IsHandleCreated)
+            return;
+
+        void Update()
+        {
+            if (!IsDisposed)
+                _refreshDisksButton.Enabled = Volatile.Read(ref _fileTransferDepth) == 0;
+        }
+
+        if (InvokeRequired)
+            BeginInvoke((Action)Update);
+        else
+            Update();
+    }
+
     private async Task RunBusyAsync(string status, Func<Task> action)
     {
-        UseWaitCursor = true;
-        Enabled = false;
+        var isOutermostOperation = _busyDepth++ == 0;
+        if (isOutermostOperation)
+        {
+            UseWaitCursor = true;
+            _busyControlStates = Controls
+                .Cast<Control>()
+                .Where(control => control != _statusBar)
+                .ToDictionary(control => control, control => control.Enabled);
+            foreach (var control in _busyControlStates.Keys)
+                control.Enabled = false;
+        }
         AppendLog(status);
         try { await action(); }
         catch (Exception ex) { AppendLog(ex.ToString()); ShowWarning(ex.Message); }
-        finally { Enabled = true; UseWaitCursor = false; }
+        finally
+        {
+            if (--_busyDepth == 0)
+            {
+                if (_busyControlStates is not null)
+                {
+                    foreach (var (control, wasEnabled) in _busyControlStates)
+                        control.Enabled = wasEnabled;
+                    _busyControlStates = null;
+                }
+                UseWaitCursor = false;
+            }
+        }
     }
 
     private sealed record DeviceItem(string Path, string Display) { public override string ToString() => Display; }
-    private sealed record PfsClipboardSelection(string Name, bool IsDirectory);
+    private sealed record PfsClipboardSelection(string Name, bool IsDirectory, long Size);
+
+    private sealed class VirtualExportProgressState
+    {
+        private readonly object _gate = new();
+        private readonly HashSet<string> _completedPaths = new(StringComparer.OrdinalIgnoreCase);
+        private Stopwatch? _timer;
+        private long _totalBytes;
+        private long _completedBytes;
+        private int _totalFiles;
+        private int _completedFiles;
+
+        public void Initialize(IReadOnlyList<DeferredPfsFile> files)
+        {
+            lock (_gate)
+            {
+                _totalBytes = files.Where(file => !file.IsDirectory).Sum(file => Math.Max(file.Size, 0));
+                _totalFiles = files.Count(file => !file.IsDirectory);
+                _completedBytes = 0;
+                _completedFiles = 0;
+                _completedPaths.Clear();
+                _timer = null;
+            }
+        }
+
+        public VirtualExportProgressSnapshot Update(DeferredPfsFile file, long currentBytes, bool isCompleted)
+        {
+            lock (_gate)
+            {
+                _timer ??= Stopwatch.StartNew();
+                var current = Math.Max(currentBytes, 0);
+                var displayed = Math.Min(_totalBytes, _completedBytes + current);
+                if (isCompleted && _completedPaths.Add(file.RelativePath))
+                {
+                    _completedFiles++;
+                    _completedBytes = Math.Min(_totalBytes, _completedBytes + (file.Size > 0 ? file.Size : current));
+                    displayed = _completedBytes;
+                }
+
+                var elapsed = Math.Max(_timer.Elapsed.TotalSeconds, 0.001);
+                var allDone = _totalFiles > 0 && _completedFiles >= _totalFiles;
+                return new VirtualExportProgressSnapshot(
+                    _totalBytes,
+                    displayed,
+                    _completedFiles,
+                    _totalFiles,
+                    displayed / elapsed,
+                    allDone);
+            }
+        }
+    }
+
+    private sealed record VirtualExportProgressSnapshot(
+        long TotalBytes,
+        long DisplayedBytes,
+        int CompletedFiles,
+        int TotalFiles,
+        double SpeedBytesPerSecond,
+        bool IsCompletedAll)
+    {
+        public bool IsCompleted => IsCompletedAll;
+    }
+
+    private sealed class ImportProgressState(int totalFiles, long totalBytes)
+    {
+        public int TotalFiles { get; } = totalFiles;
+        public long TotalBytes { get; } = totalBytes;
+        public int CompletedFiles { get; set; }
+        public long CompletedBytes { get; set; }
+        public Stopwatch Timer { get; } = Stopwatch.StartNew();
+    }
+
+    private sealed class ImportSpaceBudget
+    {
+        public ImportSpaceBudget(PfsSpace space) => Reset(space);
+
+        public long AvailableBytes { get; set; }
+        public uint ZoneSizeBytes { get; private set; }
+        public bool NeedsRefresh { get; set; }
+
+        public void Reset(PfsSpace space)
+        {
+            AvailableBytes = space.FreeBytes;
+            ZoneSizeBytes = space.ZoneSizeBytes;
+            NeedsRefresh = false;
+        }
+    }
 }
 
 internal static class ControlExtensions
@@ -959,10 +1808,10 @@ internal static class Prompt
 {
     public static string? Show(IWin32Window owner, string title, string label, string initialValue = "")
     {
-        using var dialog = new Form { Text = title, ClientSize = new Size(420, 120), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false };
-        var textBox = new TextBox { Left = 18, Top = 46, Width = 384, Text = initialValue };
-        var ok = new Button { Text = "确定", DialogResult = DialogResult.OK, Left = 246, Top = 82, Width = 75 };
-        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 327, Top = 82, Width = 75 };
+        using var dialog = new Form { Text = title, ClientSize = new Size(560, 220), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, AutoScaleMode = AutoScaleMode.Dpi };
+        var textBox = new TextBox { Left = 24, Top = 68, Width = 512, Height = 34, Text = initialValue };
+        var ok = new Button { Text = "确定", DialogResult = DialogResult.OK, Left = 236, Top = 150, Width = 150, Height = 52 };
+        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 386, Top = 150, Width = 150, Height = 52 };
         dialog.Controls.AddRange([new Label { Text = label, Left = 18, Top = 18, AutoSize = true }, textBox, ok, cancel]);
         dialog.AcceptButton = ok; dialog.CancelButton = cancel;
         return dialog.ShowDialog(owner) == DialogResult.OK ? textBox.Text.Trim() : null;
@@ -973,12 +1822,101 @@ internal static class OverwriteConfirmation
 {
     public static bool Show(IWin32Window owner)
     {
-        using var dialog = new Form { Text = "发现同名项目", ClientSize = new Size(460, 132), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false };
-        var label = new Label { Text = "目标 PFS 目录中发现同名文件或目录。\n选择“全部覆盖”将替换同名文件，并合并同名目录。", Left = 18, Top = 18, Width = 424, Height = 48 };
-        var overwrite = new Button { Text = "全部覆盖", DialogResult = DialogResult.OK, Left = 250, Top = 82, Width = 92 };
-        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 350, Top = 82, Width = 92 };
+        using var dialog = new Form { Text = "发现同名项目", ClientSize = new Size(620, 240), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, AutoScaleMode = AutoScaleMode.Dpi };
+        var label = new Label { Text = "目标 PFS 目录中发现同名文件或目录。\n选择“全部覆盖”将替换同名文件，并合并同名目录。", Left = 24, Top = 24, Width = 572, Height = 92 };
+        var overwrite = new Button { Text = "全部覆盖", DialogResult = DialogResult.OK, Left = 300, Top = 164, Width = 150, Height = 52 };
+        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 466, Top = 164, Width = 150, Height = 52 };
         dialog.Controls.AddRange([label, overwrite, cancel]);
         dialog.AcceptButton = overwrite;
+        dialog.CancelButton = cancel;
+        return dialog.ShowDialog(owner) == DialogResult.OK;
+    }
+}
+
+internal sealed record PartitionCreateRequest(string Name, string Size);
+
+internal static class PartitionCreatePrompt
+{
+    public static PartitionCreateRequest? Show(IWin32Window owner, string freeSpace, string defaultSize)
+    {
+        using var dialog = new Form
+        {
+            Text = "新建 PFS 分区",
+            ClientSize = new Size(680, 390),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            AutoScaleMode = AutoScaleMode.Dpi
+        };
+        var description = new Label
+        {
+            Text = $"当前 APA 未分配空间：{freeSpace}\n分区名必须以 + 开头；容量必须是 128MiB 的整数倍。\n大于单个 APA 分区上限时，会由 PS2SDK 自动建立主分区和子分区。",
+            Left = 18,
+            Top = 15,
+            Width = 632,
+            Height = 108
+        };
+        var nameBox = new TextBox { Left = 164, Top = 148, Width = 488, Height = 38, Text = "+DATA" };
+        var sizeBox = new TextBox { Left = 164, Top = 214, Width = 488, Height = 38, Text = defaultSize };
+        var ok = new Button { Text = "下一步", DialogResult = DialogResult.OK, Left = 360, Top = 318, Width = 150, Height = 52 };
+        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 520, Top = 318, Width = 150, Height = 52 };
+        dialog.Controls.AddRange(
+        [
+            description,
+            new Label { Text = "分区名称：", Left = 24, Top = 153, AutoSize = true }, nameBox,
+            new Label { Text = "容量：", Left = 24, Top = 219, AutoSize = true }, sizeBox,
+            new Label { Text = "例如：512G 或 128M", Left = 24, Top = 273, AutoSize = true, ForeColor = SystemColors.GrayText },
+            ok,
+            cancel
+        ]);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+        return dialog.ShowDialog(owner) == DialogResult.OK
+            ? new PartitionCreateRequest(nameBox.Text.Trim(), sizeBox.Text.Trim())
+            : null;
+    }
+}
+
+internal static class PartitionCreateConfirmation
+{
+    public static bool Show(IWin32Window owner, string source, string name, string size)
+    {
+        using var dialog = new Form
+        {
+            Text = "确认写入 APA 分区表",
+            ClientSize = new Size(720, 400),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            AutoScaleMode = AutoScaleMode.Dpi
+        };
+        var message = new Label
+        {
+            Text = $"将在以下来源的“当前未分配 APA 空间”中创建新的 PFS 逻辑卷：\n{source}\n\n分区：{name}\n容量：{size}\n\n此操作会写入分区表。请勿断电、拔出硬盘或强制关闭程序。",
+            Left = 18,
+            Top = 16,
+            Width = 672,
+            AutoSize = false,
+            AutoEllipsis = false
+        };
+        var measuredMessage = TextRenderer.MeasureText(
+            message.Text,
+            dialog.Font,
+            new Size(message.Width, int.MaxValue),
+            TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl);
+        message.Height = Math.Max(190, measuredMessage.Height + 16);
+
+        var acknowledgeTop = message.Bottom + 18;
+        var acknowledge = new CheckBox { Text = "我确认目标来源正确，并已备份重要数据", Left = 24, Top = acknowledgeTop, Width = 520, Height = 38 };
+        var buttonTop = acknowledge.Bottom + 20;
+        var create = new Button { Text = "创建", DialogResult = DialogResult.OK, Left = 380, Top = buttonTop, Width = 150, Height = 52, Enabled = false };
+        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 548, Top = buttonTop, Width = 150, Height = 52 };
+        dialog.ClientSize = new Size(dialog.ClientSize.Width, buttonTop + 52 + 20);
+        acknowledge.CheckedChanged += (_, _) => create.Enabled = acknowledge.Checked;
+        dialog.Controls.AddRange([message, acknowledge, create, cancel]);
+        dialog.AcceptButton = create;
         dialog.CancelButton = cancel;
         return dialog.ShowDialog(owner) == DialogResult.OK;
     }
