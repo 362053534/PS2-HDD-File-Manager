@@ -8,12 +8,24 @@ namespace PfsExplorerLite.Services;
 
 internal sealed record DeferredPfsFile(string RelativePath, string RemoteDirectory, string Name, bool IsDirectory, long Size = 0);
 
+[ComImport]
+[Guid("3D8B0590-F691-11D2-8EA9-006097DF5BD4")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IDataObjectAsyncCapability
+{
+    [PreserveSig] int SetAsyncMode([MarshalAs(UnmanagedType.Bool)] bool doOperationAsync);
+    [PreserveSig] int GetAsyncMode([MarshalAs(UnmanagedType.Bool)] out bool isAsync);
+    [PreserveSig] int StartOperation(IntPtr bindContext);
+    [PreserveSig] int InOperation([MarshalAs(UnmanagedType.Bool)] out bool inOperation);
+    [PreserveSig] int EndOperation(int result, IntPtr bindContext, uint effects);
+}
+
 /// <summary>
 /// Windows Shell virtual-file clipboard source. The file list and contents are resolved only when
 /// the paste target asks for them, so clicking Copy does not read from the PFS device.
 /// </summary>
 [ComVisible(true)]
-internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataObject
+internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataObject, IDataObjectAsyncCapability
 {
     private const int S_OK = 0;
     private const int E_NOTIMPL = unchecked((int)0x80004001);
@@ -23,6 +35,7 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
     private const uint GmemMoveable = 0x0002;
     private const uint GmemZeroInit = 0x0040;
     private const uint FdAttributes = 0x00000004;
+    private const uint FdFileSize = 0x00000040;
     private const uint FdUnicode = 0x80000000;
     private const uint FileAttributeNormal = 0x00000080;
     private const uint FileAttributeDirectory = 0x00000010;
@@ -33,8 +46,11 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
     private readonly Func<IReadOnlyList<DeferredPfsFile>> _filesFactory;
     private readonly Func<DeferredPfsFile, string> _materializeFile;
     private readonly Action<Exception> _errorReporter;
+    private readonly bool _deferStreams;
     private readonly object _gate = new();
     private IReadOnlyList<DeferredPfsFile>? _files;
+    private bool _asyncMode = true;
+    private bool _inOperation;
 
     private static readonly short FileGroupDescriptorFormat = unchecked((short)RegisterClipboardFormat("FileGroupDescriptorW"));
     private static readonly short FileGroupDescriptorAnsiFormat = unchecked((short)RegisterClipboardFormat("FileGroupDescriptor"));
@@ -44,11 +60,13 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
     public VirtualFileClipboardDataObject(
         Func<IReadOnlyList<DeferredPfsFile>> filesFactory,
         Func<DeferredPfsFile, string> materializeFile,
-        Action<Exception> errorReporter)
+        Action<Exception> errorReporter,
+        bool deferStreams = false)
     {
         _filesFactory = filesFactory;
         _materializeFile = materializeFile;
         _errorReporter = errorReporter;
+        _deferStreams = deferStreams;
     }
 
     public void GetData(ref FORMATETC format, out STGMEDIUM medium)
@@ -78,8 +96,11 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
                     return;
                 }
 
-                medium = CreateStreamMedium(new ManagedFileStream(() =>
-                    new FileStream(_materializeFile(file), FileMode.Open, FileAccess.Read, FileShare.Read)));
+                // 拖拽源必须等到放置操作真正开始后再读取 PFS；剪贴板则直接交付原生临时文件流。
+                medium = _deferStreams
+                    ? CreateStreamMedium(new ManagedFileStream(() =>
+                        new FileStream(_materializeFile(file), FileMode.Open, FileAccess.Read, FileShare.Read)))
+                    : CreateNativeFileStreamMedium(_materializeFile(file));
                 return;
             }
 
@@ -152,6 +173,36 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
         return E_NOTIMPL;
     }
 
+    public int SetAsyncMode(bool doOperationAsync)
+    {
+        _asyncMode = doOperationAsync;
+        return S_OK;
+    }
+
+    public int GetAsyncMode(out bool isAsync)
+    {
+        isAsync = _asyncMode;
+        return S_OK;
+    }
+
+    public int StartOperation(IntPtr bindContext)
+    {
+        _inOperation = true;
+        return S_OK;
+    }
+
+    public int InOperation(out bool inOperation)
+    {
+        inOperation = _inOperation;
+        return S_OK;
+    }
+
+    public int EndOperation(int result, IntPtr bindContext, uint effects)
+    {
+        _inOperation = false;
+        return S_OK;
+    }
+
     object? FormsDataObject.GetData(string format, bool autoConvert)
     {
         try
@@ -206,9 +257,15 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
             var file = files[index];
             var offset = sizeof(uint) + index * descriptorSize;
             // FileGroupDescriptorW 需带 FD_UNICODE，否则部分 Shell 目标会忽略该描述符。
-            var flags = FdAttributes | (unicode ? FdUnicode : 0u);
+            var flags = FdAttributes | (unicode ? FdUnicode : 0u) | (!file.IsDirectory ? FdFileSize : 0u);
             BitConverter.GetBytes(flags).CopyTo(data, offset);
             BitConverter.GetBytes(file.IsDirectory ? FileAttributeDirectory : FileAttributeNormal).CopyTo(data, offset + 36);
+            if (!file.IsDirectory)
+            {
+                var size = (ulong)Math.Max(file.Size, 0);
+                BitConverter.GetBytes((uint)(size >> 32)).CopyTo(data, offset + 64);
+                BitConverter.GetBytes((uint)size).CopyTo(data, offset + 68);
+            }
             var name = file.RelativePath.Replace('/', '\\').TrimStart('\\');
             var fileName = name[..Math.Min(name.Length, 259)] + "\0";
             var nameBytes = (unicode ? Encoding.Unicode : Encoding.Default).GetBytes(fileName);
@@ -235,6 +292,16 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
         pUnkForRelease = IntPtr.Zero
     };
 
+    private static STGMEDIUM CreateNativeFileStreamMedium(string path)
+    {
+        const uint stgmRead = 0x00000000;
+        const uint stgmShareDenyNone = 0x00000040;
+        var result = SHCreateStreamOnFileEx(path, stgmRead | stgmShareDenyNone, 0, false, IntPtr.Zero, out var stream);
+        if (result < 0)
+            Marshal.ThrowExceptionForHR(result);
+        return CreateStreamMedium(stream);
+    }
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern uint RegisterClipboardFormat(string format);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -245,6 +312,14 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
     private static extern bool GlobalUnlock(IntPtr handle);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GlobalFree(IntPtr handle);
+    [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHCreateStreamOnFileEx(
+        string file,
+        uint mode,
+        uint attributes,
+        [MarshalAs(UnmanagedType.Bool)] bool create,
+        IntPtr template,
+        out IStream stream);
 }
 
 internal static class VirtualFileClipboard

@@ -38,8 +38,15 @@ internal sealed class MainForm : Form
     private readonly TextBox _log = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, Dock = DockStyle.Fill, Font = new Font(FontFamily.GenericMonospace, 9F) };
     private readonly StatusStrip _statusBar = new();
     private readonly ToolStripStatusLabel _statusLabel = new() { Text = "就绪", Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-    private readonly ToolStripProgressBar _progressBar = new() { Visible = false, AutoSize = false, Width = 260 };
-    private readonly ToolStripStatusLabel _transferSpeedLabel = new() { Visible = false, AutoSize = false, Width = 110, TextAlign = ContentAlignment.MiddleRight };
+    private readonly ToolStripProgressBar _progressBar = new()
+    {
+        Visible = false,
+        AutoSize = false,
+        Width = 220,
+        Margin = new Padding(2, 2, -70, 2),
+        BackColor = Color.Gainsboro
+    };
+    private readonly ToolStripSpeedLabel _transferSpeedLabel = new() { Visible = false, AutoSize = false, Width = 240 };
     private string _currentPath = "/";
     private string? _activePartition;
     private int _busyDepth;
@@ -58,6 +65,7 @@ internal sealed class MainForm : Form
 
         Text = "PS2 HDD File Manager v1.0 — 峰哥原创，免费发布";
         MinimumSize = new Size(960, 660);
+        Size = new Size(1008, 693);
         StartPosition = FormStartPosition.CenterScreen;
         KeyPreview = true;
         // 提权进程需在创建窗口前放行拖放消息，否则资源管理器拖入会被 UIPI 拦截。
@@ -125,13 +133,11 @@ internal sealed class MainForm : Form
             if (items.Length == 0) return;
             await ImportLocalItemsAsync(items);
         };
-        _entries.ItemDrag += (_, e) =>
+        _entries.ItemDrag += async (_, e) =>
         {
             if (e.Button != MouseButtons.Left || _activePartition is null || SelectedEntries().Count == 0)
                 return;
-            if (!TryCreateWindowsTransferDataObject(out var dataObject, out string _))
-                return;
-            _entries.DoDragDrop(dataObject, DragDropEffects.Copy);
+            await DragSelectedToWindowsAsync();
         };
         _entries.KeyDown += async (_, e) =>
         {
@@ -257,6 +263,7 @@ internal sealed class MainForm : Form
         tabsHost.Controls.Add(tabs);
         tabsHost.Controls.Add(diskSpaceHost);
         _statusBar.Items.AddRange([_statusLabel, _progressBar, _transferSpeedLabel]);
+        _transferSpeedLabel.BringControlToFront();
         Controls.Add(tabsHost);
         Controls.Add(top);
         Controls.Add(_statusBar);
@@ -880,6 +887,62 @@ internal sealed class MainForm : Form
         return Task.CompletedTask;
     }
 
+    private async Task DragSelectedToWindowsAsync()
+    {
+        var selected = SelectedEntries();
+        if (selected.Count == 0 || _activePartition is null || !TryGetPfsTarget(out var device, out var partition))
+            return;
+
+        var sourcePath = _currentPath;
+        var sourceItems = selected
+            .Select(entry => new PfsClipboardSelection(entry.Name, entry.IsDirectory, entry.Size))
+            .ToArray();
+        var progress = new VirtualExportProgressState();
+        var stagingDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "PS2-HDD-File-Manager",
+            "Clipboard",
+            Guid.NewGuid().ToString("N"));
+        try
+        {
+            // 只在拖拽开始前读取目录结构，不读取文件内容。
+            IReadOnlyList<DeferredPfsFile> files;
+            if (sourceItems is [{ IsDirectory: false } singleFile])
+            {
+                files =
+                [
+                    new DeferredPfsFile(PfsNameEncoding.ToDisplay(singleFile.Name), sourcePath, singleFile.Name, false, singleFile.Size)
+                ];
+                progress.Initialize(files);
+            }
+            else
+            {
+                files = await BuildVirtualClipboardFilesAsync(device, partition, sourcePath, sourceItems, progress);
+            }
+
+            var materialized = new System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<string>>(StringComparer.OrdinalIgnoreCase);
+            string MaterializeOnce(DeferredPfsFile file) => materialized.GetOrAdd(
+                file.RelativePath,
+                _ => new Lazy<string>(
+                    () => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, progress)).GetAwaiter().GetResult(),
+                    LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+            var dataObject = new VirtualFileClipboardDataObject(
+                () => files,
+                MaterializeOnce,
+                ex => ReportVirtualClipboardError(ex),
+                deferStreams: true);
+
+            // DoDragDrop 只负责等待用户松开鼠标；文件内容在目标确认放置后才由流读取。
+            _entries.DoDragDrop(dataObject, DragDropEffects.Copy);
+        }
+        catch (Exception ex)
+        {
+            AppendLog(ex.ToString());
+            ShowWarning($"拖拽复制失败：{ex.Message}");
+            HideVirtualExportProgress();
+        }
+    }
+
     // 供 Ctrl+C / 拖出共用：构造延迟落地的虚拟文件 DataObject（仅 Copy）。
     private bool TryCreateWindowsTransferDataObject(out System.Windows.Forms.IDataObject dataObject, out string successLog)
     {
@@ -900,21 +963,29 @@ internal sealed class MainForm : Form
             "Clipboard",
             Guid.NewGuid().ToString("N"));
 
-        if (sourceItems is [{ IsDirectory: false } singleFile])
+        var materialized = new System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<string>>(StringComparer.OrdinalIgnoreCase);
+        string MaterializeOnce(DeferredPfsFile file) => materialized.GetOrAdd(
+            file.RelativePath,
+            _ => new Lazy<string>(
+                () => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, exportProgress)).GetAwaiter().GetResult(),
+                LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+
+        IReadOnlyList<DeferredPfsFile> GetDeferredFiles()
         {
-            // RelativePath 给资源管理器显示/落盘；Name 保持 ls 保真字节名供 pfsshell 使用。
-            var deferredFile = new DeferredPfsFile(PfsNameEncoding.ToDisplay(singleFile.Name), sourcePath, singleFile.Name, false, singleFile.Size);
-            exportProgress.Initialize([deferredFile]);
-            dataObject = VirtualFileClipboard.CreateSingleFileDataObject(
-                deferredFile,
-                () => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, deferredFile, stagingDirectory, exportProgress)).GetAwaiter().GetResult());
-            successLog = "已将 1 个 PFS 文件放入 Windows 延迟传输。目标请求时才会读取 PFS。";
-            return true;
+            if (sourceItems is not [{ IsDirectory: false } singleFile])
+                return Task.Run(() => BuildVirtualClipboardFilesAsync(device, partition, sourcePath, sourceItems, exportProgress)).GetAwaiter().GetResult();
+
+            var files = new[]
+            {
+                new DeferredPfsFile(PfsNameEncoding.ToDisplay(singleFile.Name), sourcePath, singleFile.Name, false, singleFile.Size)
+            };
+            exportProgress.Initialize(files);
+            return files;
         }
 
         dataObject = new VirtualFileClipboardDataObject(
-            () => Task.Run(() => BuildVirtualClipboardFilesAsync(device, partition, sourcePath, sourceItems, exportProgress)).GetAwaiter().GetResult(),
-            file => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, exportProgress)).GetAwaiter().GetResult(),
+            GetDeferredFiles,
+            MaterializeOnce,
             ex => ReportVirtualClipboardError(ex));
         successLog = $"已将 {sourceItems.Length} 个 PFS 项目放入 Windows 延迟传输。目标请求时才会读取 PFS。";
         return true;
@@ -1538,7 +1609,7 @@ internal sealed class MainForm : Form
         _progressBar.Maximum = 1000;
         _progressBar.Value = 0;
         _progressBar.Visible = true;
-        _transferSpeedLabel.Text = "速度：0 MB/s";
+        _transferSpeedLabel.Text = "0 MB/s";
         _transferSpeedLabel.Visible = true;
         _statusLabel.Text = progress.TotalFiles == 0
             ? "正在导入目录结构…"
@@ -1558,7 +1629,7 @@ internal sealed class MainForm : Form
         var fraction = progress.TotalBytes <= 0 ? 0d : (double)displayedBytes / progress.TotalBytes;
         _progressBar.Value = Math.Clamp((int)Math.Round(fraction * _progressBar.Maximum), 0, _progressBar.Maximum);
         var elapsedSeconds = Math.Max(progress.Timer.Elapsed.TotalSeconds, 0.001);
-        _transferSpeedLabel.Text = $"速度：{FormatTransferSpeed(displayedBytes / elapsedSeconds)}";
+        _transferSpeedLabel.Text = FormatTransferSpeed(displayedBytes / elapsedSeconds);
         var action = isCompleted ? "已导入" : "正在导入";
         var displayedFileNumber = isCompleted ? progress.CompletedFiles : progress.CompletedFiles + 1;
         _statusLabel.Text = $"{action}：{FormatBytes(displayedBytes)} / {FormatBytes(progress.TotalBytes)} · {displayedFileNumber} / {progress.TotalFiles} 个文件 · {fileName}";
@@ -1617,11 +1688,11 @@ internal sealed class MainForm : Form
                 ? (snapshot.IsCompleted ? 1000 : 0)
                 : Math.Clamp((int)Math.Round((double)snapshot.DisplayedBytes / snapshot.TotalBytes * 1000), 0, 1000);
             _progressBar.Visible = !snapshot.IsCompletedAll;
-            _transferSpeedLabel.Text = $"速度：{FormatTransferSpeed(snapshot.SpeedBytesPerSecond)}";
+            _transferSpeedLabel.Text = FormatTransferSpeed(snapshot.SpeedBytesPerSecond);
             _transferSpeedLabel.Visible = !snapshot.IsCompletedAll;
             _statusLabel.Text = snapshot.IsCompletedAll
                 ? $"复制到 Windows 完成：{FormatBytes(snapshot.TotalBytes)}"
-                : $"正在复制到 Windows：{FormatBytes(snapshot.DisplayedBytes)} / {FormatBytes(snapshot.TotalBytes)} · {snapshot.CompletedFiles} / {snapshot.TotalFiles} 个文件 · {Path.GetFileName(file.RelativePath)}";
+                : $"复制到 PC：{FormatBytes(snapshot.DisplayedBytes)} / {FormatBytes(snapshot.TotalBytes)} · {snapshot.CompletedFiles} / {snapshot.TotalFiles}";
         }
 
         if (InvokeRequired)
@@ -1920,4 +1991,34 @@ internal static class PartitionCreateConfirmation
         dialog.CancelButton = cancel;
         return dialog.ShowDialog(owner) == DialogResult.OK;
     }
+}
+
+internal sealed class ToolStripSpeedLabel : ToolStripControlHost
+{
+    private Label SpeedControl => (Label)Control;
+
+    public ToolStripSpeedLabel() : base(new Label
+    {
+        Dock = DockStyle.Fill,
+        AutoSize = false,
+        Size = new Size(240, 18),
+        MinimumSize = new Size(240, 18),
+        TextAlign = ContentAlignment.MiddleRight,
+        BackColor = SystemColors.Control,
+        ForeColor = SystemColors.ControlText,
+        Padding = new Padding(4, 0, 4, 0)
+    })
+    {
+        AutoSize = false;
+        Size = new Size(240, 18);
+        Margin = new Padding(2, 2, 10, 2);
+    }
+
+    public new string Text
+    {
+        get => SpeedControl.Text;
+        set => SpeedControl.Text = value;
+    }
+
+    public void BringControlToFront() => SpeedControl.BringToFront();
 }
