@@ -119,7 +119,13 @@ internal sealed class PfsShellClient
         }
     }
 
-    public async Task<ProcessResult> ImportAsync(string device, string partition, string remoteDirectory, string localFilePath, CancellationToken cancellationToken)
+    public async Task<ProcessResult> ImportAsync(
+        string device,
+        string partition,
+        string remoteDirectory,
+        string localFilePath,
+        CancellationToken cancellationToken,
+        Func<long, Task>? progress = null)
     {
         localFilePath = Path.GetFullPath(localFilePath);
         var originalName = Path.GetFileName(localFilePath);
@@ -144,7 +150,8 @@ internal sealed class PfsShellClient
                 partition,
                 PathParts(remoteDirectory),
                 command,
-                cancellationToken);
+                cancellationToken,
+                progress);
         }
         finally
         {
@@ -166,22 +173,24 @@ internal sealed class PfsShellClient
         RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"rename {Quote(oldName)} {Quote(PfsNameEncoding.ToShell(newName))}", cancellationToken);
 
     private Task<ProcessResult> RunSessionAsync(string device, IReadOnlyList<string> remotePath, string command, CancellationToken cancellationToken) =>
-        RunSessionCoreAsync(device, mountPartition: null, remotePath, command, cancellationToken);
+        RunSessionCoreAsync(device, mountPartition: null, remotePath, command, cancellationToken, progress: null);
 
     private Task<ProcessResult> RunMountedSessionAsync(
         string device,
         string partition,
         IReadOnlyList<string> remotePath,
         string command,
-        CancellationToken cancellationToken) =>
-        RunSessionCoreAsync(device, partition, remotePath, command, cancellationToken);
+        CancellationToken cancellationToken,
+        Func<long, Task>? progress = null) =>
+        RunSessionCoreAsync(device, partition, remotePath, command, cancellationToken, progress);
 
     private async Task<ProcessResult> RunSessionCoreAsync(
         string device,
         string? mountPartition,
         IReadOnlyList<string> remotePath,
         string command,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<long, Task>? progress)
     {
         if (!IsAvailable)
             throw new FileNotFoundException("pfsshell.exe is missing. Build the project from this repository or place it in the tools folder.", _executablePath);
@@ -204,7 +213,8 @@ internal sealed class PfsShellClient
             string.Empty,
             script.ToString(),
             cancellationToken,
-            encoding: PfsNameEncoding.Wire);
+            encoding: PfsNameEncoding.Wire,
+            progress: progress);
     }
 
     public static IReadOnlyList<string> ParsePartitionNames(string output)
@@ -216,6 +226,13 @@ internal sealed class PfsShellClient
             if (named.Success)
             {
                 names.Add(named.Groups["name"].Value);
+                continue;
+            }
+
+            var sizeFirst = Regex.Match(line.Trim(), @"^\d+(?:\.\d+)?\s+[KMGT]i?B\s+(?<name>[+_.A-Za-z0-9-]{1,32})/?$", RegexOptions.IgnoreCase);
+            if (sizeFirst.Success)
+            {
+                names.Add(sizeFirst.Groups["name"].Value);
                 continue;
             }
 

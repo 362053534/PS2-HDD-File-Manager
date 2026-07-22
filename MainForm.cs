@@ -1162,8 +1162,8 @@ internal sealed class MainForm : Form
         SetImportProgress(progress, localItem, fileLength, isCompleted: true);
     }
 
-    // pfsshell 没有导出字节进度。导入期间读取 PFS 位图中的可用空间变化，
-    // 即可得到已实际分配（写入）的字节数；这是 uLaunchELF 以已写入字节计进度的同一原则。
+    // pfsshell 在每次成功写入一个传输块后报告累计字节数；
+    // 直接使用该计数显示进度，避免写入期间反复扫描实体硬盘上的 PFS 位图。
     private async Task<ProcessResult> ImportFileWithProgressAsync(
         string device,
         string partition,
@@ -1172,45 +1172,23 @@ internal sealed class MainForm : Form
         long fileLength,
         ImportProgressState progress)
     {
-        PfsSpace? before = null;
-        try
-        {
-            before = await ReadPfsSpaceAsync(device, partition);
-        }
-        catch (Exception ex)
-        {
-            // 进度读取失败不应阻止实际导入；保留活动指示器，等待 pfsshell 完成。
-            AppendLog($"无法读取导入前 PFS 位图，当前文件将只显示活动状态：{ex.Message}");
-        }
-
-        var importTask = _pfs.ImportAsync(device, partition, remoteDirectory, localFile, CancellationToken.None);
-        var reportedBytes = 0L;
-        var progressReadFailed = false;
-
-        while (!importTask.IsCompleted)
-        {
-            await Task.WhenAny(importTask, Task.Delay(TimeSpan.FromSeconds(1)));
-            if (importTask.IsCompleted || before is null)
-                continue;
-
-            try
+        var uiUpdateTimer = Stopwatch.StartNew();
+        return await _pfs.ImportAsync(
+            device,
+            partition,
+            remoteDirectory,
+            localFile,
+            CancellationToken.None,
+            bytes =>
             {
-                var current = await ReadPfsSpaceAsync(device, partition);
-                reportedBytes = Math.Clamp(before.FreeBytes - current.FreeBytes, 0, fileLength);
-                SetImportProgress(progress, localFile, reportedBytes, isCompleted: false);
-            }
-            catch (Exception ex)
-            {
-                // NBD 或 USB 在写入时偶尔会暂时拒绝并发读取；只记一次，不中断写入。
-                if (!progressReadFailed)
+                var transferred = Math.Clamp(bytes, 0, fileLength);
+                if (transferred >= fileLength || uiUpdateTimer.ElapsedMilliseconds >= 1000)
                 {
-                    AppendLog($"读取 PFS 写入进度暂时失败，将继续等待导入完成：{ex.Message}");
-                    progressReadFailed = true;
+                    SetImportProgress(progress, localFile, transferred, isCompleted: false);
+                    uiUpdateTimer.Restart();
                 }
-            }
-        }
-
-        return await importTask;
+                return Task.CompletedTask;
+            });
     }
 
     private async Task<Dictionary<string, PfsEntry>> GetRemoteEntriesAsync(

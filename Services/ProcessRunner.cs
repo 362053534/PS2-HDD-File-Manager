@@ -17,7 +17,8 @@ internal static class ProcessRunner
         string? input = null,
         CancellationToken cancellationToken = default,
         Encoding? encoding = null,
-        string? workingDirectory = null)
+        string? workingDirectory = null,
+        Func<long, Task>? progress = null)
     {
         // 默认 UTF-8 无 BOM，供 hdl_dump / wnbd 等工具；pfsshell 需传入系统 ANSI 编码。
         var textEncoding = encoding ?? new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
@@ -44,7 +45,9 @@ internal static class ProcessRunner
         if (!process.Start())
             throw new InvalidOperationException($"Unable to start {Path.GetFileName(fileName)}.");
 
-        var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var outputTask = progress is null
+            ? process.StandardOutput.ReadToEndAsync(cancellationToken)
+            : ReadOutputAsync(process.StandardOutput, cancellationToken, progress);
         var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
         if (input is not null)
         {
@@ -56,6 +59,38 @@ internal static class ProcessRunner
 
         await process.WaitForExitAsync(cancellationToken);
         return new ProcessResult(process.ExitCode, await outputTask, await errorTask);
+    }
+
+    private static async Task<string> ReadOutputAsync(
+        StreamReader reader,
+        CancellationToken cancellationToken,
+        Func<long, Task>? progress)
+    {
+        var output = new StringBuilder();
+        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        {
+            if (progress is not null && TryParseProgress(line, out var bytes))
+            {
+                await progress(bytes);
+                continue;
+            }
+
+            output.AppendLine(line);
+        }
+
+        return output.ToString();
+    }
+
+    private static bool TryParseProgress(string line, out long bytes)
+    {
+        const string prefix = "__PFS_PROGRESS__:";
+        bytes = 0;
+        if (!line.StartsWith(prefix, StringComparison.Ordinal) ||
+            !long.TryParse(line[prefix.Length..], out var parsed) || parsed < 0)
+            return false;
+
+        bytes = parsed;
+        return true;
     }
 }
 
