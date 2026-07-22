@@ -127,21 +127,18 @@ internal sealed class PfsShellClient
             throw new ArgumentException("The selected file has no name.");
 
         // pfsshell 找不到“进程工作目录”里的中文路径文件；lcd 中文路径也常失败。
-        // 做法：同卷 ASCII 目录硬链接（不复制数据）；非 ASCII 名先 put payload 再 rename 回原名。
+        // 做法：同卷 ASCII 目录硬链接（不复制数据）；所有文件都先 put 到唯一 ASCII 暂存名，
+        // 写入完成后再 rename 回原名，避免长文件名退化、批量导入重名以及残留文件冲突。
         var stagingRoot = CreateAsciiStagingDirectory("Import", localFilePath);
         var extension = Path.GetExtension(originalName);
-        var stagingName = IsAscii(originalName)
-            ? originalName
-            : "payload_" + Guid.NewGuid().ToString("N")[..8] + (IsAscii(extension) ? extension : ".bin");
+        var stagingName = "payload_" + Guid.NewGuid().ToString("N")[..8] + (IsAscii(extension) ? extension : ".bin");
         var stagingPath = Path.Combine(stagingRoot, stagingName);
         try
         {
             await Task.Run(() => LinkOrCopy(localFilePath, stagingPath), cancellationToken);
-            // 非 ASCII 本地名：put 仅用 ASCII staging 名，再 rename 为 ACP 字节（经 Latin-1 保真送入 pfsshell）
+            // put 仅使用 ASCII staging 名，再 rename 为原始文件名（经 Latin-1 保真送入 pfsshell）。
             var shellName = PfsNameEncoding.ToShell(originalName);
-            var command = string.Equals(stagingName, originalName, StringComparison.Ordinal)
-                ? $"lcd {Quote(stagingRoot)}{Environment.NewLine}put {Quote(stagingName)}"
-                : $"lcd {Quote(stagingRoot)}{Environment.NewLine}put {Quote(stagingName)}{Environment.NewLine}rename {Quote(stagingName)} {Quote(shellName)}";
+            var command = $"lcd {Quote(stagingRoot)}{Environment.NewLine}put {Quote(stagingName)}{Environment.NewLine}rename {Quote(stagingName)} {Quote(shellName)}";
             return await RunMountedSessionAsync(
                 device,
                 partition,
