@@ -16,4 +16,13 @@
     <None Include="..\PFS-BatchKit-Manager\BAT\wnbd-client.exe" Link="tools\wnbd-client.exe" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\PFS-BatchKit-Manager\BAT\libwnbd.dll" Link="tools\libwnbd.dll" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <!-- Release 构建完成后，在 bin\Release 下生成可分发 zip（不含 pdb）。 -->
+  <Target Name="ZipReleaseOutput" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <PropertyGroup>
+      <_ReleaseZipDir>$(MSBuildProjectDirectory)\bin\Release</_ReleaseZipDir>
+      <_ReleaseZipPath>$(_ReleaseZipDir)\PS2-HDD-File-Manager.zip</_ReleaseZipPath>
+    </PropertyGroup>
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;$ErrorActionPreference='Stop'; $src='$(TargetDir.TrimEnd('\'))'; $dst='$(_ReleaseZipPath)'; New-Item -ItemType Directory -Force -Path '$(_ReleaseZipDir)' | Out-Null; if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Force }; $stage = Join-Path $env:TEMP ('pfs-zip-' + [guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Force -Path $stage | Out-Null; try { Get-ChildItem -LiteralPath $src -Force | Where-Object { $_.Name -ne 'PS2-HDD-File-Manager.zip' -and $_.Extension -ne '.pdb' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage $_.Name) -Recurse -Force }; Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $dst -Force; Write-Host ('Created ' + $dst) } finally { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }&quot;" />
+  </Target>
 </Project>

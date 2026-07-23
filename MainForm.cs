@@ -89,8 +89,16 @@ internal sealed class MainForm : Form
         _entries.BeforeLabelEdit += (_, e) =>
         {
             // 分区列表不允许就地重命名；仅已打开的 PFS 目录可改名。
-            if (_activePartition is null || _entries.Items[e.Item].Tag is not PfsEntry)
+            // 且须由二次单击计时器 / 菜单 / F2 显式允许，避免单击过灵敏。
+            var browser = (BrowserListView)_entries;
+            if (!browser.AllowNextLabelEdit
+                || _activePartition is null
+                || _entries.Items[e.Item].Tag is not PfsEntry)
+            {
                 e.CancelEdit = true;
+                return;
+            }
+            browser.AllowNextLabelEdit = false;
         };
         _entries.AfterLabelEdit += (_, e) =>
         {
@@ -147,6 +155,17 @@ internal sealed class MainForm : Form
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 await RenameSelectedAsync();
+                return;
+            }
+            // 主键盘 Delete 与小键盘 Del（NumLock 关闭时）均为 Keys.Delete。
+            if (e.KeyCode == Keys.Delete)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                if (_activePartition is null)
+                    await DeleteSelectedPartitionAsync();
+                else
+                    await DeleteSelectedAsync();
                 return;
             }
             if (!e.Control) return;
@@ -827,10 +846,10 @@ internal sealed class MainForm : Form
         try
         {
             var hasConflicts = false;
+            var entryCache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
             await RunBusyAsync("正在扫描导入冲突…", async () =>
             {
-                var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
-                hasConflicts = await HasImportConflictsAsync(items, device, partition, _currentPath, cache);
+                hasConflicts = await HasImportConflictsAsync(items, device, partition, _currentPath, entryCache);
             });
 
             if (hasConflicts && !OverwriteConfirmation.Show(this))
@@ -840,7 +859,9 @@ internal sealed class MainForm : Form
             await RunBusyAsync("正在检查当前 PFS 分区剩余空间…", async () =>
             {
                 var currentSpace = await ReadPfsSpaceAsync(device, partition);
-                var requiredBytes = EstimateImportRequirement(items, currentSpace.ZoneSizeBytes);
+                // 覆盖时按“先删后拷”估算净占用，把将被替换项释放的空间计入可用额度。
+                var requiredBytes = await EstimateNetImportRequirementAsync(
+                    items, device, partition, _currentPath, entryCache, currentSpace.ZoneSizeBytes, overwrite: hasConflicts);
                 if (requiredBytes > currentSpace.FreeBytes)
                 {
                     AppendLog($"导入空间不足：当前分区剩余 {FormatBytes(currentSpace.FreeBytes)}，预计至少需要 {FormatBytes(requiredBytes)}。未启动文件写入。");
@@ -848,7 +869,7 @@ internal sealed class MainForm : Form
                 }
 
                 spaceBudget = new ImportSpaceBudget(currentSpace);
-                AppendLog($"PFS 导入空间预检通过：当前分区剩余 {FormatBytes(currentSpace.FreeBytes)}，预计占用 {FormatBytes(requiredBytes)}。");
+                AppendLog($"PFS 导入空间预检通过：当前分区剩余 {FormatBytes(currentSpace.FreeBytes)}，预计净占用 {FormatBytes(requiredBytes)}。");
             });
             if (spaceBudget is null)
                 return;
@@ -927,6 +948,94 @@ internal sealed class MainForm : Form
     private sealed class BrowserListView : ListView
     {
         public event Func<string[], Task>? FilesDropped;
+
+        // 仅允许“已选中后再点名称”经延时进入编辑，屏蔽系统默认的过灵敏单击改名。
+        private readonly System.Windows.Forms.Timer _labelEditTimer = new();
+        private ListViewItem? _pendingEditItem;
+        private bool _wasSelectedOnMouseDown;
+        private Point _mouseDownPoint;
+
+        public bool AllowNextLabelEdit { get; set; }
+
+        public BrowserListView()
+        {
+            _labelEditTimer.Tick += (_, _) =>
+            {
+                _labelEditTimer.Stop();
+                var item = _pendingEditItem;
+                _pendingEditItem = null;
+                if (item is null || item.ListView != this || !item.Selected || SelectedItems.Count != 1)
+                    return;
+                BeginRename(item);
+            };
+        }
+
+        public void BeginRename(ListViewItem item)
+        {
+            if (item.ListView != this)
+                return;
+            AllowNextLabelEdit = true;
+            FocusedItem = item;
+            item.BeginEdit();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _labelEditTimer.Dispose();
+            base.Dispose(disposing);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                _labelEditTimer.Stop();
+                _pendingEditItem = null;
+                _mouseDownPoint = e.Location;
+                var hit = HitTest(e.Location);
+                _wasSelectedOnMouseDown = hit.Item is not null
+                    && hit.Item.Selected
+                    && SelectedItems.Count == 1;
+            }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button != MouseButtons.Left || !LabelEdit)
+                return;
+
+            var hit = HitTest(e.Location);
+            // 资源管理器风格：仅对“已选中项”再点名称，且等过双击间隔后才改名。
+            if (!_wasSelectedOnMouseDown
+                || hit.Item is null
+                || SelectedItems.Count != 1
+                || !hit.Item.Selected
+                || hit.Item != GetItemAt(_mouseDownPoint.X, _mouseDownPoint.Y)
+                || (hit.Location & ListViewHitTestLocations.Label) == 0)
+                return;
+
+            _pendingEditItem = hit.Item;
+            _labelEditTimer.Interval = SystemInformation.DoubleClickTime + 50;
+            _labelEditTimer.Stop();
+            _labelEditTimer.Start();
+        }
+
+        protected override void OnDoubleClick(EventArgs e)
+        {
+            _labelEditTimer.Stop();
+            _pendingEditItem = null;
+            base.OnDoubleClick(e);
+        }
+
+        protected override void OnSelectedIndexChanged(EventArgs e)
+        {
+            _labelEditTimer.Stop();
+            _pendingEditItem = null;
+            base.OnSelectedIndexChanged(e);
+        }
 
         protected override void OnHandleCreated(EventArgs e)
         {
@@ -1131,7 +1240,7 @@ internal sealed class MainForm : Form
             return Task.CompletedTask;
         }
         _entries.FocusedItem = _entries.SelectedItems[0];
-        _entries.SelectedItems[0].BeginEdit();
+        ((BrowserListView)_entries).BeginRename(_entries.SelectedItems[0]);
         return Task.CompletedTask;
     }
 
@@ -1200,8 +1309,8 @@ internal sealed class MainForm : Form
         Dictionary<string, Dictionary<string, PfsEntry>> cache)
     {
         var name = LocalItemName(localItem);
-        // 本地 Unicode 名 → PFS 保真字节名，才能和 ls 缓存键、cd 路径一致。
-        var shellName = PfsNameEncoding.ToShell(name);
+        // 与实际 put/mkdir 一致：净化 + 截断后再转 GBK 线名。
+        var shellName = PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(name));
         var entries = await GetRemoteEntriesAsync(device, partition, remoteDirectory, cache);
         var conflict = entries.TryGetValue(shellName, out var existing);
         if (!Directory.Exists(localItem) || existing is not { IsDirectory: true })
@@ -1225,7 +1334,7 @@ internal sealed class MainForm : Form
         List<PfsImportRequest> pendingImports)
     {
         var name = LocalItemName(localItem);
-        var shellName = PfsNameEncoding.ToShell(name);
+        var shellName = PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(name));
         var isDirectory = Directory.Exists(localItem);
         var entries = await GetRemoteEntriesAsync(device, partition, remoteDirectory, cache);
         entries.TryGetValue(shellName, out var existing);
@@ -1287,7 +1396,7 @@ internal sealed class MainForm : Form
 
         // 同一目录内出现同名来源时，维持旧版逐文件覆盖语义，避免批处理改变最终结果。
         var distinctTargets = pendingImports
-            .Select(item => item.RemoteDirectory + "\0" + PfsNameEncoding.ToShell(Path.GetFileName(item.LocalFilePath)))
+            .Select(item => item.RemoteDirectory + "\0" + PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(Path.GetFileName(item.LocalFilePath))))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Count() == pendingImports.Count;
 
@@ -1428,25 +1537,89 @@ internal sealed class MainForm : Form
         budget.AvailableBytes -= requiredBytes;
     }
 
-    private static long EstimateImportRequirement(IEnumerable<string> items, uint zoneSizeBytes)
+    private async Task<long> EstimateNetImportRequirementAsync(
+        IEnumerable<string> localItems,
+        string device,
+        string partition,
+        string remoteDirectory,
+        Dictionary<string, Dictionary<string, PfsEntry>> cache,
+        uint zoneSizeBytes,
+        bool overwrite)
     {
         long required = 0;
-        foreach (var item in items)
-            required = checked(required + EstimateImportRequirement(item, zoneSizeBytes));
-        return required;
+        foreach (var item in localItems)
+            required = checked(required + await EstimateNetImportRequirementAsync(item, device, partition, remoteDirectory, cache, zoneSizeBytes, overwrite));
+        return required < 0 ? 0 : required;
     }
 
-    private static long EstimateImportRequirement(string item, uint zoneSizeBytes)
+    private async Task<long> EstimateNetImportRequirementAsync(
+        string localItem,
+        string device,
+        string partition,
+        string remoteDirectory,
+        Dictionary<string, Dictionary<string, PfsEntry>> cache,
+        uint zoneSizeBytes,
+        bool overwrite)
     {
-        if (File.Exists(item))
-            return EstimateFileRequirement(new FileInfo(item).Length, zoneSizeBytes);
-        if (!Directory.Exists(item))
-            return 0;
+        var name = LocalItemName(localItem);
+        var shellName = PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(name));
+        var isDirectory = Directory.Exists(localItem);
+        var entries = await GetRemoteEntriesAsync(device, partition, remoteDirectory, cache);
+        entries.TryGetValue(shellName, out var existing);
 
-        // 新目录自身和目录项都需要 PFS 元数据；按一个 zone 保守预留。
+        if (isDirectory)
+        {
+            long required = 0;
+            if (existing is { IsDirectory: false })
+            {
+                if (overwrite)
+                    required = checked(required - EstimateFileRequirement(existing.Size, zoneSizeBytes));
+                existing = null;
+            }
+
+            // 与 ImportLocalItemAsync 一致：仅新建目录时预留 zone；合并已有目录不计。
+            if (existing is null)
+                required = checked(required + zoneSizeBytes);
+
+            var childRemoteDirectory = CombineRemotePath(remoteDirectory, existing?.Name ?? shellName);
+            foreach (var child in Directory.EnumerateFileSystemEntries(localItem))
+                required = checked(required + await EstimateNetImportRequirementAsync(child, device, partition, childRemoteDirectory, cache, zoneSizeBytes, overwrite));
+            return required;
+        }
+
+        var fileRequirement = EstimateFileRequirement(new FileInfo(localItem).Length, zoneSizeBytes);
+        if (!overwrite || existing is null)
+            return fileRequirement;
+
+        if (existing.IsDirectory)
+        {
+            var reclaimed = await EstimateRemoteTreeRequirementAsync(device, partition, remoteDirectory, existing.Name, cache, zoneSizeBytes);
+            return checked(fileRequirement - reclaimed);
+        }
+
+        return checked(fileRequirement - EstimateFileRequirement(existing.Size, zoneSizeBytes));
+    }
+
+    private async Task<long> EstimateRemoteTreeRequirementAsync(
+        string device,
+        string partition,
+        string parentDirectory,
+        string name,
+        Dictionary<string, Dictionary<string, PfsEntry>> cache,
+        uint zoneSizeBytes)
+    {
+        // 删除整个远程目录树时，目录元数据与各文件分配均可回收。
         long required = zoneSizeBytes;
-        foreach (var child in Directory.EnumerateFileSystemEntries(item))
-            required = checked(required + EstimateImportRequirement(child, zoneSizeBytes));
+        var directory = CombineRemotePath(parentDirectory, name);
+        var entries = await GetRemoteEntriesAsync(device, partition, directory, cache);
+        foreach (var child in entries.Values)
+        {
+            if (child.IsDirectory)
+                required = checked(required + await EstimateRemoteTreeRequirementAsync(device, partition, directory, child.Name, cache, zoneSizeBytes));
+            else
+                required = checked(required + EstimateFileRequirement(child.Size, zoneSizeBytes));
+        }
+
         return required;
     }
 
@@ -1599,11 +1772,13 @@ internal sealed class MainForm : Form
                     UpdateVirtualExportProgress(progress, file, bytes, isCompleted: false);
                     return Task.CompletedTask;
                 });
-            if (!PfsShellClient.IsSuccessfulSession(result))
-                throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
             var localPath = Path.Combine(destination, PfsNameEncoding.ToDisplay(file.Name));
             if (!File.Exists(localPath))
-                throw new InvalidOperationException($"PFS 文件“{file.RelativePath}”未能导出。");
+            {
+                if (!string.IsNullOrWhiteSpace(result.CombinedOutput))
+                    AppendLog(result.CombinedOutput);
+                throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
+            }
             UpdateVirtualExportProgress(progress, file, new FileInfo(localPath).Length, isCompleted: true);
             completed = true;
             return localPath;

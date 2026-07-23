@@ -69,7 +69,10 @@ internal sealed class PfsShellClient
         destination = Path.GetFullPath(destination);
         Directory.CreateDirectory(destination);
         var targetPath = Path.Combine(destination, PfsNameEncoding.ToDisplay(fileName));
-        var command = $"lcd {Quote(PfsNameEncoding.ToShell(destination))}{Environment.NewLine}get {Quote(fileName)}";
+        // lcd / get：路径与 PFS 名均为 UTF-8 保真字节。
+        var command =
+            $"lcd {Quote(PfsNameEncoding.ToLocalShell(destination))}{Environment.NewLine}" +
+            $"get {Quote(fileName)}";
         var sessionTask = RunMountedSessionAsync(
             device,
             partition,
@@ -86,11 +89,11 @@ internal sealed class PfsShellClient
             }
         }
         var result = await sessionTask;
-        if (!IsSuccessfulSession(result))
-            return result;
-
+        // 文件已落地则视为成功（规避个别会话收尾异常）。
         if (!File.Exists(targetPath))
         {
+            if (!IsSuccessfulSession(result))
+                return result;
             return new ProcessResult(
                 -1,
                 result.StandardOutput,
@@ -114,9 +117,10 @@ internal sealed class PfsShellClient
         if (string.IsNullOrWhiteSpace(originalName))
             throw new ArgumentException("The selected file has no name.");
 
-        var localDirectory = Path.GetDirectoryName(localFilePath) ?? Environment.CurrentDirectory;
-        var shellName = PfsNameEncoding.ToShell(originalName);
-        var command = $"lcd {Quote(PfsNameEncoding.ToShell(localDirectory))}{Environment.NewLine}put {Quote(shellName)}";
+        // 直接 put：本地 UTF-8 绝对路径 + PFS UTF-8 名（pfsshell getline 已修复长命令行）。
+        var remoteName = PfsNameEncoding.ToPfsFileName(originalName);
+        var command =
+            $"put {Quote(PfsNameEncoding.ToLocalShell(localFilePath))} {Quote(PfsNameEncoding.ToShell(remoteName))}";
         return await RunMountedSessionAsync(
             device,
             partition,
@@ -143,14 +147,14 @@ internal sealed class PfsShellClient
         foreach (var request in requests)
         {
             var localFilePath = Path.GetFullPath(request.LocalFilePath);
-            var originalName = Path.GetFileName(localFilePath);
-            if (string.IsNullOrWhiteSpace(originalName))
+            var fileName = Path.GetFileName(localFilePath);
+            if (string.IsNullOrWhiteSpace(fileName))
                 throw new ArgumentException("The selected file has no name.");
 
             directFiles.Add(new DirectImportFile(
                 request,
-                Path.GetDirectoryName(localFilePath) ?? Environment.CurrentDirectory,
-                PfsNameEncoding.ToShell(originalName),
+                PfsNameEncoding.ToLocalShell(localFilePath),
+                PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(fileName)),
                 new FileInfo(localFilePath).Length));
         }
 
@@ -161,8 +165,7 @@ internal sealed class PfsShellClient
             var targetPath = PathParts(file.Request.RemoteDirectory);
             AppendPathTransition(command, currentPath, targetPath);
             currentPath = targetPath;
-            command.AppendLine($"lcd {Quote(PfsNameEncoding.ToShell(file.LocalDirectory))}");
-            command.AppendLine($"put {Quote(file.ShellName)}");
+            command.AppendLine($"put {Quote(file.LocalPathShell)} {Quote(file.RemoteNameShell)}");
         }
 
         var progressIndex = 0;
@@ -192,13 +195,13 @@ internal sealed class PfsShellClient
         RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"rm {Quote(name)}", cancellationToken);
 
     public Task<ProcessResult> CreateDirectoryAsync(string device, string partition, string remoteDirectory, string name, CancellationToken cancellationToken) =>
-        RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"mkdir {Quote(PfsNameEncoding.ToShell(name))}", cancellationToken);
+        RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"mkdir {Quote(PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(name)))}", cancellationToken);
 
     public Task<ProcessResult> RemoveDirectoryAsync(string device, string partition, string remoteDirectory, string name, CancellationToken cancellationToken) =>
         RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"rmdir {Quote(name)}", cancellationToken);
 
     public Task<ProcessResult> RenameAsync(string device, string partition, string remoteDirectory, string oldName, string newName, CancellationToken cancellationToken) =>
-        RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"rename {Quote(oldName)} {Quote(PfsNameEncoding.ToShell(newName))}", cancellationToken);
+        RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"rename {Quote(oldName)} {Quote(PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(newName)))}", cancellationToken);
 
     private Task<ProcessResult> RunSessionAsync(string device, IReadOnlyList<string> remotePath, string command, CancellationToken cancellationToken) =>
         RunSessionCoreAsync(device, mountPartition: null, remotePath, command, cancellationToken, progress: null);
@@ -224,7 +227,8 @@ internal sealed class PfsShellClient
             throw new FileNotFoundException("pfsshell.exe is missing. Build the project from this repository or place it in the tools folder.", _executablePath);
 
         var script = new StringBuilder();
-        script.AppendLine($"device {Quote(device)}");
+        // 镜像路径可能含任意 Unicode：按 UTF-8 字节送给 pfsshell。
+        script.AppendLine($"device {Quote(PfsNameEncoding.ToLocalShell(device))}");
         if (mountPartition is not null)
             script.AppendLine($"mount {Quote(mountPartition)}");
         foreach (var part in remotePath)
@@ -235,7 +239,7 @@ internal sealed class PfsShellClient
         if (mountPartition is not null)
             script.AppendLine("umount");
         script.AppendLine("exit");
-        // Latin-1 保真传输原始文件名字节；用户可见名称由 PfsNameEncoding.ToDisplay 再按 ACP 解码。
+        // Latin-1 保真传输 UTF-8 字节；显示侧由 ToDisplay 再解码。
         return await ProcessRunner.RunAsync(
             _executablePath,
             string.Empty,
@@ -334,7 +338,7 @@ internal sealed class PfsShellClient
 
     private sealed record DirectImportFile(
         PfsImportRequest Request,
-        string LocalDirectory,
-        string ShellName,
+        string LocalPathShell,
+        string RemoteNameShell,
         long Length);
 }
