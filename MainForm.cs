@@ -860,8 +860,10 @@ internal sealed class MainForm : Form
                 await RunBusyAsync($"正在导入 {items.Length} 个项目…", async () =>
                 {
                     var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
+                    var pendingImports = new List<PfsImportRequest>();
                     foreach (var item in items)
-                        await ImportLocalItemAsync(item, device, partition, _currentPath, cache, hasConflicts, progress, spaceBudget);
+                        await ImportLocalItemAsync(item, device, partition, _currentPath, cache, hasConflicts, progress, spaceBudget, pendingImports);
+                    await ImportPendingFilesAsync(device, partition, pendingImports, progress);
                     await RefreshDirectoryAsync();
                 });
             }
@@ -1219,7 +1221,8 @@ internal sealed class MainForm : Form
         Dictionary<string, Dictionary<string, PfsEntry>> cache,
         bool overwrite,
         ImportProgressState progress,
-        ImportSpaceBudget spaceBudget)
+        ImportSpaceBudget spaceBudget,
+        List<PfsImportRequest> pendingImports)
     {
         var name = LocalItemName(localItem);
         var shellName = PfsNameEncoding.ToShell(name);
@@ -1248,7 +1251,7 @@ internal sealed class MainForm : Form
 
             var childRemoteDirectory = CombineRemotePath(remoteDirectory, existing?.Name ?? shellName);
             foreach (var child in Directory.EnumerateFileSystemEntries(localItem))
-                await ImportLocalItemAsync(child, device, partition, childRemoteDirectory, cache, overwrite, progress, spaceBudget);
+                await ImportLocalItemAsync(child, device, partition, childRemoteDirectory, cache, overwrite, progress, spaceBudget, pendingImports);
             return;
         }
 
@@ -1269,12 +1272,83 @@ internal sealed class MainForm : Form
         var fileRequirement = EstimateFileRequirement(fileLength, spaceBudget.ZoneSizeBytes);
         await ReservePfsSpaceAsync(device, partition, spaceBudget, fileRequirement, name, isDirectory: false);
         SetImportProgress(progress, localItem, 0, isCompleted: false);
-        var import = await ImportFileWithProgressAsync(device, partition, remoteDirectory, localItem, fileLength, progress);
-        AppendResult(import);
-        if (!PfsShellClient.IsSuccessfulSession(import))
-            throw new InvalidOperationException($"导入“{name}”失败，请查看诊断输出。");
+        pendingImports.Add(new PfsImportRequest(remoteDirectory, localItem));
         entries[shellName] = new PfsEntry(shellName, false, string.Empty);
-        SetImportProgress(progress, localItem, fileLength, isCompleted: true);
+    }
+
+    private async Task ImportPendingFilesAsync(
+        string device,
+        string partition,
+        IReadOnlyList<PfsImportRequest> pendingImports,
+        ImportProgressState progress)
+    {
+        if (pendingImports.Count == 0)
+            return;
+
+        // 同一目录内出现同名来源时，维持旧版逐文件覆盖语义，避免批处理改变最终结果。
+        var distinctTargets = pendingImports
+            .Select(item => item.RemoteDirectory + "\0" + PfsNameEncoding.ToShell(Path.GetFileName(item.LocalFilePath)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count() == pendingImports.Count;
+
+        if (pendingImports.Count > 1 && distinctTargets)
+        {
+            var completed = new HashSet<PfsImportRequest>();
+            var uiUpdateTimer = Stopwatch.StartNew();
+            var batch = await _pfs.ImportBatchAsync(
+                device,
+                partition,
+                pendingImports,
+                CancellationToken.None,
+                async (item, bytes, isCompleted) =>
+                {
+                    var fileLength = new FileInfo(item.LocalFilePath).Length;
+                    var transferred = Math.Clamp(bytes, 0, fileLength);
+                    if (isCompleted)
+                    {
+                        if (completed.Add(item))
+                            SetImportProgress(progress, item.LocalFilePath, fileLength, isCompleted: true);
+                        return;
+                    }
+
+                    if (uiUpdateTimer.ElapsedMilliseconds >= 1000)
+                    {
+                        SetImportProgress(progress, item.LocalFilePath, transferred, isCompleted: false);
+                        uiUpdateTimer.Restart();
+                    }
+                    await Task.CompletedTask;
+                });
+
+            if (batch.UsedSharedSession)
+            {
+                if (batch.Result is null)
+                    throw new InvalidOperationException("批量导入未返回执行结果。");
+                AppendResult(batch.Result);
+                if (!PfsShellClient.IsSuccessfulSession(batch.Result))
+                    throw new InvalidOperationException("批量导入失败，请查看诊断输出。");
+
+                // pfsshell 成功写完时会报告每个文件的最终字节数；此处仅补偿异常缺失的最终进度事件。
+                foreach (var item in pendingImports.Where(item => !completed.Contains(item)))
+                {
+                    var fileLength = new FileInfo(item.LocalFilePath).Length;
+                    SetImportProgress(progress, item.LocalFilePath, fileLength, isCompleted: true);
+                }
+                AppendLog($"已使用共享 PFS 会话连续导入 {pendingImports.Count} 个文件。");
+                return;
+            }
+
+            AppendLog($"{batch.FallbackReason}，已切换为逐文件兼容导入。");
+        }
+
+        foreach (var item in pendingImports)
+        {
+            var fileLength = new FileInfo(item.LocalFilePath).Length;
+            var import = await ImportFileWithProgressAsync(device, partition, item.RemoteDirectory, item.LocalFilePath, fileLength, progress);
+            AppendResult(import);
+            if (!PfsShellClient.IsSuccessfulSession(import))
+                throw new InvalidOperationException($"导入“{Path.GetFileName(item.LocalFilePath)}”失败，请查看诊断输出。");
+            SetImportProgress(progress, item.LocalFilePath, fileLength, isCompleted: true);
+        }
     }
 
     // pfsshell 在每次成功写入一个传输块后报告累计字节数；

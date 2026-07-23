@@ -5,6 +5,10 @@ using PfsExplorerLite.Models;
 
 namespace PfsExplorerLite.Services;
 
+internal sealed record PfsImportRequest(string RemoteDirectory, string LocalFilePath);
+
+internal sealed record PfsBatchImportResult(ProcessResult? Result, bool UsedSharedSession, string? FallbackReason);
+
 internal sealed class PfsShellClient
 {
     private static readonly string[] BannerFragments =
@@ -162,6 +166,90 @@ internal sealed class PfsShellClient
         }
     }
 
+    /// <summary>
+    /// 将一批同卷 NTFS 文件放入同一个 pfsshell 会话，避免每个文件都重新打开、挂载和卸载 PFS。
+    /// 若来源不支持硬链接，则返回兼容模式标记；调用方应继续使用逐文件导入，避免一次性复制大量临时文件。
+    /// </summary>
+    public async Task<PfsBatchImportResult> ImportBatchAsync(
+        string device,
+        string partition,
+        IReadOnlyList<PfsImportRequest> requests,
+        CancellationToken cancellationToken,
+        Func<PfsImportRequest, long, bool, Task>? progress = null)
+    {
+        if (requests.Count == 0)
+            return new PfsBatchImportResult(new ProcessResult(0, string.Empty, string.Empty), true, null);
+
+        var stagedFiles = new List<StagedImportFile>(requests.Count);
+        try
+        {
+            foreach (var request in requests)
+            {
+                var localFilePath = Path.GetFullPath(request.LocalFilePath);
+                var originalName = Path.GetFileName(localFilePath);
+                if (string.IsNullOrWhiteSpace(originalName))
+                    throw new ArgumentException("The selected file has no name.");
+
+                var stagingRoot = CreateAsciiStagingDirectory("Import", localFilePath);
+                var extension = Path.GetExtension(originalName);
+                var stagingName = "payload_" + Guid.NewGuid().ToString("N")[..8] + (IsAscii(extension) ? extension : ".bin");
+                var stagingPath = Path.Combine(stagingRoot, stagingName);
+
+                // 仅接受无数据复制的硬链接。否则保留逐文件兼容路径，避免批量暂存占满本地磁盘。
+                if (!TryCreateHardLink(stagingPath, localFilePath))
+                {
+                    TryDeleteDirectory(stagingRoot);
+                    return new PfsBatchImportResult(null, false, "来源不支持同卷 NTFS 硬链接暂存");
+                }
+
+                stagedFiles.Add(new StagedImportFile(
+                    request,
+                    stagingRoot,
+                    stagingName,
+                    PfsNameEncoding.ToShell(originalName),
+                    new FileInfo(localFilePath).Length));
+            }
+
+            IReadOnlyList<string> currentPath = Array.Empty<string>();
+            var command = new StringBuilder();
+            foreach (var staged in stagedFiles)
+            {
+                var targetPath = PathParts(staged.Request.RemoteDirectory);
+                AppendPathTransition(command, currentPath, targetPath);
+                currentPath = targetPath;
+                command.AppendLine($"lcd {Quote(staged.StagingRoot)}");
+                command.AppendLine($"put {Quote(staged.StagingName)}");
+                command.AppendLine($"rename {Quote(staged.StagingName)} {Quote(staged.TargetName)}");
+            }
+
+            var progressIndex = 0;
+            var result = await RunSessionCoreAsync(
+                device,
+                partition,
+                [],
+                command.ToString(),
+                cancellationToken,
+                async bytes =>
+                {
+                    if (progressIndex >= stagedFiles.Count || progress is null)
+                        return;
+
+                    var staged = stagedFiles[progressIndex];
+                    var transferred = Math.Clamp(bytes, 0, staged.Length);
+                    var completed = transferred >= staged.Length;
+                    await progress(staged.Request, transferred, completed);
+                    if (completed)
+                        progressIndex++;
+                });
+            return new PfsBatchImportResult(result, true, null);
+        }
+        finally
+        {
+            foreach (var staged in stagedFiles)
+                TryDeleteDirectory(staged.StagingRoot);
+        }
+    }
+
     // name/oldName 须为 ls 得到的保真字节名；勿再 ToShell，否则乱码名会被二次编码。
     public Task<ProcessResult> DeleteAsync(string device, string partition, string remoteDirectory, string name, CancellationToken cancellationToken) =>
         RunMountedSessionAsync(device, partition, PathParts(remoteDirectory), $"rm {Quote(name)}", cancellationToken);
@@ -291,6 +379,20 @@ internal sealed class PfsShellClient
     private static IReadOnlyList<string> PathParts(string path) =>
         path.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
+    // 只生成必要的 cd/cd ..，确保一批文件可以在同一挂载会话中写入不同目录。
+    private static void AppendPathTransition(StringBuilder command, IReadOnlyList<string> currentPath, IReadOnlyList<string> targetPath)
+    {
+        var commonLength = 0;
+        while (commonLength < currentPath.Count && commonLength < targetPath.Count &&
+               string.Equals(currentPath[commonLength], targetPath[commonLength], StringComparison.Ordinal))
+            commonLength++;
+
+        for (var index = currentPath.Count - 1; index >= commonLength; index--)
+            command.AppendLine("cd ..");
+        for (var index = commonLength; index < targetPath.Count; index++)
+            command.AppendLine($"cd {Quote(targetPath[index])}");
+    }
+
     private static string Quote(string value) => $"\"{value.Replace("\"", string.Empty)}\"";
 
     private static bool IsAscii(string value) => value.Length > 0 && value.All(static c => c <= 0x7F);
@@ -341,6 +443,13 @@ internal sealed class PfsShellClient
         File.Copy(sourcePath, destinationPath, overwrite: true);
     }
 
+    private static bool TryCreateHardLink(string linkPath, string existingFilePath)
+    {
+        if (File.Exists(linkPath))
+            File.Delete(linkPath);
+        return CreateHardLink(linkPath, existingFilePath, IntPtr.Zero);
+    }
+
     private static void TryDeleteDirectory(string path)
     {
         try
@@ -355,4 +464,11 @@ internal sealed class PfsShellClient
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLink(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
+    private sealed record StagedImportFile(
+        PfsImportRequest Request,
+        string StagingRoot,
+        string StagingName,
+        string TargetName,
+        long Length);
 }
