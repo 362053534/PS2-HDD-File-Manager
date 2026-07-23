@@ -12,7 +12,8 @@
 
   <ItemGroup>
     <None Include="..\PFS-BatchKit-Manager\BAT\hdl_dump.exe" Link="tools\hdl_dump.exe" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\PFS-BatchKit-Manager\BAT\pfsshell.exe" Link="tools\pfsshell.exe" CopyToOutputDirectory="PreserveNewest" />
+    <!-- pfsshell 使用源码编译产物，不从 BAT 拷贝；Release 打包脚本会确保其已生成。 -->
+    <None Include="..\..\pfsshell\build-local-win32\pfsshell.exe" Link="tools\pfsshell.exe" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\PFS-BatchKit-Manager\BAT\wnbd-client.exe" Link="tools\wnbd-client.exe" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\PFS-BatchKit-Manager\BAT\libwnbd.dll" Link="tools\libwnbd.dll" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

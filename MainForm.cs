@@ -89,7 +89,7 @@ internal sealed class MainForm : Form
         _entries.BeforeLabelEdit += (_, e) =>
         {
             // 分区列表不允许就地重命名；仅已打开的 PFS 目录可改名。
-            // 且须由二次单击计时器 / 菜单 / F2 显式允许，避免单击过灵敏。
+            // 只接受 BeginRename（单击延时 / 文件双击 / F2 / 菜单），屏蔽系统原生误触发以免闪一下又取消。
             var browser = (BrowserListView)_entries;
             if (!browser.AllowNextLabelEdit
                 || _activePartition is null
@@ -252,6 +252,9 @@ internal sealed class MainForm : Form
             MakeButton("加载硬盘镜像", SelectImage)
         ]);
 
+        var ejectBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        ejectBar.Controls.Add(MakeButton("安全弹出硬盘", async (_, _) => await SafeEjectSelectedAsync()));
+
         var nbdBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         var ipBox = new TextBox { Width = 170, PlaceholderText = "PS2 NBD IP，例如 192.168.1.10" };
         nbdBar.Controls.AddRange(
@@ -270,6 +273,7 @@ internal sealed class MainForm : Form
 
         var top = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Padding = new Padding(10) };
         top.Controls.Add(sourceBar);
+        top.Controls.Add(ejectBar);
         top.Controls.Add(nbdBar);
         top.Controls.Add(actionBar);
 
@@ -696,6 +700,77 @@ internal sealed class MainForm : Form
         await RefreshDisksAsync();
     });
 
+    private async Task SafeEjectSelectedAsync()
+    {
+        if (Volatile.Read(ref _fileTransferDepth) != 0)
+        {
+            ShowWarning("正在传输文件，请等待完成后再安全弹出。");
+            return;
+        }
+
+        if (_deviceCombo.SelectedItem is not DeviceItem item || string.IsNullOrWhiteSpace(item.Path))
+        {
+            ShowWarning("请先选择要弹出的 PS2 硬盘。");
+            return;
+        }
+
+        // 镜像文件不是可弹出设备，仅从列表移除。
+        if (!DiskSafeEject.TryParsePhysicalDriveNumber(item.Path, out var driveNumber))
+        {
+            if (MessageBox.Show(this,
+                    $"“{item.Display}”是镜像文件，无法执行硬件弹出。\n是否仅从列表中移除？",
+                    Text,
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+
+            RemoveSelectedSourceDevice();
+            ResetPfsExplorer();
+            AppendLog($"已从列表移除镜像：{item.Path}");
+            return;
+        }
+
+        var isNbd = item.Display.StartsWith("PS2 NBD", StringComparison.OrdinalIgnoreCase);
+        var action = isNbd ? "断开 NBD 映射" : "安全弹出";
+        if (MessageBox.Show(this,
+                $"确定要{action}吗？\n\n{item.Display}\n\n弹出前请确认没有其它程序正在访问该硬盘。",
+                Text,
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        if (isNbd)
+        {
+            await DisconnectNbdAsync();
+            return;
+        }
+
+        await RunBusyAsync($"正在安全弹出 PhysicalDrive{driveNumber}…", async () =>
+        {
+            await Task.Run(() => DiskSafeEject.EjectPhysicalDrive(driveNumber));
+            AppendLog($"已请求安全弹出 PhysicalDrive{driveNumber}。");
+        });
+
+        RemoveSelectedSourceDevice();
+        ResetPfsExplorer();
+        AppendLog("硬盘已从列表移除。若托盘仍提示可安全移除，请再确认硬件指示灯熄灭后拔出。");
+    }
+
+    private void RemoveSelectedSourceDevice()
+    {
+        var index = _deviceCombo.SelectedIndex;
+        if (index < 0)
+            return;
+        _deviceCombo.Items.RemoveAt(index);
+        if (_deviceCombo.Items.Count == 0)
+        {
+            _deviceCombo.Items.Add(new DeviceItem(string.Empty, "未检测到PS2硬盘"));
+            _deviceCombo.SelectedIndex = 0;
+            return;
+        }
+
+        _deviceCombo.SelectedIndex = Math.Min(index, _deviceCombo.Items.Count - 1);
+    }
     private async Task LoadPartitionsAsync()
     {
         if (!TryGetDevice(out var device)) return;
@@ -949,7 +1024,8 @@ internal sealed class MainForm : Form
     {
         public event Func<string[], Task>? FilesDropped;
 
-        // 仅允许“已选中后再点名称”经延时进入编辑，屏蔽系统默认的过灵敏单击改名。
+        // 资源管理器风格：已选中后再点名称 → 等过双击判定后再重命名；
+        // 若在双击间隔内又点一次：目录打开，文件则直接重命名（文件本来就不会“打开”）。
         private readonly System.Windows.Forms.Timer _labelEditTimer = new();
         private ListViewItem? _pendingEditItem;
         private bool _wasSelectedOnMouseDown;
@@ -1008,34 +1084,41 @@ internal sealed class MainForm : Form
                 return;
 
             var hit = HitTest(e.Location);
-            // 资源管理器风格：仅对“已选中项”再点名称，且等过双击间隔后才改名。
             if (!_wasSelectedOnMouseDown
                 || hit.Item is null
                 || SelectedItems.Count != 1
                 || !hit.Item.Selected
                 || hit.Item != GetItemAt(_mouseDownPoint.X, _mouseDownPoint.Y)
-                || (hit.Location & ListViewHitTestLocations.Label) == 0)
+                || !IsRenameHit(hit))
                 return;
 
             _pendingEditItem = hit.Item;
-            _labelEditTimer.Interval = SystemInformation.DoubleClickTime + 50;
+            _labelEditTimer.Interval = Math.Max(50, SystemInformation.DoubleClickTime);
             _labelEditTimer.Stop();
             _labelEditTimer.Start();
         }
 
         protected override void OnDoubleClick(EventArgs e)
         {
+            var pending = _pendingEditItem;
             _labelEditTimer.Stop();
             _pendingEditItem = null;
+
+            // 文件没有“打开”，双击间隔内的第二次点击改为重命名，避免只闪一下没有反馈。
+            if (pending is not null
+                && pending.ListView == this
+                && pending.Selected
+                && SelectedItems.Count == 1
+                && pending.Tag is PfsEntry { IsDirectory: false })
+            {
+                BeginRename(pending);
+            }
+
             base.OnDoubleClick(e);
         }
 
-        protected override void OnSelectedIndexChanged(EventArgs e)
-        {
-            _labelEditTimer.Stop();
-            _pendingEditItem = null;
-            base.OnSelectedIndexChanged(e);
-        }
+        private static bool IsRenameHit(ListViewHitTestInfo hit) =>
+            (hit.Location & (ListViewHitTestLocations.Label | ListViewHitTestLocations.Image)) != 0;
 
         protected override void OnHandleCreated(EventArgs e)
         {
