@@ -30,6 +30,9 @@ internal sealed class PfsShellClient
     public Task<ProcessResult> RemovePartitionAsync(string device, string name, CancellationToken cancellationToken) =>
         RunSessionAsync(device, [], $"rmpart {Quote(name)}", cancellationToken);
 
+    public Task<ProcessResult> RenamePartitionAsync(string device, string oldName, string newName, CancellationToken cancellationToken) =>
+        RunSessionAsync(device, [], $"rename {Quote(oldName)} {Quote(newName)}", cancellationToken);
+
     public async Task<IReadOnlyList<string>> FilterBrowsablePfsPartitionsAsync(
         string device,
         IReadOnlyList<string> partitions,

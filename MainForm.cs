@@ -31,6 +31,7 @@ internal sealed class MainForm : Form
     private readonly ToolStripMenuItem _pasteMenuItem = new("粘贴");
     private readonly ToolStripMenuItem _newDirectoryMenuItem = new("新建目录");
     private readonly ToolStripMenuItem _newPartitionMenuItem = new("新建 PFS 分区");
+    private readonly ToolStripMenuItem _renamePartitionMenuItem = new("重命名分区");
     private readonly ToolStripMenuItem _deletePartitionMenuItem = new("删除 PFS 分区");
     private readonly ToolStripMenuItem _refreshMenuItem = new("刷新");
     private readonly ToolStripSeparator _entryMenuSeparator = new();
@@ -177,6 +178,7 @@ internal sealed class MainForm : Form
         _pasteMenuItem.Click += async (_, _) => await PasteImportAsync();
         _newDirectoryMenuItem.Click += async (_, _) => await CreateDirectoryAsync();
         _newPartitionMenuItem.Click += async (_, _) => await CreatePfsPartitionAsync();
+        _renamePartitionMenuItem.Click += async (_, _) => await RenameSelectedPartitionAsync();
         _deletePartitionMenuItem.Click += async (_, _) => await DeleteSelectedPartitionAsync();
         _refreshMenuItem.Click += async (_, _) => await RefreshBrowserAsync();
         _entryMenu.Items.AddRange(
@@ -189,6 +191,7 @@ internal sealed class MainForm : Form
             _newDirectoryMenuItem,
             _entryMenuSeparator2,
             _newPartitionMenuItem,
+            _renamePartitionMenuItem,
             _deletePartitionMenuItem,
             _refreshMenuItem
         ]);
@@ -211,8 +214,10 @@ internal sealed class MainForm : Form
             _entryMenuSeparator2.Visible = inPartition;
             _newPartitionMenuItem.Visible = !inPartition;
             _newPartitionMenuItem.Enabled = !inPartition && _deviceCombo.SelectedItem is DeviceItem;
+            _renamePartitionMenuItem.Visible = !inPartition;
+            _renamePartitionMenuItem.Enabled = !inPartition && selected.Count == 1 && !IsProtectedPartitionName(selected[0].Name) && _deviceCombo.SelectedItem is DeviceItem;
             _deletePartitionMenuItem.Visible = !inPartition;
-            _deletePartitionMenuItem.Enabled = !inPartition && selected.Count == 1 && _deviceCombo.SelectedItem is DeviceItem;
+            _deletePartitionMenuItem.Enabled = !inPartition && selected.Count == 1 && !IsProtectedPartitionName(selected[0].Name) && _deviceCombo.SelectedItem is DeviceItem;
             e.Cancel = false;
         };
         _entries.ContextMenuStrip = _entryMenu;
@@ -330,7 +335,7 @@ internal sealed class MainForm : Form
             ShowWarning(sizeError);
             return;
         }
-        if (!IsSafeNewPartitionName(request.Name, out var nameError))
+        if (!IsSafePartitionName(request.Name, out var nameError))
         {
             ShowWarning(nameError);
             return;
@@ -501,10 +506,120 @@ internal sealed class MainForm : Form
             await LoadPartitionsAsync();
     }
 
+    private async Task RenameSelectedPartitionAsync()
+    {
+        if (_activePartition is not null || !TryGetDevice(out var device))
+            return;
+        if (SelectedEntry() is not { } selected)
+        {
+            ShowWarning("请在分区列表中选择一个要重命名的 PFS 分区。");
+            return;
+        }
+
+        var oldName = selected.Name;
+        if (IsProtectedPartitionName(oldName))
+        {
+            ShowWarning($"“{oldName}”是系统保留分区，程序禁止重命名。");
+            return;
+        }
+
+        var newName = Prompt.Show(this, "重命名 PFS 分区", "新分区名称：", oldName);
+        if (newName is null || newName.Equals(oldName, StringComparison.Ordinal))
+            return;
+        if (!IsSafePartitionName(newName, out var nameError))
+        {
+            ShowWarning(nameError);
+            return;
+        }
+        if (IsProtectedPartitionName(newName))
+        {
+            ShowWarning("不能使用系统保留分区名称。");
+            return;
+        }
+
+        ApaPartitionInfo? target;
+        try
+        {
+            var layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            target = layout.Partitions.SingleOrDefault(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase));
+            if (target is null || target.Type != 0x0100)
+            {
+                ShowWarning("目标不是有效的 PFS 主分区，已取消重命名。");
+                return;
+            }
+            if (layout.Partitions.Any(partition => !partition.IsSubPartition && partition.Name.Equals(newName, StringComparison.OrdinalIgnoreCase)))
+            {
+                ShowWarning($"分区“{newName}”已存在。");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"拒绝重命名分区：无法通过 APA 校验读取分区表。{ex.Message}");
+            ShowWarning("分区表无法通过完整校验，已拒绝重命名。请先备份硬盘并修复分区表。");
+            return;
+        }
+
+        var sourceDisplay = (_deviceCombo.SelectedItem as DeviceItem)?.Display ?? device;
+        if (MessageBox.Show(
+                this,
+                $"将把 PFS 分区“{oldName}”重命名为“{newName}”。\n\n来源：{sourceDisplay}\n\n此操作只修改 APA 分区表中的名称，不移动分区或文件数据。请勿断电、拔出硬盘或强制关闭程序。确定继续？",
+                "确认重命名 PFS 分区",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+
+        var renamed = false;
+        await RunBusyAsync($"正在重命名 PFS 分区“{oldName}”…", async () =>
+        {
+            var beforeRename = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var currentTarget = beforeRename.Partitions.SingleOrDefault(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase));
+            if (currentTarget is null || currentTarget.Type != 0x0100 || !SamePartitionLayout(currentTarget, target!))
+                throw new InvalidOperationException("重命名前分区表状态已变化，已取消操作。");
+            if (IsProtectedPartitionName(currentTarget.Name) || beforeRename.Partitions.Any(partition =>
+                    !partition.IsSubPartition && partition.Name.Equals(newName, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException("重命名前发现系统保留名称或同名分区，已取消操作。");
+
+            var result = await _pfs.RenamePartitionAsync(device, oldName, newName, CancellationToken.None);
+            AppendResult(result);
+            if (!PfsShellClient.IsSuccessfulSession(result))
+                throw new InvalidOperationException("pfsshell 未能重命名 PFS 分区，请查看诊断输出。");
+
+            var afterRename = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var renamedTarget = afterRename.Partitions.SingleOrDefault(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(newName, StringComparison.OrdinalIgnoreCase));
+            var oldTarget = afterRename.Partitions.Any(partition =>
+                !partition.IsSubPartition && partition.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase));
+            if (renamedTarget is null || oldTarget || !SamePartitionLayout(renamedTarget, target!))
+                throw new InvalidOperationException("重命名后的 APA 分区表校验未通过。请立即停止写入、保留硬盘现状并查看诊断输出。");
+
+            renamed = true;
+            AppendLog($"已重命名 PFS 分区“{oldName}”为“{newName}”，分区位置、容量和子分区布局已复核一致。");
+        });
+
+        if (renamed)
+            await LoadPartitionsAsync();
+    }
+
+    private static bool SamePartitionLayout(ApaPartitionInfo left, ApaPartitionInfo right) =>
+        left.StartSector == right.StartSector &&
+        left.LengthSectors == right.LengthSectors &&
+        left.Type == right.Type &&
+        left.Flags == right.Flags &&
+        left.MainSector == right.MainSector &&
+        left.Number == right.Number &&
+        left.SubPartitions.SequenceEqual(right.SubPartitions);
+
     private static bool IsProtectedPartitionName(string name) =>
         name.Equals("__mbr", StringComparison.OrdinalIgnoreCase) ||
         name.Equals("__net", StringComparison.OrdinalIgnoreCase) ||
-        name.Equals("__system", StringComparison.OrdinalIgnoreCase);
+        name.Equals("__system", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("__sysconf", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("__common", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("__boot", StringComparison.OrdinalIgnoreCase);
 
     private void SelectImageDevice(string imagePath, string displayName)
     {
@@ -1523,11 +1638,11 @@ internal sealed class MainForm : Form
             : $"{bytesPerSecond / gibibyte:0.##} GB/s";
     }
 
-    private static bool IsSafeNewPartitionName(string name, out string error)
+    private static bool IsSafePartitionName(string name, out string error)
     {
-        if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^\+[A-Za-z0-9_.-]{1,31}$"))
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[+A-Za-z0-9_.-]{1,32}$"))
         {
-            error = "分区名必须以 + 开头，后面只能使用英文、数字、点、下划线或连字符；总长度最多 32 个字符。例如：+DATA。";
+            error = "分区名只能使用英文、数字、加号、点、下划线或连字符；总长度最多 32 个字符。例如：DATA 或 +DATA。";
             return false;
         }
 
@@ -1900,7 +2015,7 @@ internal static class PartitionCreatePrompt
         };
         var description = new Label
         {
-            Text = $"当前 APA 未分配空间：{freeSpace}\n分区名必须以 + 开头；容量必须是 128MiB 的整数倍。\n大于单个 APA 分区上限时，会由 PS2SDK 自动建立主分区和子分区。",
+            Text = $"当前 APA 未分配空间：{freeSpace}\n分区名可使用 DATA 或 +DATA；容量必须是 128MiB 的整数倍。\n大于单个 APA 分区上限时，会由 PS2SDK 自动建立主分区和子分区。",
             Left = 18,
             Top = 15,
             Width = 632,
