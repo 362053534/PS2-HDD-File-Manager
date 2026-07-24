@@ -22,7 +22,15 @@ internal sealed class MainForm : Form
     private readonly ComboBox _deviceCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 549 };
     private readonly Button _refreshDisksButton = new() { Text = "刷新", AutoSize = true, Margin = new Padding(4) };
     private readonly TextBox _pathBox = new() { ReadOnly = true, Width = 510, Text = "/" };
+    private readonly CheckBox _showSystemPartitionsCheckBox = new()
+    {
+        Text = "显示系统分区",
+        AutoSize = true,
+        Checked = false,
+        Margin = new Padding(12, 8, 4, 0)
+    };
     private readonly Label _diskSpaceLabel = new() { AutoSize = true, Padding = new Padding(8, 3, 0, 0), Text = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—" };
+    private readonly Button _downloadArt2Button = new() { Text = "一键下载ART2图集", AutoSize = true, Margin = new Padding(4) };
     private readonly ListView _entries = new BrowserListView { View = View.Details, FullRowSelect = true, MultiSelect = true, LabelEdit = true, Dock = DockStyle.Fill };
     private readonly ContextMenuStrip _entryMenu = new();
     private readonly ToolStripMenuItem _copyMenuItem = new("复制");
@@ -53,6 +61,7 @@ internal sealed class MainForm : Form
     private int _busyDepth;
     private int _fileTransferDepth;
     private Dictionary<Control, bool>? _busyControlStates;
+    private bool _suppressShowSystemPartitionsEvent;
 
     public MainForm()
     {
@@ -72,6 +81,15 @@ internal sealed class MainForm : Form
         // 提权进程需在创建窗口前放行拖放消息，否则资源管理器拖入会被 UIPI 拦截。
         AllowDragDropFromLowerIntegrityProcessWide();
         BuildUi();
+        // Backspace 在窗体级处理，避免焦点不在 ListView 时无法返回上级。
+        KeyDown += async (_, e) =>
+        {
+            if (e.KeyCode != Keys.Back || IsEditableTextInputFocused())
+                return;
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            await GoUpAsync();
+        };
         Shown += async (_, _) => await RefreshDisksAsync();
         FormClosed += (_, _) => _nbd.Dispose();
     }
@@ -255,6 +273,10 @@ internal sealed class MainForm : Form
         var ejectBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         ejectBar.Controls.Add(MakeButton("安全弹出硬盘", async (_, _) => await SafeEjectSelectedAsync()));
 
+        var art2Bar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        art2Bar.Controls.Add(_downloadArt2Button);
+        _downloadArt2Button.Click += async (_, _) => await DownloadArt2Async();
+
         var nbdBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         var ipBox = new TextBox { Width = 170, PlaceholderText = "PS2 NBD IP，例如 192.168.1.10" };
         nbdBar.Controls.AddRange(
@@ -268,13 +290,21 @@ internal sealed class MainForm : Form
         actionBar.Controls.AddRange(
         [
             MakeButton("上级目录", async (_, _) => await GoUpAsync()),
-            _pathBox
+            _pathBox,
+            _showSystemPartitionsCheckBox
         ]);
+        _showSystemPartitionsCheckBox.CheckedChanged += async (_, _) => await OnShowSystemPartitionsChangedAsync();
+
+        var diskSpaceBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        _diskSpaceLabel.Margin = new Padding(0, 4, 0, 0);
+        diskSpaceBar.Controls.Add(_diskSpaceLabel);
 
         var top = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Padding = new Padding(10) };
         top.Controls.Add(sourceBar);
-        top.Controls.Add(ejectBar);
         top.Controls.Add(nbdBar);
+        top.Controls.Add(ejectBar);
+        top.Controls.Add(art2Bar);
+        top.Controls.Add(diskSpaceBar);
         top.Controls.Add(actionBar);
 
         var tabs = new TabControl { Dock = DockStyle.Fill };
@@ -284,20 +314,22 @@ internal sealed class MainForm : Form
         logPage.Controls.Add(_log);
         tabs.TabPages.Add(browserPage);
         tabs.TabPages.Add(logPage);
-        var tabsHost = new Panel { Dock = DockStyle.Fill };
-        var diskSpaceHost = new Panel { Dock = DockStyle.Top, Height = 28, Padding = new Padding(8, 3, 8, 3) };
-        _diskSpaceLabel.Location = new Point(0, -6);
-        diskSpaceHost.Controls.Add(_diskSpaceLabel);
-        tabsHost.Controls.Add(tabs);
-        tabsHost.Controls.Add(diskSpaceHost);
         _statusBar.Items.AddRange([_statusLabel, _progressBar, _transferSpeedLabel]);
         _transferSpeedLabel.BringControlToFront();
-        Controls.Add(tabsHost);
+        Controls.Add(tabs);
         Controls.Add(top);
         Controls.Add(_statusBar);
     }
 
     private Button MakeButton(string text, EventHandler click) => new Button { Text = text, AutoSize = true, Margin = new Padding(4) }.Also(button => button.Click += click);
+
+    private Task DownloadArt2Async()
+    {
+        // 预留：之后将按游戏 ID 在线下载图集，并写入当前 PFS 分区下的 ART2/ 目录。
+        AppendLog("「一键下载ART2图集」尚未实现：后续将下载到当前分区的 ART2 文件夹。");
+        ShowWarning("该功能尚未实现。\n\n预留说明：图集将下载到当前 PFS 分区内的 ART2 文件夹。");
+        return Task.CompletedTask;
+    }
 
     private async Task RefreshDisksAsync()
     {
@@ -780,6 +812,8 @@ internal sealed class MainForm : Form
             AppendResult(result);
             var apaPartitions = PfsShellClient.ParsePartitionNames(result.StandardOutput);
             var partitions = await _pfs.FilterBrowsablePfsPartitionsAsync(device, apaPartitions, CancellationToken.None);
+            if (!_showSystemPartitionsCheckBox.Checked)
+                partitions = partitions.Where(name => !IsProtectedPartitionName(name)).ToList();
             _activePartition = null;
             await UpdateDiskSpaceAsync(device, null);
             _currentPath = "/";
@@ -787,9 +821,15 @@ internal sealed class MainForm : Form
             _entries.Items.Clear();
             foreach (var partition in partitions)
             {
-                var item = new ListViewItem(partition) { Tag = new PfsEntry(partition, true, "可操作的 PFS 分区；双击查看") };
-                item.SubItems.Add("PFS 分区");
-                item.SubItems.Add("可操作的 PFS 分区；双击查看");
+                var isSystem = IsProtectedPartitionName(partition);
+                var item = new ListViewItem(partition)
+                {
+                    Tag = new PfsEntry(partition, true, isSystem ? "系统保留分区；可浏览读写，禁止删除/重命名分区" : "可操作的 PFS 分区；双击查看")
+                };
+                item.SubItems.Add(isSystem ? "系统分区" : "PFS 分区");
+                item.SubItems.Add(isSystem
+                    ? "系统保留分区；可浏览读写，禁止删除/重命名分区"
+                    : "可操作的 PFS 分区；双击查看");
                 _entries.Items.Add(item);
             }
             _entries.EndUpdate();
@@ -798,6 +838,46 @@ internal sealed class MainForm : Form
                 ? $"识别到 {partitions.Count} 个可浏览 PFS 分区。双击分区开始浏览。"
                 : "未找到可浏览的 PFS 分区。请查看诊断输出。");
         });
+    }
+
+    private async Task OnShowSystemPartitionsChangedAsync()
+    {
+        if (_suppressShowSystemPartitionsEvent)
+            return;
+
+        if (_showSystemPartitionsCheckBox.Checked)
+        {
+            var confirmed = MessageBox.Show(
+                this,
+                "即将显示系统保留分区（如 __system、__common 等）。\n\n" +
+                "确认后可以浏览并自由读写这些分区内的文件，但禁止删除或重命名系统分区本身。\n" +
+                "误操作可能导致 PS2 无法正常启动。\n\n是否继续？",
+                Text,
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning) == DialogResult.OK;
+            if (!confirmed)
+            {
+                _suppressShowSystemPartitionsEvent = true;
+                _showSystemPartitionsCheckBox.Checked = false;
+                _suppressShowSystemPartitionsEvent = false;
+                return;
+            }
+
+            AppendLog("已启用显示系统分区：可读写分区内文件，仍禁止删除/重命名系统分区。");
+        }
+        else
+        {
+            AppendLog("已隐藏系统分区。");
+            if (_activePartition is not null && IsProtectedPartitionName(_activePartition))
+            {
+                _activePartition = null;
+                _currentPath = "/";
+            }
+        }
+
+        // 仅在分区列表视图下刷新；若正在普通分区内浏览则无需重载目录。
+        if (_activePartition is null && _deviceCombo.SelectedItem is DeviceItem { Path.Length: > 0 })
+            await LoadPartitionsAsync();
     }
 
     private async Task RefreshDirectoryAsync()
@@ -858,6 +938,22 @@ internal sealed class MainForm : Form
         parts.RemoveAt(parts.Count - 1);
         _currentPath = parts.Count == 0 ? "/" : "/" + string.Join('/', parts);
         await RefreshDirectoryAsync();
+    }
+
+    // 可编辑文本框（含重命名编辑框、NBD IP）内保留 Backspace 删字；只读路径框等仍触发返回上级。
+    private bool IsEditableTextInputFocused()
+    {
+        for (Control? control = ActiveControl; control is not null; control = control.Parent)
+        {
+            if (control is TextBox { ReadOnly: true })
+                return false;
+            if (control is TextBoxBase)
+                return true;
+            if (control is ComboBox { DropDownStyle: not ComboBoxStyle.DropDownList })
+                return true;
+        }
+
+        return false;
     }
 
     private async Task ExportSelectedAsync()
