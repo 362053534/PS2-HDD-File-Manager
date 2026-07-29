@@ -290,8 +290,8 @@ internal sealed class MainForm : Form
         actionBar.Controls.AddRange(
         [
             MakeButton("上级目录", async (_, _) => await GoUpAsync()),
-            _pathBox,
-            _showSystemPartitionsCheckBox
+            _showSystemPartitionsCheckBox,
+            _pathBox
         ]);
         _showSystemPartitionsCheckBox.CheckedChanged += async (_, _) => await OnShowSystemPartitionsChangedAsync();
 
