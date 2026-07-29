@@ -1756,11 +1756,12 @@ internal sealed class MainForm : Form
                 existing = null;
             }
 
-            // 与 ImportLocalItemAsync 一致：仅新建目录时预留 zone；合并已有目录不计。
+            // 远程尚无此目录（或刚删掉同名文件准备新建）：按本地树估算，勿 ls 未创建路径。
             if (existing is null)
-                required = checked(required + zoneSizeBytes);
+                return checked(required + EstimateLocalImportRequirement(localItem, zoneSizeBytes));
 
-            var childRemoteDirectory = CombineRemotePath(remoteDirectory, existing?.Name ?? shellName);
+            // 合并已有同名目录：只累计子项净需求。
+            var childRemoteDirectory = CombineRemotePath(remoteDirectory, existing.Name);
             foreach (var child in Directory.EnumerateFileSystemEntries(localItem))
                 required = checked(required + await EstimateNetImportRequirementAsync(child, device, partition, childRemoteDirectory, cache, zoneSizeBytes, overwrite));
             return required;
@@ -1799,6 +1800,20 @@ internal sealed class MainForm : Form
                 required = checked(required + EstimateFileRequirement(child.Size, zoneSizeBytes));
         }
 
+        return required;
+    }
+
+    private static long EstimateLocalImportRequirement(string item, uint zoneSizeBytes)
+    {
+        if (File.Exists(item))
+            return EstimateFileRequirement(new FileInfo(item).Length, zoneSizeBytes);
+        if (!Directory.Exists(item))
+            return 0;
+
+        // 新目录自身按一个 zone 预留，再累加子项。
+        long required = zoneSizeBytes;
+        foreach (var child in Directory.EnumerateFileSystemEntries(item))
+            required = checked(required + EstimateLocalImportRequirement(child, zoneSizeBytes));
         return required;
     }
 
