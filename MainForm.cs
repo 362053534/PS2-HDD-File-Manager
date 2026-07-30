@@ -3,6 +3,7 @@ using System.Text;
 using System.Diagnostics;
 using PfsExplorerLite.Models;
 using PfsExplorerLite.Services;
+using PfsExplorerLite.Services.PfsNet;
 
 namespace PfsExplorerLite;
 
@@ -15,6 +16,7 @@ internal sealed class MainForm : Form
 
     private readonly PfsShellClient _pfs;
     private readonly NbdClient _nbd;
+    private readonly PfsNetClient _pfsNet = new();
     private readonly DiskDiscovery _diskDiscovery;
     private readonly ApaSpaceReader _apaSpaceReader;
     private readonly ApaPartitionTableReader _apaPartitionTableReader;
@@ -91,7 +93,12 @@ internal sealed class MainForm : Form
             await GoUpAsync();
         };
         Shown += async (_, _) => await RefreshDisksAsync();
-        FormClosed += (_, _) => _nbd.Dispose();
+        FormClosed += (_, _) =>
+        {
+            try { _pfsNet.Disconnect(); } catch { }
+            _pfsNet.Dispose();
+            _nbd.Dispose();
+        };
     }
 
     private void BuildUi()
@@ -281,9 +288,19 @@ internal sealed class MainForm : Form
         var ipBox = new TextBox { Width = 170, PlaceholderText = "PS2 NBD IP，例如 192.168.1.10" };
         nbdBar.Controls.AddRange(
         [
-            new Label { Text = "网络：", AutoSize = true, Padding = new Padding(0, 8, 0, 0) }, ipBox,
+            new Label { Text = "网络(NBD)：", AutoSize = true, Padding = new Padding(0, 8, 0, 0) }, ipBox,
             MakeButton("连接 NBD", async (_, _) => await ConnectNbdAsync(ipBox.Text)),
             MakeButton("断开 NBD", async (_, _) => await DisconnectNbdAsync())
+        ]);
+
+        // PfsNet：对接 PS2 端 ps2-server ELF（与 NBD 互斥，见 PROTOCOL.md）。
+        var pfsNetBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        var pfsNetIpBox = new TextBox { Width = 170, PlaceholderText = "PS2 PfsNet IP，例如 192.168.1.10" };
+        pfsNetBar.Controls.AddRange(
+        [
+            new Label { Text = "PFS 网络：", AutoSize = true, Padding = new Padding(0, 8, 0, 0) }, pfsNetIpBox,
+            MakeButton("连接 PFS 网络", async (_, _) => await ConnectPfsNetAsync(pfsNetIpBox.Text)),
+            MakeButton("断开 PFS 网络", async (_, _) => await DisconnectPfsNetAsync())
         ]);
 
         var actionBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
@@ -302,6 +319,7 @@ internal sealed class MainForm : Form
         var top = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Padding = new Padding(10) };
         top.Controls.Add(sourceBar);
         top.Controls.Add(nbdBar);
+        top.Controls.Add(pfsNetBar);
         top.Controls.Add(ejectBar);
         top.Controls.Add(art2Bar);
         top.Controls.Add(diskSpaceBar);
@@ -340,6 +358,9 @@ internal sealed class MainForm : Form
             ResetPfsExplorer();
             foreach (var disk in disks)
                 AddSourceDevice(disk.DevicePath, disk.DisplayName);
+            // 刷新物理盘列表时保留已连接的 PfsNet 来源。
+            if (_pfsNet.IsConnected && _pfsNet.Host is { } host)
+                AddSourceDevice(PfsNetProtocol.MakeDevicePath(host), $"PS2 PfsNet · {host}");
             if (_deviceCombo.Items.Count > 0)
             {
                 _deviceCombo.SelectedIndex = 0;
@@ -370,6 +391,7 @@ internal sealed class MainForm : Form
     private async Task CreatePfsPartitionAsync()
     {
         if (!TryGetDevice(out var device)) return;
+        if (RejectNetworkPartitionMutationIfNeeded(device)) return;
 
         ApaPartitionTable layout;
         try
@@ -469,6 +491,8 @@ internal sealed class MainForm : Form
             return;
         if (!TryGetDevice(out var device))
             return;
+        if (RejectNetworkPartitionMutationIfNeeded(device))
+            return;
         if (SelectedEntry() is not { } selected)
         {
             ShowWarning("请在分区列表中选择一个要删除的 PFS 分区。");
@@ -564,6 +588,8 @@ internal sealed class MainForm : Form
     private async Task RenameSelectedPartitionAsync()
     {
         if (_activePartition is not null || !TryGetDevice(out var device))
+            return;
+        if (RejectNetworkPartitionMutationIfNeeded(device))
             return;
         if (SelectedEntry() is not { } selected)
         {
@@ -704,6 +730,12 @@ internal sealed class MainForm : Form
     private async Task ConnectNbdAsync(string ipAddress)
     {
         if (string.IsNullOrWhiteSpace(ipAddress)) { ShowWarning("请输入 PS2 的 NBD IP 地址。"); return; }
+        if (_pfsNet.IsConnected)
+        {
+            ShowWarning("已连接 PFS 网络。请先断开 PFS 网络后再连接 NBD（二者互斥）。");
+            return;
+        }
+
         string? mappedDevicePath = null;
         await RunBusyAsync("正在连接 NBD…", async () =>
         {
@@ -732,6 +764,78 @@ internal sealed class MainForm : Form
         await RefreshDisksAsync();
     });
 
+    private async Task ConnectPfsNetAsync(string ipAddress)
+    {
+        if (string.IsNullOrWhiteSpace(ipAddress))
+        {
+            ShowWarning("请输入运行 ps2-server 的 PS2 IP 地址。");
+            return;
+        }
+
+        if (_nbd.IsMapRunning)
+        {
+            ShowWarning("NBD 映射仍在运行。请先断开 NBD 后再连接 PFS 网络（二者互斥）。");
+            return;
+        }
+
+        await RunBusyAsync("正在连接 PfsNet…", async () =>
+        {
+            await _pfsNet.ConnectAsync(ipAddress.Trim(), CancellationToken.None);
+            var path = PfsNetProtocol.MakeDevicePath(ipAddress.Trim());
+            AddSourceDevice(path, $"PS2 PfsNet · {ipAddress.Trim()}");
+            _deviceCombo.SelectedIndex = _deviceCombo.Items.Count - 1;
+            ResetPfsExplorer();
+            AppendLog($"已连接 PfsNet（{ipAddress.Trim()}:{PfsNetProtocol.CommandPort}）。数据口：本机 TCP {PfsNetProtocol.DataPort}。features=0x{_pfsNet.Features:X}。");
+        });
+
+        if (_pfsNet.IsConnected)
+            await LoadPartitionsAsync();
+    }
+
+    private async Task DisconnectPfsNetAsync()
+    {
+        await RunBusyAsync("正在断开 PfsNet…", async () =>
+        {
+            try { await _pfsNet.UmountAsync(CancellationToken.None); } catch { }
+            var host = _pfsNet.Host;
+            _pfsNet.Disconnect();
+            if (host is not null)
+            {
+                var path = PfsNetProtocol.MakeDevicePath(host);
+                for (var i = _deviceCombo.Items.Count - 1; i >= 0; i--)
+                {
+                    if (_deviceCombo.Items[i] is DeviceItem item && item.Path.Equals(path, StringComparison.OrdinalIgnoreCase))
+                        _deviceCombo.Items.RemoveAt(i);
+                }
+            }
+
+            ResetPfsExplorer();
+            AppendLog("已断开 PfsNet。");
+        });
+
+        if (_deviceCombo.Items.Count == 0)
+        {
+            _deviceCombo.Items.Add(new DeviceItem(string.Empty, "未检测到PS2硬盘"));
+            _deviceCombo.SelectedIndex = 0;
+        }
+        else if (_deviceCombo.SelectedItem is null)
+        {
+            _deviceCombo.SelectedIndex = 0;
+            if ((_deviceCombo.SelectedItem as DeviceItem)?.Path is { Length: > 0 })
+                await LoadPartitionsAsync();
+        }
+    }
+
+    private bool RejectNetworkPartitionMutationIfNeeded(string device)
+    {
+        if (!PfsNetProtocol.IsNetworkDevice(device))
+            return false;
+        if (_pfsNet.SupportsApaMutate)
+            return false;
+        ShowWarning("网络模式分区管理尚未启用。\n\n需待 APA 扇区校验（A1）与分区变更命令就绪后可用。当前仅支持文件/目录浏览与后续文件操作。");
+        return true;
+    }
+
     private async Task SafeEjectSelectedAsync()
     {
         if (Volatile.Read(ref _fileTransferDepth) != 0)
@@ -743,6 +847,18 @@ internal sealed class MainForm : Form
         if (_deviceCombo.SelectedItem is not DeviceItem item || string.IsNullOrWhiteSpace(item.Path))
         {
             ShowWarning("请先选择要弹出的 PS2 硬盘。");
+            return;
+        }
+
+        if (PfsNetProtocol.IsNetworkDevice(item.Path))
+        {
+            if (MessageBox.Show(this,
+                    "当前来源是 PFS 网络连接，无法硬件弹出。\n是否断开 PfsNet？",
+                    Text,
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+            await DisconnectPfsNetAsync();
             return;
         }
 
@@ -808,12 +924,30 @@ internal sealed class MainForm : Form
         if (!TryGetDevice(out var device)) return;
         await RunBusyAsync("正在读取分区表…", async () =>
         {
-            var result = await _pfs.ListPartitionsAsync(device, CancellationToken.None);
-            AppendResult(result);
-            var apaPartitions = PfsShellClient.ParsePartitionNames(result.StandardOutput);
-            var partitions = await _pfs.FilterBrowsablePfsPartitionsAsync(device, apaPartitions, CancellationToken.None);
-            if (!_showSystemPartitionsCheckBox.Checked)
-                partitions = partitions.Where(name => !IsProtectedPartitionName(name)).ToList();
+            IReadOnlyList<string> partitions;
+            if (PfsNetProtocol.IsNetworkDevice(device))
+            {
+                try { await _pfsNet.UmountAsync(CancellationToken.None); } catch { }
+                var infos = await _pfsNet.ListPartitionsAsync(
+                    _showSystemPartitionsCheckBox.Checked,
+                    CancellationToken.None);
+                partitions = infos
+                    .Where(p => p.IsPfs)
+                    .Select(p => p.Name)
+                    .Where(name => _showSystemPartitionsCheckBox.Checked || !IsProtectedPartitionName(name))
+                    .ToList();
+                AppendLog($"PfsNet 分区列表：{partitions.Count} 个可浏览项。");
+            }
+            else
+            {
+                var result = await _pfs.ListPartitionsAsync(device, CancellationToken.None);
+                AppendResult(result);
+                var apaPartitions = PfsShellClient.ParsePartitionNames(result.StandardOutput);
+                partitions = await _pfs.FilterBrowsablePfsPartitionsAsync(device, apaPartitions, CancellationToken.None);
+                if (!_showSystemPartitionsCheckBox.Checked)
+                    partitions = partitions.Where(name => !IsProtectedPartitionName(name)).ToList();
+            }
+
             _activePartition = null;
             await UpdateDiskSpaceAsync(device, null);
             _currentPath = "/";
@@ -885,11 +1019,24 @@ internal sealed class MainForm : Form
         if (!TryGetPfsTarget(out var device, out var partition)) return;
         await RunBusyAsync("正在读取目录…", async () =>
         {
-            var result = await _pfs.ListDirectoryAsync(device, partition, _currentPath, CancellationToken.None);
-            AppendResult(result);
-            if (!PfsShellClient.IsSuccessfulSession(result))
-                throw new InvalidOperationException($"无法打开 PFS 分区“{partition}”，请查看诊断输出。");
-            var entries = PfsShellClient.ParseDirectoryEntries(result.StandardOutput);
+            IReadOnlyList<PfsEntry> entries;
+            if (PfsNetProtocol.IsNetworkDevice(device))
+            {
+                await _pfsNet.MountAsync(partition, CancellationToken.None);
+                var remote = await _pfsNet.ListDirAsync(_currentPath, CancellationToken.None);
+                entries = remote
+                    .Select(e => new PfsEntry(e.Name, e.IsDirectory, string.IsNullOrEmpty(e.Details) ? (e.IsDirectory ? "目录" : "文件") : e.Details, (long)Math.Min(e.Size, long.MaxValue)))
+                    .ToList();
+            }
+            else
+            {
+                var result = await _pfs.ListDirectoryAsync(device, partition, _currentPath, CancellationToken.None);
+                AppendResult(result);
+                if (!PfsShellClient.IsSuccessfulSession(result))
+                    throw new InvalidOperationException($"无法打开 PFS 分区“{partition}”，请查看诊断输出。");
+                entries = PfsShellClient.ParseDirectoryEntries(result.StandardOutput);
+            }
+
             _entries.BeginUpdate();
             _entries.Items.Clear();
             foreach (var entry in entries)
@@ -932,6 +1079,11 @@ internal sealed class MainForm : Form
         var parts = _currentPath.Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
         if (parts.Count == 0)
         {
+            if (TryGetDevice(out var device) && PfsNetProtocol.IsNetworkDevice(device))
+            {
+                try { await _pfsNet.UmountAsync(CancellationToken.None); } catch { }
+            }
+
             await LoadPartitionsAsync();
             return;
         }
@@ -960,6 +1112,12 @@ internal sealed class MainForm : Form
     {
         if (SelectedEntry() is not { IsDirectory: false } entry) { ShowWarning("请选择一个文件。目录导出将在后续版本加入。"); return; }
         if (!TryGetPfsTarget(out var device, out var partition)) return;
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            ShowWarning("PFS 网络模式下的文件导出（Get）尚未接入。当前可浏览分区与目录；传输将在下一阶段实现。");
+            return;
+        }
+
         using var dialog = new FolderBrowserDialog { Description = "选择导出到的本地目录" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         BeginFileTransfer();
@@ -1007,6 +1165,12 @@ internal sealed class MainForm : Form
     private async Task ImportLocalItemsAsync(IEnumerable<string> localItems)
     {
         if (!TryGetPfsTarget(out var device, out var partition)) return;
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            ShowWarning("PFS 网络模式下的文件导入（Put）尚未接入。当前可浏览分区与目录；传输将在下一阶段实现。");
+            return;
+        }
+
         var items = localItems
             .Where(path => File.Exists(path) || Directory.Exists(path))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1358,6 +1522,11 @@ internal sealed class MainForm : Form
             return false;
         if (!TryGetPfsTarget(out var device, out var partition))
             return false;
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            ShowWarning("PFS 网络模式下暂不支持复制到 Windows（Get 尚未接入）。");
+            return false;
+        }
 
         var sourcePath = _currentPath;
         var sourceItems = selected.Select(entry => new PfsClipboardSelection(entry.Name, entry.IsDirectory, entry.Size)).ToArray();
@@ -1403,9 +1572,19 @@ internal sealed class MainForm : Form
         if (string.IsNullOrWhiteSpace(name)) return;
         await RunBusyAsync("正在创建目录…", async () =>
         {
-            var result = await _pfs.CreateDirectoryAsync(device, partition, _currentPath, name, CancellationToken.None);
-            AppendResult(result);
-            if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("创建目录失败，请查看诊断输出。");
+            if (PfsNetProtocol.IsNetworkDevice(device))
+            {
+                await _pfsNet.MountAsync(partition, CancellationToken.None);
+                var remoteName = PfsNameEncoding.ToPfsFileName(name);
+                await _pfsNet.MkdirAsync(_currentPath, remoteName, CancellationToken.None);
+            }
+            else
+            {
+                var result = await _pfs.CreateDirectoryAsync(device, partition, _currentPath, name, CancellationToken.None);
+                AppendResult(result);
+                if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("创建目录失败，请查看诊断输出。");
+            }
+
             await RefreshDirectoryAsync();
         });
         await UpdateDiskSpaceAsync(device, partition);
@@ -1428,9 +1607,19 @@ internal sealed class MainForm : Form
         if (!TryGetPfsTarget(out var device, out var partition)) return;
         await RunBusyAsync("正在重命名…", async () =>
         {
-            var result = await _pfs.RenameAsync(device, partition, _currentPath, oldName, newName, CancellationToken.None);
-            AppendResult(result);
-            if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("重命名失败，请查看诊断输出。");
+            if (PfsNetProtocol.IsNetworkDevice(device))
+            {
+                await _pfsNet.MountAsync(partition, CancellationToken.None);
+                var remoteNew = PfsNameEncoding.ToPfsFileName(newName);
+                await _pfsNet.RenameAsync(_currentPath, oldName, remoteNew, CancellationToken.None);
+            }
+            else
+            {
+                var result = await _pfs.RenameAsync(device, partition, _currentPath, oldName, newName, CancellationToken.None);
+                AppendResult(result);
+                if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("重命名失败，请查看诊断输出。");
+            }
+
             await RefreshDirectoryAsync();
         });
     }
@@ -1675,6 +1864,17 @@ internal sealed class MainForm : Form
         Dictionary<string, Dictionary<string, PfsEntry>> cache)
     {
         if (cache.TryGetValue(remoteDirectory, out var entries)) return entries;
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            await _pfsNet.MountAsync(partition, CancellationToken.None);
+            var remote = await _pfsNet.ListDirAsync(remoteDirectory, CancellationToken.None);
+            entries = remote
+                .Select(e => new PfsEntry(e.Name, e.IsDirectory, e.Details, (long)Math.Min(e.Size, long.MaxValue)))
+                .ToDictionary(entry => entry.Name, StringComparer.OrdinalIgnoreCase);
+            cache[remoteDirectory] = entries;
+            return entries;
+        }
+
         var result = await _pfs.ListDirectoryAsync(device, partition, remoteDirectory, CancellationToken.None);
         AppendResult(result);
         if (!PfsShellClient.IsSuccessfulSession(result))
@@ -1687,6 +1887,16 @@ internal sealed class MainForm : Form
 
     private async Task<PfsSpace> ReadPfsSpaceAsync(string device, string partition)
     {
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            await _pfsNet.MountAsync(partition, CancellationToken.None);
+            var space = await _pfsNet.GetPfsFreeAsync(CancellationToken.None);
+            return new PfsSpace(
+                (long)Math.Min(space.TotalBytes, long.MaxValue),
+                (long)Math.Min(space.FreeBytes, long.MaxValue),
+                space.ZoneSizeBytes == 0 ? 8192u : space.ZoneSizeBytes);
+        }
+
         var layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
         var current = layout.Partitions.SingleOrDefault(item =>
             !item.IsSubPartition && item.Name.Equals(partition, StringComparison.OrdinalIgnoreCase));
@@ -1831,11 +2041,28 @@ internal sealed class MainForm : Form
         _diskSpaceLabel.Text = "硬盘总计：正在读取…　未分配：正在读取…　当前分区：—　当前分区剩余：—";
         try
         {
+            if (PfsNetProtocol.IsNetworkDevice(device))
+            {
+                var apa = await _pfsNet.GetApaFreeAsync(CancellationToken.None);
+                var label = $"硬盘总计：{FormatCapacity((long)Math.Min(apa.TotalBytes, long.MaxValue))}　未分配：{FormatCapacity((long)Math.Min(apa.FreeBytes, long.MaxValue))}";
+                if (string.IsNullOrWhiteSpace(partition))
+                {
+                    _diskSpaceLabel.Text = label + "　当前分区：—　当前分区剩余：—";
+                    return;
+                }
+
+                var pfs = await _pfsNet.GetPfsFreeAsync(CancellationToken.None);
+                _diskSpaceLabel.Text = label
+                    + $"　当前分区：{FormatCapacity((long)Math.Min(pfs.TotalBytes, long.MaxValue))}"
+                    + $"　当前分区剩余：{FormatCapacity((long)Math.Min(pfs.FreeBytes, long.MaxValue))}";
+                return;
+            }
+
             var layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
-            var label = $"硬盘总计：{FormatCapacity(layout.TotalBytes)}　未分配：{FormatCapacity(layout.FreeBytes)}";
+            var localLabel = $"硬盘总计：{FormatCapacity(layout.TotalBytes)}　未分配：{FormatCapacity(layout.FreeBytes)}";
             if (string.IsNullOrWhiteSpace(partition))
             {
-                _diskSpaceLabel.Text = label + "　当前分区：—　当前分区剩余：—";
+                _diskSpaceLabel.Text = localLabel + "　当前分区：—　当前分区剩余：—";
                 return;
             }
 
@@ -1843,14 +2070,14 @@ internal sealed class MainForm : Form
                 !item.IsSubPartition && item.Name.Equals(partition, StringComparison.OrdinalIgnoreCase));
             if (current is null)
             {
-                _diskSpaceLabel.Text = label + "　当前分区：无法读取　当前分区剩余：无法读取";
+                _diskSpaceLabel.Text = localLabel + "　当前分区：无法读取　当前分区剩余：无法读取";
                 AppendLog($"无法在 APA 分区表中定位当前分区：{partition}");
                 return;
             }
 
-            _diskSpaceLabel.Text = label + $"　当前分区：{FormatCapacity(current.TotalBytes)}　当前分区剩余：正在读取…";
+            _diskSpaceLabel.Text = localLabel + $"　当前分区：{FormatCapacity(current.TotalBytes)}　当前分区剩余：正在读取…";
             var pfsSpace = await _pfsSpaceReader.ReadAsync(device, current, CancellationToken.None);
-            _diskSpaceLabel.Text = label + $"　当前分区：{FormatCapacity(pfsSpace.TotalBytes)}　当前分区剩余：{FormatCapacity(pfsSpace.FreeBytes)}";
+            _diskSpaceLabel.Text = localLabel + $"　当前分区：{FormatCapacity(pfsSpace.TotalBytes)}　当前分区剩余：{FormatCapacity(pfsSpace.FreeBytes)}";
         }
         catch (Exception ex)
         {
@@ -1875,15 +2102,32 @@ internal sealed class MainForm : Form
             else
                 await DeleteRemoteFileAsync(device, partition, directory, child.Name);
         }
-        var result = await _pfs.RemoveDirectoryAsync(device, partition, parentDirectory, name, CancellationToken.None);
-        AppendResult(result);
-        if (!PfsShellClient.IsSuccessfulSession(result))
-            throw new InvalidOperationException($"无法删除目录“{name}”，请查看诊断输出。");
+
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            await _pfsNet.MountAsync(partition, CancellationToken.None);
+            await _pfsNet.RmdirAsync(parentDirectory, name, CancellationToken.None);
+        }
+        else
+        {
+            var result = await _pfs.RemoveDirectoryAsync(device, partition, parentDirectory, name, CancellationToken.None);
+            AppendResult(result);
+            if (!PfsShellClient.IsSuccessfulSession(result))
+                throw new InvalidOperationException($"无法删除目录“{name}”，请查看诊断输出。");
+        }
+
         cache.Remove(directory);
     }
 
     private async Task DeleteRemoteFileAsync(string device, string partition, string remoteDirectory, string name)
     {
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            await _pfsNet.MountAsync(partition, CancellationToken.None);
+            await _pfsNet.RemoveAsync(remoteDirectory, name, CancellationToken.None);
+            return;
+        }
+
         var result = await _pfs.DeleteAsync(device, partition, remoteDirectory, name, CancellationToken.None);
         AppendResult(result);
         if (!PfsShellClient.IsSuccessfulSession(result))
@@ -1892,6 +2136,13 @@ internal sealed class MainForm : Form
 
     private async Task CreateRemoteDirectoryAsync(string device, string partition, string remoteDirectory, string name)
     {
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            await _pfsNet.MountAsync(partition, CancellationToken.None);
+            await _pfsNet.MkdirAsync(remoteDirectory, PfsNameEncoding.ToPfsFileName(name), CancellationToken.None);
+            return;
+        }
+
         var result = await _pfs.CreateDirectoryAsync(device, partition, remoteDirectory, name, CancellationToken.None);
         AppendResult(result);
         if (!PfsShellClient.IsSuccessfulSession(result))

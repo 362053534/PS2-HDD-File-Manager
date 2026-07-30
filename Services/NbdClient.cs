@@ -22,6 +22,16 @@ internal sealed class NbdClient : IDisposable
 
     public bool IsAvailable => File.Exists(_executablePath);
 
+    /// <summary>WNBD map 进程是否仍在运行（用于与 PfsNet 互斥）。</summary>
+    public bool IsMapRunning
+    {
+        get
+        {
+            DisposeExitedMapProcess();
+            return _mapProcess is { HasExited: false };
+        }
+    }
+
     public string GetMapCommandDescription(string ipAddress) =>
         $"\"{_executablePath}\" map {InstanceName} {ipAddress} --port {DefaultPort} --export-name {InstanceName}";
 
