@@ -50,9 +50,15 @@ Docker 未安装或不在 PATH。
     Write-Host "  PS2SDK(in container)=$DockerPs2Sdk"
     Write-Host "  dir=$root"
 
-    & $dockerExe pull $Image
+    # 本地已有镜像则跳过 pull（避免 docker-credential-desktop 不在 PATH 时失败）
+    & $dockerExe image inspect $Image 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "docker pull failed: $Image"
+        & $dockerExe pull $Image
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker pull failed: $Image"
+        }
+    } else {
+        Write-Host "  using local image (skip pull)"
     }
 
     # 镜像已设置 PS2DEV/PS2SDK/PATH；避免在 PowerShell 里嵌多行 bash（CRLF 会破坏脚本）

@@ -196,8 +196,10 @@ int pfsnetStartServer(void)
     int yes = 1;
 
     g_listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (g_listenSocket < 0)
+    if (g_listenSocket < 0) {
+        scr_printf("server: socket failed (%d)\n", g_listenSocket);
         return -1;
+    }
 
     setsockopt(g_listenSocket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
@@ -207,11 +209,13 @@ int pfsnetStartServer(void)
     addr.sin_port = htons(PFSNET_COMMAND_PORT);
 
     if (bind(g_listenSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        scr_printf("server: bind :%u failed\n", PFSNET_COMMAND_PORT);
         close(g_listenSocket);
         g_listenSocket = -1;
         return -1;
     }
     if (listen(g_listenSocket, 1) < 0) {
+        scr_printf("server: listen failed\n");
         close(g_listenSocket);
         g_listenSocket = -1;
         return -1;
@@ -227,8 +231,11 @@ int pfsnetStartServer(void)
     thread.option = 0;
 
     g_serverThreadId = CreateThread(&thread);
-    if (g_serverThreadId < 0)
+    if (g_serverThreadId < 0) {
+        scr_printf("server: CreateThread failed (%d)\n", g_serverThreadId);
         return -1;
+    }
     StartThread(g_serverThreadId, NULL);
+    scr_printf("server: listening on :%u\n", PFSNET_COMMAND_PORT);
     return 0;
 }

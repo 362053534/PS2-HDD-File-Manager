@@ -16,7 +16,29 @@
 
 struct PfsNetClient;
 
+/* 网络配置来源（记忆卡文件 → DHCP → 静态兜底） */
+enum PfsNetIpSource {
+    PFSNET_IP_SRC_IPCONFIG = 1, /* mc?:/SYS-CONF/IPCONFIG.DAT */
+    PFSNET_IP_SRC_OPL = 2,      /* mc?:/OPL/conf_network.cfg */
+    PFSNET_IP_SRC_DHCP = 3,
+    PFSNET_IP_SRC_STATIC = 4
+};
+
+typedef struct PfsNetIpConfig {
+    int useDhcp;
+    int source;
+    struct ip4_addr ip;
+    struct ip4_addr nm;
+    struct ip4_addr gw;
+    char sourcePath[64];
+} PfsNetIpConfig;
+
+void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg);
+int pfsnetLoadIpConfig(PfsNetIpConfig *cfg);
+const char *pfsnetIpSourceName(int source);
+
 int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw);
+int ethApplyIPConfig(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw);
 int ethWaitLinkAndDhcp(int use_dhcp);
 void ethGetIpDisplay(char *out, int outLen);
 
