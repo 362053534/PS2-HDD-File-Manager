@@ -367,3 +367,4 @@ V1 若未实现 0x0050–0x0052：feature 位置 0；PC 菜单 **P1b** 提示未
 | 日期 | 说明 |
 |------|------|
 | 2026-07-30 | 初稿：按冻结决策 F1 编写 |
+| 2026-07-31 | P1 ELF 源码落地（main/net/server/fsops）；features 仅 FEAT_FILE_OPS |

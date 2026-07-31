@@ -1,31 +1,41 @@
-# ps2-server（PfsNet）
+# ps2-server（PfsNet P1）
 
-PS2 端网络 PFS 服务，协议见同目录 [PROTOCOL.md](PROTOCOL.md)。
+无操作网络 PFS 服务：开机自动 DHCP/静态 IP，监听 **45061**，屏幕显示 IP。PC 用「PFS 网络」连接。
 
-## 状态
+## 依赖
 
-- **P1 目标**：HELLO / PING / LIST_PARTITIONS / MOUNT / UMOUNT / LIST_DIR / GET_*_FREE / 目录元数据命令  
-- PC 端客户端已接入浏览与 mkdir/rename/delete；**Put/Get 与 APA 变更**待下一阶段  
-- 本目录目前提供协议头与实现骨架；完整 ELF 需在具备 **PS2SDK** 的环境，参照 `C:\GitHub\HDLGameInstaller` 的 IOP 加载与网络初始化进行链接
+1. **魔改 PS2SDK**：`C:\GitHub\ps2sdk`（你的 fork；路径/UTF-8 字节按本工具约定透传）
+2. 该 SDK **已编译出 IRX**（至少含 `iop/irx/ps2fs.irx`、`ps2hdd.irx`、`netman.irx`、`smap.irx` 等）
+3. **PS2 工具链**：`mips64r5900el-ps2-elf-gcc` + `bin2c`（通常在 WSL 的 `/usr/local/ps2dev`）
 
-## 建议实现步骤（PS2）
+## 本阶段（P1）已实现
 
-1. 从 HDLGameInstaller 复用：`DEV9` / `ATAD` / `HDD` / `PFS` / `FILEXIO` / `NETMAN` / `SMAP` / `ps2ip` 加载顺序  
-2. 启动后 `listen(45061)`，屏幕显示 IP；无菜单操作即可  
-3. 按 `include/protocol.h` 实现控制帧；断线时强制 `umount`（M1 契约）  
-4. features：V1 先报 `FEAT_FILE_OPS | FEAT_DATA_CHANNEL`；分区变更待 A1 后再置位  
+- HELLO / PING  
+- LIST_PARTITIONS / GET_APA_FREE / GET_PFS_FREE（PFS free 为占位增强项）  
+- MOUNT / UMOUNT（M1，断线强制 umount）  
+- LIST_DIR / MKDIR / RMDIR / REMOVE / RENAME  
+- features：`FEAT_FILE_OPS`（数据通道 Put/Get、APA 扇区/变更返回 `ERR_UNSUPPORTED`）
+
+## 编译
+
+在已安装工具链的 WSL 中：
+
+```bash
+export PS2SDK=/mnt/c/GitHub/ps2sdk
+export PS2DEV=/usr/local/ps2dev   # 按你的安装路径
+export PATH=$PS2DEV/ee/bin:$PS2DEV/iop/bin:$PS2SDK/bin:$PATH
+cd /mnt/c/GitHub/PFS-BatchKit-Manager/PS2-HDD-File-Manager/ps2-server
+make clean && make
+```
+
+或在 Windows：
+
+```powershell
+.\scripts\build.ps1 -Ps2Sdk C:\GitHub\ps2sdk -Ps2Dev /usr/local/ps2dev
+```
+
+产物：`PfsNetServer.elf`
 
 ## 与 HDLGameInstaller
 
-- **同端口** 45061/45062，不可同时运行  
-- 握手魔数 `PFSN`，勿使用 HDL 的 `0x0C`  
-
-## 目录
-
-```
-ps2-server/
-  PROTOCOL.md
-  README.md
-  include/protocol.h
-  src/          （后续填入 server 实现）
-```
+同端口 45061/45062，**不要同时运行**。握手魔数为 `PFSN`，误连会拒。
