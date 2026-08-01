@@ -1248,8 +1248,9 @@ internal sealed class MainForm : Form
             }
             finally
             {
-                EndTransferCancellation();
+                // 先结束进度文案，再结束取消态，避免“正在取消…”被导入结束文案盖住或残留。
                 EndImportProgress(progress);
+                EndTransferCancellation();
             }
             await UpdateDiskSpaceAsync(device, partition);
         }
@@ -2330,6 +2331,9 @@ internal sealed class MainForm : Form
     private void ReportVirtualClipboardError(Exception error)
     {
         if (IsDisposed || !IsHandleCreated) return;
+        // Task.Run / COM 路径偶发包一层 AggregateException，仍按取消处理。
+        while (error is AggregateException { InnerException: { } inner })
+            error = inner;
         BeginInvoke(() =>
         {
             EndTransferCancellation();
@@ -2691,11 +2695,15 @@ internal sealed class MainForm : Form
 
     private void EndTransferCancellation()
     {
+        var canceled = _transferCts?.IsCancellationRequested == true;
         _cancelTransferButton.Visible = false;
         _cancelTransferButton.Enabled = false;
         var cts = _transferCts;
         _transferCts = null;
         cts?.Dispose();
+        // 取消已完成后清掉“正在取消…”，避免按钮已隐藏但状态栏仍卡住。
+        if (canceled)
+            _statusLabel.Text = "传输已取消";
     }
 
     private CancellationToken EnsureTransferCancellationFromAnyThread()
