@@ -16,10 +16,10 @@
 
 struct PfsNetClient;
 
-/* 网络配置来源（记忆卡文件 → DHCP → 静态兜底） */
+/* 网络配置优先：DHCP → OPL → uLE(IPCONFIG.DAT) → 静态兜底 */
 enum PfsNetIpSource {
-    PFSNET_IP_SRC_IPCONFIG = 1, /* mc?:/SYS-CONF/IPCONFIG.DAT */
-    PFSNET_IP_SRC_OPL = 2,      /* mc?:/OPL/conf_network.cfg */
+    PFSNET_IP_SRC_IPCONFIG = 1, /* uLE: mc?:/SYS-CONF/IPCONFIG.DAT */
+    PFSNET_IP_SRC_OPL = 2,      /* OPL: mc?:/OPL/conf_network.cfg */
     PFSNET_IP_SRC_DHCP = 3,
     PFSNET_IP_SRC_STATIC = 4
 };

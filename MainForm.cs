@@ -86,7 +86,7 @@ internal sealed class MainForm : Form
 
         Text = "PS2 HDD File Manager v1.0 — 峰哥原创，免费发布";
         MinimumSize = new Size(960, 660);
-        Size = new Size(1008, 693);
+        Size = new Size(1008, 901);
         StartPosition = FormStartPosition.CenterScreen;
         KeyPreview = true;
         // 提权进程需在创建窗口前放行拖放消息，否则资源管理器拖入会被 UIPI 拦截。
@@ -301,7 +301,8 @@ internal sealed class MainForm : Form
         art2Bar.Controls.Add(_downloadArt2Button);
         _downloadArt2Button.Click += async (_, _) => await DownloadArt2Async();
 
-        var nbdBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
+        // NBD UI 暂时隐藏，代码保留待后续开发
+        var nbdBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Visible = false };
         var ipBox = new TextBox { Width = 170, PlaceholderText = "PS2 NBD IP，例如 192.168.1.10" };
         nbdBar.Controls.AddRange(
         [
@@ -815,9 +816,9 @@ internal sealed class MainForm : Form
 
     private async Task DisconnectPfsNetAsync()
     {
-        await RunBusyAsync("正在断开 PfsNet…", async () =>
+        await RunBusyAsync("正在断开 PfsNet…", () =>
         {
-            try { await _pfsNet.UmountAsync(CancellationToken.None); } catch { }
+            // 断开时只做本地清理：对端已掉线时远程 umount 读写会卡死；PS2 断线会自行 force umount
             var host = _pfsNet.Host;
             _pfsNet.Disconnect();
             if (host is not null)
@@ -832,6 +833,7 @@ internal sealed class MainForm : Form
 
             ResetPfsExplorer();
             AppendLog("已断开 PfsNet。");
+            return Task.CompletedTask;
         });
 
         if (_deviceCombo.Items.Count == 0)
@@ -946,6 +948,7 @@ internal sealed class MainForm : Form
         await RunBusyAsync("正在读取分区表…", async () =>
         {
             IReadOnlyList<string> partitions;
+            Dictionary<string, ulong>? netSizes = null;
             if (PfsNetProtocol.IsNetworkDevice(device))
             {
                 try { await _pfsNet.UmountAsync(CancellationToken.None); } catch { }
@@ -957,6 +960,9 @@ internal sealed class MainForm : Form
                     .Select(p => p.Name)
                     .Where(name => _showSystemPartitionsCheckBox.Checked || !IsProtectedPartitionName(name))
                     .ToList();
+                netSizes = infos
+                    .Where(p => p.IsPfs)
+                    .ToDictionary(p => p.Name, p => p.TotalBytes, StringComparer.OrdinalIgnoreCase);
                 AppendLog($"PfsNet 分区列表：{partitions.Count} 个可浏览项。");
             }
             else
@@ -977,11 +983,19 @@ internal sealed class MainForm : Form
             foreach (var partition in partitions)
             {
                 var isSystem = IsProtectedPartitionName(partition);
+                var sizeHint = "";
+                if (netSizes is not null
+                    && netSizes.TryGetValue(partition, out var totalBytes)
+                    && totalBytes > 0)
+                {
+                    sizeHint = $" · {FormatCapacity((long)Math.Min(totalBytes, long.MaxValue))}";
+                }
+
                 var item = new ListViewItem(partition)
                 {
                     Tag = new PfsEntry(partition, true, isSystem ? "系统保留分区；可浏览读写，禁止删除/重命名分区" : "可操作的 PFS 分区；双击查看")
                 };
-                item.SubItems.Add(isSystem ? "系统分区" : "PFS 分区");
+                item.SubItems.Add(isSystem ? $"系统分区{sizeHint}" : $"PFS 分区{sizeHint}");
                 item.SubItems.Add(isSystem
                     ? "系统保留分区；可浏览读写，禁止删除/重命名分区"
                     : "可操作的 PFS 分区；双击查看");
@@ -1487,6 +1501,13 @@ internal sealed class MainForm : Form
         if (selected.Count == 0 || _activePartition is null || !TryGetPfsTarget(out var device, out var partition))
             return;
 
+        // PfsNet 拖出暂不支持（避免 staging 双写与 0KB 占位）；请用复制后粘贴。
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            MessageBox.Show(this, "网络传输不支持拖拽操作", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
         var sourcePath = _currentPath;
         var sourceItems = selected
             .Select(entry => new PfsClipboardSelection(entry.Name, entry.IsDirectory, entry.Size))
@@ -1514,12 +1535,16 @@ internal sealed class MainForm : Form
                 files = await BuildVirtualClipboardFilesAsync(device, partition, sourcePath, sourceItems, progress);
             }
 
-            var materialized = new System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<string>>(StringComparer.OrdinalIgnoreCase);
-            string MaterializeOnce(DeferredPfsFile file) => materialized.GetOrAdd(
-                file.RelativePath,
-                _ => new Lazy<string>(
-                    () => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, progress)).GetAwaiter().GetResult(),
-                    LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+            // 只缓存成功落地路径；取消/失败不得留下可复用的失败结果（Lazy 会缓存异常）。
+            var materialized = new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string MaterializeOnce(DeferredPfsFile file)
+            {
+                if (materialized.TryGetValue(file.RelativePath, out var existing))
+                    return existing;
+                var path = Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, progress)).GetAwaiter().GetResult();
+                materialized.TryAdd(file.RelativePath, path);
+                return path;
+            }
             var dataObject = new VirtualFileClipboardDataObject(
                 () => files,
                 MaterializeOnce,
@@ -1531,6 +1556,13 @@ internal sealed class MainForm : Form
         }
         catch (Exception ex)
         {
+            if (VirtualFileClipboardDataObject.IsCancelException(ex))
+            {
+                AppendLog("传输已取消。");
+                _statusLabel.Text = "传输已取消";
+                HideVirtualExportProgress();
+                return;
+            }
             AppendLog(ex.ToString());
             ShowWarning($"拖拽复制失败：{ex.Message}");
             HideVirtualExportProgress();
@@ -1557,13 +1589,6 @@ internal sealed class MainForm : Form
             "Clipboard",
             Guid.NewGuid().ToString("N"));
 
-        var materialized = new System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<string>>(StringComparer.OrdinalIgnoreCase);
-        string MaterializeOnce(DeferredPfsFile file) => materialized.GetOrAdd(
-            file.RelativePath,
-            _ => new Lazy<string>(
-                () => Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, exportProgress)).GetAwaiter().GetResult(),
-                LazyThreadSafetyMode.ExecutionAndPublication)).Value;
-
         IReadOnlyList<DeferredPfsFile> GetDeferredFiles()
         {
             if (sourceItems is not [{ IsDirectory: false } singleFile])
@@ -1575,6 +1600,79 @@ internal sealed class MainForm : Form
             };
             exportProgress.Initialize(files);
             return files;
+        }
+
+        // PfsNet：粘贴时 IStream.Read 直拉网络 Get，无 staging 临时文件。
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            Stream OpenPfsNetClipboardStream(DeferredPfsFile file)
+            {
+                BeginFileTransfer();
+                var completed = false;
+                try
+                {
+                    UpdateVirtualExportProgress(exportProgress, file, 0, isCompleted: false);
+                    var ct = EnsureTransferCancellationFromAnyThread();
+                    return ProducerConsumerReadStream.Start(
+                        Math.Max(file.Size, 0),
+                        async (dest, token) =>
+                        {
+                            await _pfsNet.MountAsync(partition, CancellationToken.None);
+                            await _pfsNet.GetFileToStreamAsync(
+                                file.RemoteDirectory,
+                                file.Name,
+                                dest,
+                                token,
+                                bytes =>
+                                {
+                                    UpdateVirtualExportProgress(exportProgress, file, bytes, isCompleted: false);
+                                    return Task.CompletedTask;
+                                });
+                        },
+                        ct,
+                        onSuccess: () =>
+                        {
+                            completed = true;
+                            UpdateVirtualExportProgress(exportProgress, file, Math.Max(file.Size, 0), isCompleted: true);
+                        },
+                        onCleanup: () =>
+                        {
+                            if (!completed)
+                            {
+                                HideVirtualExportProgress();
+                                EndTransferCancellationFromAnyThread();
+                            }
+                            EndFileTransfer();
+                        });
+                }
+                catch
+                {
+                    HideVirtualExportProgress();
+                    EndTransferCancellationFromAnyThread();
+                    EndFileTransfer();
+                    throw;
+                }
+            }
+
+            dataObject = new VirtualFileClipboardDataObject(
+                GetDeferredFiles,
+                _ => throw new InvalidOperationException("PfsNet 剪贴板使用流式读取，不应落盘。"),
+                ex => ReportVirtualClipboardError(ex),
+                deferStreams: true,
+                openStream: OpenPfsNetClipboardStream);
+            successLog = $"已将 {sourceItems.Length} 个 PFS 项目放入 Windows 延迟流式传输（无临时落盘）。目标粘贴时才会通过网络读取。";
+            return true;
+        }
+
+        // 只缓存成功落地路径；取消/失败不得留下可复用的失败结果（Lazy 会缓存异常）。
+        var materialized = new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string MaterializeOnce(DeferredPfsFile file)
+        {
+            if (materialized.TryGetValue(file.RelativePath, out var existing))
+                return existing;
+            var path = Task.Run(() => MaterializeVirtualClipboardFileAsync(device, partition, file, stagingDirectory, exportProgress)).GetAwaiter().GetResult();
+            materialized.TryAdd(file.RelativePath, path);
+            return path;
         }
 
         dataObject = new VirtualFileClipboardDataObject(
@@ -2104,9 +2202,21 @@ internal sealed class MainForm : Form
                     return;
                 }
 
+                await _pfsNet.MountAsync(partition, CancellationToken.None);
                 var pfs = await _pfsNet.GetPfsFreeAsync(CancellationToken.None);
+                var partitionTotal = pfs.TotalBytes;
+                if (partitionTotal == 0)
+                {
+                    // 兼容旧 ELF：GET_PFS_FREE 总容量为 0 时回退 LIST_PARTITIONS
+                    var parts = await _pfsNet.ListPartitionsAsync(includeSystem: true, CancellationToken.None);
+                    var match = parts.FirstOrDefault(p =>
+                        p.Name.Equals(partition, StringComparison.OrdinalIgnoreCase));
+                    if (match.TotalBytes > 0)
+                        partitionTotal = match.TotalBytes;
+                }
+
                 _diskSpaceLabel.Text = label
-                    + $"　当前分区：{FormatCapacity((long)Math.Min(pfs.TotalBytes, long.MaxValue))}"
+                    + $"　当前分区：{FormatCapacity((long)Math.Min(partitionTotal, long.MaxValue))}"
                     + $"　当前分区剩余：{FormatCapacity((long)Math.Min(pfs.FreeBytes, long.MaxValue))}";
                 return;
             }
@@ -2336,8 +2446,8 @@ internal sealed class MainForm : Form
             error = inner;
         BeginInvoke(() =>
         {
-            EndTransferCancellation();
-            if (error is OperationCanceledException)
+            // CTS 已由 MaterializeVirtualClipboardFileAsync 的 finally 清理；此处不再 End，避免迟到回调清掉新一轮传输。
+            if (VirtualFileClipboardDataObject.IsCancelException(error))
             {
                 AppendLog("传输已取消。");
                 _statusLabel.Text = "传输已取消";
@@ -2719,9 +2829,16 @@ internal sealed class MainForm : Form
     {
         if (IsDisposed || !IsHandleCreated)
             return;
+        // 捕获当前 CTS，避免 BeginInvoke 迟到时清掉新一轮传输。
+        var expected = _transferCts;
         if (InvokeRequired)
         {
-            BeginInvoke(EndTransferCancellation);
+            BeginInvoke(() =>
+            {
+                if (expected is not null && !ReferenceEquals(_transferCts, expected))
+                    return;
+                EndTransferCancellation();
+            });
             return;
         }
         EndTransferCancellation();

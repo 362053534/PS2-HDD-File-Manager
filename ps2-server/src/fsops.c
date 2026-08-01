@@ -20,12 +20,17 @@
 #define PFSNET_XFER_NONE 0
 #define PFSNET_XFER_PUT 1
 #define PFSNET_XFER_GET 2
-/* 64KiB：对齐 HDD/SIF 大批次；HDL 侧 RW 缓冲更大，此处兼顾 IOP 内存 */
-#define PFSNET_XFER_BUF 65536
+/* 512KiB：对齐 HDL 大批次，显著减少 fileXio SIF 往返；双缓冲另占一份 */
+#define PFSNET_XFER_BUF (512 * 1024)
+#define PFSNET_IO_STACK 0x2000
 #define PFSNET_PUT_OVERWRITE 1u
+
+extern void *_gp;
 
 static char g_mountedPartition[APA_IDMAX];
 static int g_mounted;
+/* 挂载前缓存：挂载后常无法再 open hdd0:分区，HIOCGETSIZE 会失败导致总容量为 0 */
+static uint64_t g_mountedTotalBytes;
 
 /* 进行中的 Put/Get（控制线程内同步收发载荷，END/ABORT 再提交） */
 static struct {
@@ -38,8 +43,21 @@ static struct {
     char finalPath[768];
 } g_xfer;
 
-static uint8_t g_xferBuf[PFSNET_XFER_BUF] __attribute__((aligned(64)));
+/* [0]/[1] 乒乓：HDD 与 TCP 重叠 */
+static uint8_t g_xferBuf[2][PFSNET_XFER_BUF] __attribute__((aligned(64)));
 static uint32_t g_tempSeq;
+
+/* 网络收发工作线程（主线程专跑 fileXio，避免并发 RPC） */
+static uint8_t g_ioStack[PFSNET_IO_STACK] __attribute__((aligned(16)));
+static int g_ioSemStart = -1;
+static int g_ioSemDone = -1;
+static int g_ioTid = -1;
+static int g_ioAsync;
+static int g_ioSock;
+static void *g_ioBuf;
+static int g_ioLen;
+static int g_ioResult;
+static int g_ioIsSend;
 
 static void clearXferState(void)
 {
@@ -67,11 +85,17 @@ static void abortXferCleanup(void)
     clearXferState();
 }
 
+static void ioWorker(void *arg);
+static int initIoWorker(void);
+static uint64_t getPartitionTotalBytes(const char *partition);
+
 int pfsnetFsInit(void)
 {
     g_mounted = 0;
     g_mountedPartition[0] = '\0';
+    g_mountedTotalBytes = 0;
     clearXferState();
+    initIoWorker();
     return 0;
 }
 
@@ -82,6 +106,7 @@ void pfsnetFsForceUmount(void)
         fileXioUmount(PFSNET_MOUNT_POINT);
         g_mounted = 0;
         g_mountedPartition[0] = '\0';
+        g_mountedTotalBytes = 0;
     }
 }
 
@@ -193,12 +218,18 @@ static int doMount(const char *partition)
         fileXioUmount(PFSNET_MOUNT_POINT);
         g_mounted = 0;
         g_mountedPartition[0] = '\0';
+        g_mountedTotalBytes = 0;
     }
+
+    /* 须在 mount 前读取 APA 长度；挂载后 open 同一分区常失败 */
+    g_mountedTotalBytes = getPartitionTotalBytes(partition);
 
     buildDevicePath(device, sizeof(device), partition);
     result = fileXioMount(PFSNET_MOUNT_POINT, device, FILEXIO_MOUNTFLAG_NORMAL);
-    if (result < 0)
+    if (result < 0) {
+        g_mountedTotalBytes = 0;
         return mapErrno(result);
+    }
 
     strncpy(g_mountedPartition, partition, sizeof(g_mountedPartition) - 1);
     g_mountedPartition[sizeof(g_mountedPartition) - 1] = '\0';
@@ -215,6 +246,7 @@ static int doUmount(void)
     fileXioUmount(PFSNET_MOUNT_POINT);
     g_mounted = 0;
     g_mountedPartition[0] = '\0';
+    g_mountedTotalBytes = 0;
     return PFSNET_OK;
 }
 
@@ -263,8 +295,8 @@ static int handleListPartitions(struct PfsNetClient *client, const uint8_t *payl
         used += wrote;
         partFlags = (uint8_t)((isSystem ? 1 : 0) | (isPfs ? 2 : 0));
         out[used++] = partFlags;
-        /* size 在 iox_stat 中以 512 字节扇区计的情况因实现而异；这里用 hisize/size 拼 64 位近似 */
-        totalBytes = ((uint64_t)dirent.stat.hisize << 32) | (uint64_t)dirent.stat.size;
+        /* APA stat.size 是主分区长度（512B 扇区）；含子分区的精确总量在 GET_PFS_FREE 再算 */
+        totalBytes = ((uint64_t)dirent.stat.size) * 512ull;
         memcpy(out + used, &totalBytes, 8);
         used += 8;
         count++;
@@ -275,6 +307,46 @@ static int handleListPartitions(struct PfsNetClient *client, const uint8_t *payl
     return pfsnetSendResponse(client, PFSNET_OK, out, (uint32_t)used);
 }
 
+/* 打开 hdd0:分区，累加主分区 + 子分区扇区数得到字节总量（与 libhdd 一致） */
+static uint64_t getPartitionTotalBytes(const char *partition)
+{
+    char device[8 + APA_IDMAX];
+    int fd;
+    iox_stat_t st;
+    uint32_t i;
+    uint32_t nparts;
+    uint64_t sectors = 0;
+    int rv;
+
+    if (!partition || partition[0] == '\0')
+        return 0;
+
+    snprintf(device, sizeof(device), "hdd0:%s", partition);
+    fd = fileXioOpen(device, FIO_O_RDONLY, 0);
+    if (fd < 0) {
+        /* 已挂载时 open 常失败；至少用 GetStat 主分区长度 */
+        if (fileXioGetStat(device, &st) >= 0 && st.size > 0)
+            return (uint64_t)st.size * 512ull;
+        return 0;
+    }
+
+    if (fileXioGetStat(device, &st) < 0) {
+        fileXioClose(fd);
+        return 0;
+    }
+
+    nparts = (uint32_t)st.private_0 + 1u; /* private_0 = nsub */
+    for (i = 0; i < nparts; i++) {
+        rv = fileXioIoctl2(fd, HIOCGETSIZE, &i, sizeof(i), NULL, 0);
+        if (rv > 0)
+            sectors += (uint32_t)rv;
+    }
+    fileXioClose(fd);
+    if (sectors == 0 && st.size > 0)
+        return (uint64_t)st.size * 512ull;
+    return sectors * 512ull;
+}
+
 static int handleGetApaFree(struct PfsNetClient *client)
 {
     uint32_t freeSectors = 0;
@@ -283,13 +355,16 @@ static int handleGetApaFree(struct PfsNetClient *client)
     uint8_t out[16];
     int result;
 
+    result = fileXioDevctl("hdd0:", HDIOC_TOTALSECTOR, NULL, 0, NULL, 0);
+    if (result < 0)
+        return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
+    totalBytes = (uint64_t)(uint32_t)result * 512ull;
+
     result = fileXioDevctl("hdd0:", HDIOC_FREESECTOR, NULL, 0, &freeSectors, sizeof(freeSectors));
     if (result < 0)
         return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
 
     freeBytes = (uint64_t)freeSectors * 512ull;
-    /* 总量对 UI 提示够用；精确总量留给 A1 扇区校验 */
-    totalBytes = freeBytes;
     memcpy(out, &totalBytes, 8);
     memcpy(out + 8, &freeBytes, 8);
     return pfsnetSendResponse(client, PFSNET_OK, out, 16);
@@ -301,16 +376,26 @@ static int handleGetPfsFree(struct PfsNetClient *client)
     uint64_t totalBytes = 0;
     uint64_t freeBytes = 0;
     uint32_t zone = 8192;
-    iox_stat_t st;
+    int zoneSize;
+    int zoneFree;
 
     if (!g_mounted)
         return pfsnetSendResponse(client, PFSNET_ERR_NOT_MOUNTED, NULL, 0);
 
-    /* PFS 无统一 free ioctl 时，用根目录 stat 作占位；后续可换更准 API */
-    if (fileXioGetStat(PFSNET_MOUNT_POINT "/", &st) >= 0) {
-        totalBytes = ((uint64_t)st.hisize << 32) | (uint64_t)st.size;
-        freeBytes = totalBytes; /* 占位：避免客户端预检硬失败；精确值后续增强 */
+    /* 与 libhdd / 本地 PfsSpaceReader 对齐：PDIOC_ZONEFREE * PDIOC_ZONESZ */
+    zoneSize = fileXioDevctl(PFSNET_MOUNT_POINT, PDIOC_ZONESZ, NULL, 0, NULL, 0);
+    zoneFree = fileXioDevctl(PFSNET_MOUNT_POINT, PDIOC_ZONEFREE, NULL, 0, NULL, 0);
+    if (zoneSize > 0) {
+        zone = (uint32_t)zoneSize;
+        if (zoneFree >= 0)
+            freeBytes = (uint64_t)(uint32_t)zoneFree * (uint64_t)(uint32_t)zoneSize;
     }
+
+    totalBytes = g_mountedTotalBytes;
+    if (totalBytes == 0)
+        totalBytes = getPartitionTotalBytes(g_mountedPartition);
+    if (totalBytes > 0 && freeBytes > totalBytes)
+        freeBytes = totalBytes;
 
     memcpy(out, &totalBytes, 8);
     memcpy(out + 8, &freeBytes, 8);
@@ -476,11 +561,81 @@ static int xferRecvAll(int sock, void *buf, int len)
     return got;
 }
 
+static void ioWorker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        WaitSema(g_ioSemStart);
+        if (g_ioIsSend)
+            g_ioResult = xferSendAll(g_ioSock, g_ioBuf, g_ioLen);
+        else
+            g_ioResult = xferRecvAll(g_ioSock, g_ioBuf, g_ioLen);
+        SignalSema(g_ioSemDone);
+    }
+}
+
+/* 启动网络 I/O 线程；失败则 g_ioAsync=0，走同步收发 */
+static int initIoWorker(void)
+{
+    ee_sema_t sem;
+    ee_thread_t th;
+
+    if (g_ioTid >= 0)
+        return 0;
+
+    memset(&sem, 0, sizeof(sem));
+    sem.init_count = 0;
+    sem.max_count = 1;
+    g_ioSemStart = CreateSema(&sem);
+    g_ioSemDone = CreateSema(&sem);
+    if (g_ioSemStart < 0 || g_ioSemDone < 0) {
+        g_ioAsync = 0;
+        return -1;
+    }
+
+    memset(&th, 0, sizeof(th));
+    th.func = &ioWorker;
+    th.stack = g_ioStack;
+    th.stack_size = sizeof(g_ioStack);
+    th.gp_reg = &_gp;
+    th.initial_priority = 0x3f; /* 略高于客户端线程，便于在 fileXio 阻塞时推进 TCP */
+    th.attr = 0;
+    th.option = 0;
+
+    g_ioTid = CreateThread(&th);
+    if (g_ioTid < 0) {
+        g_ioAsync = 0;
+        return -1;
+    }
+    StartThread(g_ioTid, NULL);
+    g_ioAsync = 1;
+    return 0;
+}
+
+static void ioBegin(int isSend, int sock, void *buf, int len)
+{
+    g_ioIsSend = isSend;
+    g_ioSock = sock;
+    g_ioBuf = buf;
+    g_ioLen = len;
+    if (g_ioAsync)
+        SignalSema(g_ioSemStart);
+    else
+        g_ioResult = isSend ? xferSendAll(sock, buf, len) : xferRecvAll(sock, buf, len);
+}
+
+static int ioEnd(void)
+{
+    if (g_ioAsync)
+        WaitSema(g_ioSemDone);
+    return g_ioResult;
+}
+
 /* 数据通道：关 Nagle，尽量加大收发缓冲（SNDBUF 在部分 lwIP 上可能无效） */
 static void tuneDataSocket(int sock)
 {
     int yes = 1;
-    int buf = 128 * 1024;
+    int buf = 256 * 1024;
 
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
@@ -577,24 +732,62 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         return 0;
     }
 
-    while (got < totalBytes) {
-        uint64_t remain = totalBytes - got;
-        int chunk = remain > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)remain;
-        int n = xferRecvAll(dataSock, g_xferBuf, chunk);
-        int wr, written = 0;
-        if (n < 0)
-            break;
-        while (written < chunk) {
-            wr = fileXioWrite(fd, g_xferBuf + written, chunk - written);
-            if (wr <= 0) {
-                n = -1;
+    /* 双缓冲：收下一包同时把上一包写入 HDD */
+    {
+        int idx = 0;
+        int havePending = 0;
+        int pendingIdx = 0;
+        int pendingLen = 0;
+        int failed = 0;
+
+        while (got < totalBytes) {
+            uint64_t remain = totalBytes - got - (uint64_t)(havePending ? pendingLen : 0);
+            int chunk = remain > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)remain;
+
+            if (chunk <= 0)
                 break;
+
+            ioBegin(0, dataSock, g_xferBuf[idx], chunk);
+
+            if (havePending) {
+                int written = 0;
+                while (written < pendingLen) {
+                    int wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
+                    if (wr <= 0) {
+                        failed = 1;
+                        break;
+                    }
+                    written += wr;
+                }
+                if (!failed)
+                    got += (uint64_t)pendingLen;
+                havePending = 0;
             }
-            written += wr;
+
+            if (ioEnd() < 0)
+                failed = 1;
+            if (failed)
+                break;
+
+            pendingIdx = idx;
+            pendingLen = chunk;
+            havePending = 1;
+            idx ^= 1;
         }
-        if (n < 0)
-            break;
-        got += (uint64_t)chunk;
+
+        if (!failed && havePending) {
+            int written = 0;
+            while (written < pendingLen) {
+                int wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
+                if (wr <= 0) {
+                    failed = 1;
+                    break;
+                }
+                written += wr;
+            }
+            if (!failed)
+                got += (uint64_t)pendingLen;
+        }
     }
 
     close(dataSock);
@@ -719,18 +912,72 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         return 0;
     }
 
-    while (sent < toSend) {
-        uint64_t remain = toSend - sent;
-        int chunk = remain > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)remain;
-        int rd = fileXioRead(fd, g_xferBuf, chunk);
-        if (rd < 0)
-            break;
-        if (rd == 0)
-            break; /* 真 EOF */
-        if (xferSendAll(dataSock, g_xferBuf, rd) < 0)
-            break;
-        sent += (uint64_t)rd;
-        /* 注意：rd < chunk 时不得当作结束。fileXio/PFS 允许短读，Put 侧写循环已按此处理。 */
+    /* 双缓冲：与 Put 对称——先启动上一块 send，再读下一块（重叠）。
+     * 旧顺序「先读满再等 send」在读快于 TCP 时会让磁盘空等。 */
+    {
+        int idx = 0;
+        int havePending = 0;
+        int pendingIdx = 0;
+        int pendingLen = 0;
+        int failed = 0;
+
+        while (!failed && (sent < toSend || havePending)) {
+            int rd = 0;
+            int ioStarted = 0;
+
+            if (havePending) {
+                ioBegin(1, dataSock, g_xferBuf[pendingIdx], pendingLen);
+                ioStarted = 1;
+            }
+
+            if (sent + (uint64_t)(havePending ? pendingLen : 0) < toSend) {
+                uint64_t remain = toSend - sent - (uint64_t)(havePending ? pendingLen : 0);
+                int chunk = remain > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)remain;
+
+                while (rd < chunk) {
+                    int n = fileXioRead(fd, g_xferBuf[idx] + rd, chunk - rd);
+                    if (n < 0) {
+                        failed = 1;
+                        break;
+                    }
+                    if (n == 0)
+                        break; /* 真 EOF */
+                    rd += n;
+                }
+            }
+
+            if (ioStarted) {
+                if (ioEnd() < 0)
+                    failed = 1;
+                else
+                    sent += (uint64_t)pendingLen;
+                havePending = 0;
+            }
+
+            if (failed)
+                break;
+
+            if (rd > 0) {
+                pendingIdx = idx;
+                pendingLen = rd;
+                havePending = 1;
+                idx ^= 1;
+            } else if (sent >= toSend) {
+                break;
+            } else {
+                failed = 1; /* 未读满却提前 EOF */
+                break;
+            }
+        }
+
+        /* 循环退出时若仍有未启动的 pending，同步发出 */
+        if (!failed && havePending) {
+            if (xferSendAll(dataSock, g_xferBuf[pendingIdx], pendingLen) < 0)
+                failed = 1;
+            else
+                sent += (uint64_t)pendingLen;
+        }
+        (void)failed;
     }
 
     fileXioClose(fd);
@@ -749,7 +996,6 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
     g_xfer.totalBytes = toSend;
     return 0;
 }
-
 static int handleGetEnd(struct PfsNetClient *client)
 {
     if (g_xfer.kind != PFSNET_XFER_GET)

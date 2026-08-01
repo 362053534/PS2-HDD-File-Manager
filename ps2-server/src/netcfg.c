@@ -52,7 +52,7 @@ static int readFileText(const char *path, char *buf, int bufMax, int *outLen)
     return 0;
 }
 
-/* IPCONFIG.DAT: "A.B.C.D A.B.C.D A.B.C.D" = IP NM GW */
+/* uLE / LaunchELF：IPCONFIG.DAT "A.B.C.D A.B.C.D A.B.C.D" = IP NM GW */
 static int tryLoadIpconfigDat(PfsNetIpConfig *cfg)
 {
     static const char *paths[] = {
@@ -240,24 +240,41 @@ void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg)
 
 int pfsnetLoadIpConfig(PfsNetIpConfig *cfg)
 {
+    PfsNetIpConfig fileCfg;
+
     if (!cfg)
         return -1;
 
+    /* 优先 DHCP；OPL / uLE 静态仅预载为失败兜底，不在此处关闭 DHCP */
     pfsnetIpConfigInitDefault(cfg);
 
-    if (tryLoadIpconfigDat(cfg) == 0)
+    memset(&fileCfg, 0, sizeof(fileCfg));
+    if (tryLoadOplConf(&fileCfg) == 0) {
+        if (!fileCfg.useDhcp) {
+            cfg->ip = fileCfg.ip;
+            cfg->nm = fileCfg.nm;
+            cfg->gw = fileCfg.gw;
+            cfg->source = PFSNET_IP_SRC_OPL;
+            cfg->useDhcp = 1;
+            strncpy(cfg->sourcePath, fileCfg.sourcePath, sizeof(cfg->sourcePath) - 1);
+            cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
+            return 0;
+        }
+        /* OPL 声明 DHCP：与最高优先一致，再看 uLE 是否有静态兜底 */
+    }
+    if (tryLoadIpconfigDat(&fileCfg) == 0) {
+        cfg->ip = fileCfg.ip;
+        cfg->nm = fileCfg.nm;
+        cfg->gw = fileCfg.gw;
+        cfg->source = PFSNET_IP_SRC_IPCONFIG;
+        cfg->useDhcp = 1;
+        strncpy(cfg->sourcePath, fileCfg.sourcePath, sizeof(cfg->sourcePath) - 1);
+        cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
         return 0;
-    if (tryLoadOplConf(cfg) == 0)
-        return 0;
+    }
 
-    /* 读不到配置文件：走 DHCP，静态地址留作 DHCP 失败后的兜底 */
-    scr_printf("No MC IP config, default DHCP\n");
-    cfg->useDhcp = 1;
-    cfg->source = PFSNET_IP_SRC_DHCP;
-    strncpy(cfg->sourcePath, "DHCP", sizeof(cfg->sourcePath) - 1);
-    IP4_ADDR(&cfg->ip, 192, 168, 0, 10);
-    IP4_ADDR(&cfg->nm, 255, 255, 255, 0);
-    IP4_ADDR(&cfg->gw, 192, 168, 0, 1);
+    /* 无记忆卡静态配置：DHCP + InitDefault 中的静态种子作最终兜底 */
+    scr_printf("No MC static IP config, default DHCP\n");
     return 0;
 }
 

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
@@ -29,8 +30,11 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
 {
     private const int S_OK = 0;
     private const int E_NOTIMPL = unchecked((int)0x80004001);
+    private const int E_ABORT = unchecked((int)0x80004004);
     private const int DV_E_FORMATETC = unchecked((int)0x80040064);
     private const int DV_E_TYMED = unchecked((int)0x80040069);
+    // HRESULT_FROM_WIN32(ERROR_CANCELLED)：用户取消，避免 E_FAIL「未指定的错误」。
+    private const int HresultErrorCancelled = unchecked((int)0x800704C7);
     private const int DataSsameFormatEtc = 0x00040130;
     private const uint GmemMoveable = 0x0002;
     private const uint GmemZeroInit = 0x0040;
@@ -45,6 +49,7 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
 
     private readonly Func<IReadOnlyList<DeferredPfsFile>> _filesFactory;
     private readonly Func<DeferredPfsFile, string> _materializeFile;
+    private readonly Func<DeferredPfsFile, Stream>? _openStream;
     private readonly Action<Exception> _errorReporter;
     private readonly bool _deferStreams;
     private readonly object _gate = new();
@@ -61,12 +66,14 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
         Func<IReadOnlyList<DeferredPfsFile>> filesFactory,
         Func<DeferredPfsFile, string> materializeFile,
         Action<Exception> errorReporter,
-        bool deferStreams = false)
+        bool deferStreams = false,
+        Func<DeferredPfsFile, Stream>? openStream = null)
     {
         _filesFactory = filesFactory;
         _materializeFile = materializeFile;
         _errorReporter = errorReporter;
         _deferStreams = deferStreams;
+        _openStream = openStream;
     }
 
     public void GetData(ref FORMATETC format, out STGMEDIUM medium)
@@ -96,11 +103,13 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
                     return;
                 }
 
-                // 拖拽源必须等到放置操作真正开始后再读取 PFS；剪贴板则直接交付原生临时文件流。
-                medium = _deferStreams
-                    ? CreateStreamMedium(new ManagedFileStream(() =>
-                        new FileStream(_materializeFile(file), FileMode.Open, FileAccess.Read, FileShare.Read)))
-                    : CreateNativeFileStreamMedium(_materializeFile(file));
+                // openStream：PfsNet 等直通流（无临时落盘）；deferStreams：拖拽延迟打开落盘文件；否则剪贴板立即原生文件流。
+                if (_openStream is not null)
+                    medium = CreateStreamMedium(new ManagedFileStream(() => OpenCustomStream(file)));
+                else if (_deferStreams)
+                    medium = CreateStreamMedium(new ManagedFileStream(() => OpenMaterializedFileStream(file)));
+                else
+                    medium = CreateNativeFileStreamMedium(MaterializeOrThrowCom(file));
                 return;
             }
 
@@ -122,7 +131,7 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
         catch (Exception ex)
         {
             _errorReporter(ex);
-            throw new COMException(ex.Message, unchecked((int)0x80004005));
+            throw WrapClipboardFailure(ex);
         }
     }
 
@@ -217,7 +226,9 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
             {
                 var file = GetFiles().FirstOrDefault(item => !item.IsDirectory)
                     ?? throw new InvalidOperationException("没有可导出的 PFS 文件。");
-                return new DeferredReadStream(() => new FileStream(_materializeFile(file), FileMode.Open, FileAccess.Read, FileShare.Read));
+                return new DeferredReadStream(() => _openStream is not null
+                    ? OpenCustomStream(file)
+                    : OpenMaterializedFileStream(file));
             }
             return null;
         }
@@ -244,6 +255,79 @@ internal sealed class VirtualFileClipboardDataObject : ComDataObject, FormsDataO
     {
         lock (_gate)
             return _files ??= _filesFactory();
+    }
+
+    private Stream OpenMaterializedFileStream(DeferredPfsFile file)
+    {
+        try
+        {
+            return new FileStream(_materializeFile(file), FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+        catch (Exception ex)
+        {
+            // 延迟流在 GetData 返回后才落地；取消需同样上报，且勿变成 E_FAIL。
+            _errorReporter(ex);
+            throw WrapClipboardFailure(ex);
+        }
+    }
+
+    private Stream OpenCustomStream(DeferredPfsFile file)
+    {
+        try
+        {
+            return _openStream!(file);
+        }
+        catch (Exception ex)
+        {
+            _errorReporter(ex);
+            throw WrapClipboardFailure(ex);
+        }
+    }
+
+    private string MaterializeOrThrowCom(DeferredPfsFile file)
+    {
+        try
+        {
+            return _materializeFile(file);
+        }
+        catch (Exception ex)
+        {
+            _errorReporter(ex);
+            throw WrapClipboardFailure(ex);
+        }
+    }
+
+    internal static bool IsCancelException(Exception? error)
+    {
+        while (error is not null)
+        {
+            if (error is OperationCanceledException)
+                return true;
+            if (error is COMException com
+                && (com.ErrorCode == HresultErrorCancelled || com.ErrorCode == E_ABORT))
+                return true;
+            if (error.Message.Contains("传输已取消", StringComparison.Ordinal))
+                return true;
+            if (error is AggregateException aggregate)
+            {
+                foreach (var inner in aggregate.InnerExceptions)
+                {
+                    if (IsCancelException(inner))
+                        return true;
+                }
+                return false;
+            }
+            error = error.InnerException;
+        }
+        return false;
+    }
+
+    private static COMException WrapClipboardFailure(Exception ex)
+    {
+        // 用户取消用 ERROR_CANCELLED，避免 Shell/本进程把 E_FAIL 显示为「未指定的错误」。
+        if (IsCancelException(ex))
+            return new COMException(ex.Message, HresultErrorCancelled);
+        return new COMException(ex.Message, unchecked((int)0x80004005));
     }
 
     internal static byte[] BuildFileGroupDescriptor(IReadOnlyList<DeferredPfsFile> files, bool unicode)
@@ -444,6 +528,204 @@ internal sealed class ManagedFileStream : IStream
     {
         if (_stream is not FileStream fileStream) throw new NotSupportedException();
         stream = new ManagedFileStream(fileStream.Name);
+    }
+}
+
+/// <summary>
+/// 顺序只读生产者-消费者流：后台 Get 写入块队列，IStream.Read 拉取；不整文件落盘。
+/// 仅支持顺序 Read；Seek 仅允许当前位置或尚未读时的 Seek(0)。
+/// </summary>
+internal sealed class ProducerConsumerReadStream : Stream
+{
+    private readonly BlockingCollection<byte[]> _queue = new(boundedCapacity: 4);
+    private readonly long _length;
+    private readonly CancellationToken _cancellationToken;
+    private byte[]? _current;
+    private int _offsetInCurrent;
+    private long _position;
+    private Exception? _fault;
+
+    private ProducerConsumerReadStream(long length, CancellationToken cancellationToken)
+    {
+        _length = Math.Max(length, 0);
+        _cancellationToken = cancellationToken;
+    }
+
+    public static ProducerConsumerReadStream Start(
+        long length,
+        Func<Stream, CancellationToken, Task> produceAsync,
+        CancellationToken cancellationToken,
+        Action? onSuccess,
+        Action? onCleanup)
+    {
+        var stream = new ProducerConsumerReadStream(length, cancellationToken);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var writer = new ChunkWriteStream(stream._queue, cancellationToken);
+                await produceAsync(writer, cancellationToken).ConfigureAwait(false);
+                stream._queue.CompleteAdding();
+                onSuccess?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                stream._fault = ex;
+                try { stream._queue.CompleteAdding(); } catch { /* 已完成 */ }
+            }
+            finally
+            {
+                onCleanup?.Invoke();
+            }
+        });
+        return stream;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _length;
+    public override long Position
+    {
+        get => _position;
+        set => Seek(value, SeekOrigin.Begin);
+    }
+
+    public override void Flush() { }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+        if (offset < 0 || count < 0 || offset + count > buffer.Length)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        if (count == 0)
+            return 0;
+
+        var totalRead = 0;
+        while (totalRead < count)
+        {
+            if (_current is null || _offsetInCurrent >= _current.Length)
+            {
+                ThrowIfFaulted();
+                try
+                {
+                    if (!_queue.TryTake(out _current, Timeout.Infinite, _cancellationToken))
+                    {
+                        ThrowIfFaulted();
+                        break;
+                    }
+                }
+                catch (OperationCanceledException ex)
+                {
+                    _fault ??= ex;
+                    throw;
+                }
+
+                _offsetInCurrent = 0;
+                if (_current.Length == 0)
+                    continue;
+            }
+
+            var n = Math.Min(count - totalRead, _current.Length - _offsetInCurrent);
+            Buffer.BlockCopy(_current, _offsetInCurrent, buffer, offset + totalRead, n);
+            _offsetInCurrent += n;
+            totalRead += n;
+            _position += n;
+        }
+
+        ThrowIfFaulted();
+        return totalRead;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        var target = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _position + offset,
+            SeekOrigin.End => _length + offset,
+            _ => throw new ArgumentOutOfRangeException(nameof(origin))
+        };
+        if (target == _position)
+            return _position;
+        if (target == 0 && _position == 0)
+            return 0;
+        throw new NotSupportedException("网络剪贴板流仅支持顺序读取，不支持中途 Seek。");
+    }
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            // 仅结束队列以唤醒生产者；onCleanup 仍由生产者 finally 调用一次。
+            try { _queue.CompleteAdding(); } catch { /* 已完成 */ }
+        }
+        base.Dispose(disposing);
+    }
+
+    private void ThrowIfFaulted()
+    {
+        var fault = _fault;
+        if (fault is null)
+            return;
+        if (fault is OperationCanceledException)
+            throw fault;
+        throw new IOException(fault.Message, fault);
+    }
+}
+
+/// <summary>将 Write 转为有界块队列，形成对网络 Get 的背压。</summary>
+internal sealed class ChunkWriteStream : Stream
+{
+    private readonly BlockingCollection<byte[]> _queue;
+    private readonly CancellationToken _cancellationToken;
+
+    public ChunkWriteStream(BlockingCollection<byte[]> queue, CancellationToken cancellationToken)
+    {
+        _queue = queue;
+        _cancellationToken = cancellationToken;
+    }
+
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        if (count <= 0)
+            return;
+        var copy = new byte[count];
+        Buffer.BlockCopy(buffer, offset, copy, 0, count);
+        _queue.Add(copy, _cancellationToken);
+    }
+
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        Write(buffer, offset, count);
+        return Task.CompletedTask;
+    }
+
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (buffer.Length <= 0)
+            return ValueTask.CompletedTask;
+        var copy = buffer.ToArray();
+        _queue.Add(copy, cancellationToken.CanBeCanceled ? cancellationToken : _cancellationToken);
+        return ValueTask.CompletedTask;
     }
 }
 

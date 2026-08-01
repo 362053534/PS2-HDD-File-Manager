@@ -111,8 +111,18 @@ int main(int argc, char *argv[])
     loadModuleBuffer(IOMANX_irx, size_IOMANX_irx, 0, NULL);
     loadModuleBuffer(FILEXIO_irx, size_FILEXIO_irx, 0, NULL);
     fileXioInit();
-    /* 默认 RW 仅 16KiB；加大以减少 SIF/IOP 往返（HDL 用 512KiB，此处取 128KiB） */
-    fileXioSetRWBufferSize(128 * 1024);
+    /* 默认 RW 仅 16KiB；尽量贴近 HDL 的 512KiB 以减少 SIF RPC（失败则回退） */
+    {
+        int rw = 512 * 1024;
+        if (fileXioSetRWBufferSize(rw) < 0) {
+            rw = 256 * 1024;
+            if (fileXioSetRWBufferSize(rw) < 0) {
+                rw = 128 * 1024;
+                fileXioSetRWBufferSize(rw);
+            }
+        }
+        scr_printf("fileXio RW: %d KiB\n", rw / 1024);
+    }
 
     loadMcStack();
     loadModuleBuffer(POWEROFF_irx, size_POWEROFF_irx, 0, NULL);
@@ -129,40 +139,31 @@ int main(int argc, char *argv[])
         scr_printf("NETMAN:%d SMAP:%d NetManInit:%d\n", rNet, rSmap, rNm);
     }
 
-    /* A: IPCONFIG.DAT → OPL conf_network.cfg → DHCP → 静态兜底 */
+    /* A: DHCP → OPL conf_network.cfg → uLE(IPCONFIG.DAT) → 静态兜底 */
     pfsnetLoadIpConfig(&cfg);
     printIpConfig(&cfg);
 
-    if (!cfg.useDhcp) {
-        int rEth, rLink, rCfg;
-
-        scr_printf("Starting network (static)...\n");
-        rEth = ethInit(0, &cfg.ip, &cfg.nm, &cfg.gw);
-        scr_printf("ethInit(static): %d\n", rEth);
-        if (rEth < 0)
-            scr_printf("WARN: ethInit(static) failed\n");
-        rLink = ethWaitLinkAndDhcp(0);
-        scr_printf("link wait: %d\n", rLink);
-        if (rLink < 0)
-            scr_printf("WARN: link wait timeout\n");
-        /* 链路起来后再 setconfig 一次，避免 init 时接口尚未稳定 */
-        rCfg = ethApplyIPConfig(0, &cfg.ip, &cfg.nm, &cfg.gw);
-        scr_printf("setconfig: %d\n", rCfg);
-    } else {
-        scr_printf("Starting network (DHCP)...\n");
-        if (ethInit(1, &cfg.ip, &cfg.nm, &cfg.gw) < 0 || ethWaitLinkAndDhcp(1) < 0) {
-            scr_printf("DHCP failed, fallback 192.168.0.10\n");
-            cfg.useDhcp = 0;
+    scr_printf("Starting network (DHCP)...\n");
+    if (ethInit(1, &cfg.ip, &cfg.nm, &cfg.gw) < 0 || ethWaitLinkAndDhcp(1) < 0) {
+        scr_printf("DHCP failed, applying static fallback...\n");
+        cfg.useDhcp = 0;
+        if (cfg.source != PFSNET_IP_SRC_OPL && cfg.source != PFSNET_IP_SRC_IPCONFIG) {
+            scr_printf("fallback 192.168.0.10\n");
             cfg.source = PFSNET_IP_SRC_STATIC;
             strncpy(cfg.sourcePath, "192.168.0.10/24", sizeof(cfg.sourcePath) - 1);
             IP4_ADDR(&cfg.ip, 192, 168, 0, 10);
             IP4_ADDR(&cfg.nm, 255, 255, 255, 0);
             IP4_ADDR(&cfg.gw, 192, 168, 0, 1);
-            if (ethInit(0, &cfg.ip, &cfg.nm, &cfg.gw) < 0)
-                scr_printf("WARN: ethInit(fallback) failed\n");
-            ethWaitLinkAndDhcp(0);
-            ethApplyIPConfig(0, &cfg.ip, &cfg.nm, &cfg.gw);
         }
+        printIpConfig(&cfg);
+        if (ethInit(0, &cfg.ip, &cfg.nm, &cfg.gw) < 0)
+            scr_printf("WARN: ethInit(fallback) failed\n");
+        ethWaitLinkAndDhcp(0);
+        ethApplyIPConfig(0, &cfg.ip, &cfg.nm, &cfg.gw);
+    } else {
+        cfg.source = PFSNET_IP_SRC_DHCP;
+        strncpy(cfg.sourcePath, "DHCP", sizeof(cfg.sourcePath) - 1);
+        cfg.sourcePath[sizeof(cfg.sourcePath) - 1] = '\0';
     }
 
     ethGetIpDisplay(ipText, sizeof(ipText));
