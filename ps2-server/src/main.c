@@ -111,6 +111,8 @@ int main(int argc, char *argv[])
     loadModuleBuffer(IOMANX_irx, size_IOMANX_irx, 0, NULL);
     loadModuleBuffer(FILEXIO_irx, size_FILEXIO_irx, 0, NULL);
     fileXioInit();
+    /* 默认 RW 仅 16KiB；加大以减少 SIF/IOP 往返（HDL 用 512KiB，此处取 128KiB） */
+    fileXioSetRWBufferSize(128 * 1024);
 
     loadMcStack();
     loadModuleBuffer(POWEROFF_irx, size_POWEROFF_irx, 0, NULL);

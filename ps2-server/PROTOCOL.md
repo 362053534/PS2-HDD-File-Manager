@@ -201,27 +201,43 @@ uint32_t flags; /* bit0 = include_system_partitions */
 #### Put（T1）约定
 
 1. PC 先在本机 `listen(45062)`。
-2. `CMD_PUT_BEGIN` 载荷示例：
+2. `CMD_PUT_BEGIN` 载荷（小端）：
 
    ```c
-   struct PutBeginRequest {
-       /* path: 目标目录，如 /APPS */
-       /* final_name: 最终 UTF-8 文件名 */
-       uint64_t total_bytes;
-       uint32_t flags; /* bit0 = overwrite */
-   };
+   /* path: UTF-8 目标目录，如 /APPS */
+   /* final_name: UTF-8 最终文件名 */
+   /* 线上顺序：string path; string final_name; uint64_t total_bytes; uint32_t flags; */
+   /* flags bit0 = overwrite */
    ```
 
-3. PS2 成功响应后 **主动 connect** 到 PC 的 45062；PC `accept`。
+3. PS2 成功响应（无载荷）后 **主动 connect** 到 PC 的 45062；PC `accept`。
 4. PS2 在目标目录创建唯一临时文件并写入：
-   - 临时名建议：`.pfsnet_<8 hex>`（以 `.` 开头减少与普通文件冲突；实现可再加随机后缀）。
-5. PC 在数据通道按序发送 `total_bytes` 原始字节（无额外帧；或可选 8 字节 chunk 头——**V1 规定：纯原始字节流，长度以 PutBegin 为准**）。
+   - 临时名：`.pfsnet_<8 hex>`（以 `.` 开头减少与普通文件冲突）。
+5. PC 在数据通道按序发送 `total_bytes` 原始字节（无额外帧；**V1：纯原始字节流，长度以 PutBegin 为准**）。
 6. 发完后 PC 发 `CMD_PUT_END`；PS2 `close` 文件，`rename` 为 `final_name`（若存在且 overwrite：先删旧文件再 rename）。
 7. 任一步失败：`CMD_PUT_ABORT` 或断线兜底删除临时文件。
 
 #### Get 约定
 
-对称：`GET_BEGIN` → PS2 回连 45062 → PS2 发送文件字节 → `GET_END`。  
+与 Put 对称：PC `listen(45062)` → `CMD_GET_BEGIN` → PS2 **成功响应后再 connect** → PS2 发送文件字节 → `CMD_GET_END`。
+
+`CMD_GET_BEGIN` 载荷：
+
+```c
+/* string path; string name; uint64_t offset; uint64_t length; */
+/* length==0 表示从 offset 到文件末尾；V1 通常 offset=0,length=0 */
+```
+
+成功响应载荷：
+
+```c
+uint64_t total_bytes; /* 随后数据通道将发送的字节数 */
+```
+
+3. PS2 成功响应（含 `total_bytes`）后 **主动 connect** 到 PC 的 45062；PC `accept`。
+4. PS2 在数据通道按序发送 `total_bytes` 原始字节。
+5. 收完后 PC 发 `CMD_GET_END`；失败则 `CMD_GET_ABORT`。
+
 V1 可不支持断点续传；`offset` 字段预留为 0。
 
 ### 5.5 APA 扇区只读（A1，分区校验）
@@ -368,3 +384,4 @@ V1 若未实现 0x0050–0x0052：feature 位置 0；PC 菜单 **P1b** 提示未
 |------|------|
 | 2026-07-30 | 初稿：按冻结决策 F1 编写 |
 | 2026-07-31 | P1 ELF 源码落地（main/net/server/fsops）；features 仅 FEAT_FILE_OPS |
+| 2026-08-01 | P2：钉死 Put/Get 载荷布局；FEAT_DATA_CHANNEL；T1 临时名 + 数据回连 |

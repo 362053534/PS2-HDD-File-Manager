@@ -58,12 +58,21 @@ internal sealed class MainForm : Form
         BackColor = Color.Gainsboro
     };
     private readonly ToolStripSpeedLabel _transferSpeedLabel = new() { Visible = false, AutoSize = false, Width = 240 };
+    private readonly ToolStripButton _cancelTransferButton = new()
+    {
+        Text = "取消传输",
+        Visible = false,
+        Enabled = false,
+        Alignment = ToolStripItemAlignment.Right
+    };
+    private readonly TextBox _pfsNetIpBox = new() { Width = 170, PlaceholderText = "PS2 PfsNet IP，例如 192.168.1.10" };
     private string _currentPath = "/";
     private string? _activePartition;
     private int _busyDepth;
     private int _fileTransferDepth;
     private Dictionary<Control, bool>? _busyControlStates;
     private bool _suppressShowSystemPartitionsEvent;
+    private CancellationTokenSource? _transferCts;
 
     public MainForm()
     {
@@ -86,6 +95,14 @@ internal sealed class MainForm : Form
         // Backspace 在窗体级处理，避免焦点不在 ListView 时无法返回上级。
         KeyDown += async (_, e) =>
         {
+            if (e.KeyCode == Keys.Escape && _transferCts is not null)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                RequestCancelTransfer();
+                return;
+            }
+
             if (e.KeyCode != Keys.Back || IsEditableTextInputFocused())
                 return;
             e.Handled = true;
@@ -295,11 +312,13 @@ internal sealed class MainForm : Form
 
         // PfsNet：对接 PS2 端 ps2-server ELF（与 NBD 互斥，见 PROTOCOL.md）。
         var pfsNetBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
-        var pfsNetIpBox = new TextBox { Width = 170, PlaceholderText = "PS2 PfsNet IP，例如 192.168.1.10" };
+        var lastPfsNetIp = LoadLastPfsNetIp();
+        if (!string.IsNullOrWhiteSpace(lastPfsNetIp))
+            _pfsNetIpBox.Text = lastPfsNetIp;
         pfsNetBar.Controls.AddRange(
         [
-            new Label { Text = "PFS 网络：", AutoSize = true, Padding = new Padding(0, 8, 0, 0) }, pfsNetIpBox,
-            MakeButton("连接 PFS 网络", async (_, _) => await ConnectPfsNetAsync(pfsNetIpBox.Text)),
+            new Label { Text = "PFS 网络：", AutoSize = true, Padding = new Padding(0, 8, 0, 0) }, _pfsNetIpBox,
+            MakeButton("连接 PFS 网络", async (_, _) => await ConnectPfsNetAsync(_pfsNetIpBox.Text)),
             MakeButton("断开 PFS 网络", async (_, _) => await DisconnectPfsNetAsync())
         ]);
 
@@ -332,7 +351,8 @@ internal sealed class MainForm : Form
         logPage.Controls.Add(_log);
         tabs.TabPages.Add(browserPage);
         tabs.TabPages.Add(logPage);
-        _statusBar.Items.AddRange([_statusLabel, _progressBar, _transferSpeedLabel]);
+        _cancelTransferButton.Click += (_, _) => RequestCancelTransfer();
+        _statusBar.Items.AddRange([_statusLabel, _cancelTransferButton, _progressBar, _transferSpeedLabel]);
         _transferSpeedLabel.BringControlToFront();
         Controls.Add(tabs);
         Controls.Add(top);
@@ -778,6 +798,7 @@ internal sealed class MainForm : Form
             return;
         }
 
+        SaveLastPfsNetIp(ipAddress.Trim());
         await RunBusyAsync("正在连接 PfsNet…", async () =>
         {
             await _pfsNet.ConnectAsync(ipAddress.Trim(), CancellationToken.None);
@@ -1112,26 +1133,32 @@ internal sealed class MainForm : Form
     {
         if (SelectedEntry() is not { IsDirectory: false } entry) { ShowWarning("请选择一个文件。目录导出将在后续版本加入。"); return; }
         if (!TryGetPfsTarget(out var device, out var partition)) return;
-        if (PfsNetProtocol.IsNetworkDevice(device))
-        {
-            ShowWarning("PFS 网络模式下的文件导出（Get）尚未接入。当前可浏览分区与目录；传输将在下一阶段实现。");
-            return;
-        }
 
         using var dialog = new FolderBrowserDialog { Description = "选择导出到的本地目录" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         BeginFileTransfer();
+        var ct = BeginTransferCancellation();
         try
         {
             await RunBusyAsync($"正在导出 {PfsNameEncoding.ToDisplay(entry.Name)}…", async () =>
             {
-                var result = await _pfs.ExportAsync(device, partition, _currentPath, entry.Name, dialog.SelectedPath, CancellationToken.None);
+                if (PfsNetProtocol.IsNetworkDevice(device))
+                {
+                    await _pfsNet.MountAsync(partition, CancellationToken.None);
+                    var localPath = Path.Combine(dialog.SelectedPath, PfsNameEncoding.ToDisplay(entry.Name));
+                    await _pfsNet.GetFileAsync(_currentPath, entry.Name, localPath, ct);
+                    AppendLog($"已通过 PfsNet 导出：{localPath}");
+                    return;
+                }
+
+                var result = await _pfs.ExportAsync(device, partition, _currentPath, entry.Name, dialog.SelectedPath, ct);
                 AppendResult(result);
                 if (!PfsShellClient.IsSuccessfulSession(result)) throw new InvalidOperationException("导出失败，请查看诊断输出。");
             });
         }
         finally
         {
+            EndTransferCancellation();
             EndFileTransfer();
         }
     }
@@ -1165,11 +1192,6 @@ internal sealed class MainForm : Form
     private async Task ImportLocalItemsAsync(IEnumerable<string> localItems)
     {
         if (!TryGetPfsTarget(out var device, out var partition)) return;
-        if (PfsNetProtocol.IsNetworkDevice(device))
-        {
-            ShowWarning("PFS 网络模式下的文件导入（Put）尚未接入。当前可浏览分区与目录；传输将在下一阶段实现。");
-            return;
-        }
 
         var items = localItems
             .Where(path => File.Exists(path) || Directory.Exists(path))
@@ -1211,6 +1233,7 @@ internal sealed class MainForm : Form
 
             var progress = new ImportProgressState(CountImportFiles(items), SumImportBytes(items));
             BeginImportProgress(progress);
+            var ct = BeginTransferCancellation();
             try
             {
                 await RunBusyAsync($"正在导入 {items.Length} 个项目…", async () =>
@@ -1219,12 +1242,13 @@ internal sealed class MainForm : Form
                     var pendingImports = new List<PfsImportRequest>();
                     foreach (var item in items)
                         await ImportLocalItemAsync(item, device, partition, _currentPath, cache, hasConflicts, progress, spaceBudget, pendingImports);
-                    await ImportPendingFilesAsync(device, partition, pendingImports, progress);
+                    await ImportPendingFilesAsync(device, partition, pendingImports, progress, ct);
                     await RefreshDirectoryAsync();
                 });
             }
             finally
             {
+                EndTransferCancellation();
                 EndImportProgress(progress);
             }
             await UpdateDiskSpaceAsync(device, partition);
@@ -1522,11 +1546,6 @@ internal sealed class MainForm : Form
             return false;
         if (!TryGetPfsTarget(out var device, out var partition))
             return false;
-        if (PfsNetProtocol.IsNetworkDevice(device))
-        {
-            ShowWarning("PFS 网络模式下暂不支持复制到 Windows（Get 尚未接入）。");
-            return false;
-        }
 
         var sourcePath = _currentPath;
         var sourceItems = selected.Select(entry => new PfsClipboardSelection(entry.Name, entry.IsDirectory, entry.Size)).ToArray();
@@ -1677,10 +1696,10 @@ internal sealed class MainForm : Form
         Dictionary<string, Dictionary<string, PfsEntry>> cache)
     {
         var name = LocalItemName(localItem);
-        // 与实际 put/mkdir 一致：净化 + 截断后再转 GBK 线名。
-        var shellName = PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(name));
+        // 与实际 put/mkdir 一致：净化后按后端键名（PfsNet=Unicode，pfsshell=UTF-8 线名）查找。
+        var entryKey = RemoteEntryKey(device, name);
         var entries = await GetRemoteEntriesAsync(device, partition, remoteDirectory, cache);
-        var conflict = entries.TryGetValue(shellName, out var existing);
+        var conflict = entries.TryGetValue(entryKey, out var existing);
         if (!Directory.Exists(localItem) || existing is not { IsDirectory: true })
             return conflict;
 
@@ -1702,10 +1721,10 @@ internal sealed class MainForm : Form
         List<PfsImportRequest> pendingImports)
     {
         var name = LocalItemName(localItem);
-        var shellName = PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(name));
+        var entryKey = RemoteEntryKey(device, name);
         var isDirectory = Directory.Exists(localItem);
         var entries = await GetRemoteEntriesAsync(device, partition, remoteDirectory, cache);
-        entries.TryGetValue(shellName, out var existing);
+        entries.TryGetValue(entryKey, out var existing);
 
         if (existing is not null && !overwrite)
             throw new InvalidOperationException($"目标中已存在“{name}”。请重新导入并选择全部覆盖。");
@@ -1715,7 +1734,7 @@ internal sealed class MainForm : Form
             if (existing is { IsDirectory: false })
             {
                 await DeleteRemoteFileAsync(device, partition, remoteDirectory, existing.Name);
-                entries.Remove(shellName);
+                entries.Remove(entryKey);
                 existing = null;
                 spaceBudget.NeedsRefresh = true;
             }
@@ -1723,10 +1742,10 @@ internal sealed class MainForm : Form
             {
                 await ReservePfsSpaceAsync(device, partition, spaceBudget, spaceBudget.ZoneSizeBytes, name, isDirectory: true);
                 await CreateRemoteDirectoryAsync(device, partition, remoteDirectory, name);
-                entries[shellName] = new PfsEntry(shellName, true, string.Empty);
+                entries[entryKey] = new PfsEntry(entryKey, true, string.Empty);
             }
 
-            var childRemoteDirectory = CombineRemotePath(remoteDirectory, existing?.Name ?? shellName);
+            var childRemoteDirectory = CombineRemotePath(remoteDirectory, existing?.Name ?? entryKey);
             foreach (var child in Directory.EnumerateFileSystemEntries(localItem))
                 await ImportLocalItemAsync(child, device, partition, childRemoteDirectory, cache, overwrite, progress, spaceBudget, pendingImports);
             return;
@@ -1735,13 +1754,13 @@ internal sealed class MainForm : Form
         if (existing is { IsDirectory: true })
         {
             await DeleteRemoteDirectoryAsync(device, partition, remoteDirectory, existing.Name, cache);
-            entries.Remove(shellName);
+            entries.Remove(entryKey);
             spaceBudget.NeedsRefresh = true;
         }
         else if (existing is not null)
         {
             await DeleteRemoteFileAsync(device, partition, remoteDirectory, existing.Name);
-            entries.Remove(shellName);
+            entries.Remove(entryKey);
             spaceBudget.NeedsRefresh = true;
         }
 
@@ -1750,17 +1769,50 @@ internal sealed class MainForm : Form
         await ReservePfsSpaceAsync(device, partition, spaceBudget, fileRequirement, name, isDirectory: false);
         SetImportProgress(progress, localItem, 0, isCompleted: false);
         pendingImports.Add(new PfsImportRequest(remoteDirectory, localItem));
-        entries[shellName] = new PfsEntry(shellName, false, string.Empty);
+        entries[entryKey] = new PfsEntry(entryKey, false, string.Empty);
     }
 
     private async Task ImportPendingFilesAsync(
         string device,
         string partition,
         IReadOnlyList<PfsImportRequest> pendingImports,
-        ImportProgressState progress)
+        ImportProgressState progress,
+        CancellationToken cancellationToken)
     {
         if (pendingImports.Count == 0)
             return;
+
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            await _pfsNet.MountAsync(partition, CancellationToken.None);
+            foreach (var item in pendingImports)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var fileLength = new FileInfo(item.LocalFilePath).Length;
+                var remoteName = PfsNameEncoding.ToPfsFileName(Path.GetFileName(item.LocalFilePath));
+                var uiUpdateTimer = Stopwatch.StartNew();
+                await _pfsNet.PutFileAsync(
+                    item.RemoteDirectory,
+                    remoteName,
+                    item.LocalFilePath,
+                    overwrite: true,
+                    cancellationToken,
+                    bytes =>
+                    {
+                        var transferred = Math.Clamp(bytes, 0, fileLength);
+                        if (transferred >= fileLength || uiUpdateTimer.ElapsedMilliseconds >= 1000)
+                        {
+                            SetImportProgress(progress, item.LocalFilePath, transferred, isCompleted: false);
+                            uiUpdateTimer.Restart();
+                        }
+                        return Task.CompletedTask;
+                    });
+                SetImportProgress(progress, item.LocalFilePath, fileLength, isCompleted: true);
+            }
+
+            AppendLog($"已通过 PfsNet 导入 {pendingImports.Count} 个文件。");
+            return;
+        }
 
         // 同一目录内出现同名来源时，维持旧版逐文件覆盖语义，避免批处理改变最终结果。
         var distinctTargets = pendingImports
@@ -1951,10 +2003,10 @@ internal sealed class MainForm : Form
         bool overwrite)
     {
         var name = LocalItemName(localItem);
-        var shellName = PfsNameEncoding.ToShell(PfsNameEncoding.ToPfsFileName(name));
+        var entryKey = RemoteEntryKey(device, name);
         var isDirectory = Directory.Exists(localItem);
         var entries = await GetRemoteEntriesAsync(device, partition, remoteDirectory, cache);
-        entries.TryGetValue(shellName, out var existing);
+        entries.TryGetValue(entryKey, out var existing);
 
         if (isDirectory)
         {
@@ -2177,10 +2229,24 @@ internal sealed class MainForm : Form
         List<DeferredPfsFile> files)
     {
         files.Add(new DeferredPfsFile(relativePath, string.Empty, string.Empty, true));
-        var result = await _pfs.ListDirectoryAsync(device, partition, remoteDirectory, CancellationToken.None);
-        if (!PfsShellClient.IsSuccessfulSession(result))
-            throw new InvalidOperationException($"无法读取 PFS 目录“{relativePath}”。连接可能已断开。");
-        foreach (var entry in PfsShellClient.ParseDirectoryEntries(result.StandardOutput))
+        IReadOnlyList<PfsEntry> entries;
+        if (PfsNetProtocol.IsNetworkDevice(device))
+        {
+            await _pfsNet.MountAsync(partition, CancellationToken.None);
+            var remote = await _pfsNet.ListDirAsync(remoteDirectory, CancellationToken.None);
+            entries = remote
+                .Select(e => new PfsEntry(e.Name, e.IsDirectory, e.Details, (long)Math.Min(e.Size, long.MaxValue)))
+                .ToList();
+        }
+        else
+        {
+            var result = await _pfs.ListDirectoryAsync(device, partition, remoteDirectory, CancellationToken.None);
+            if (!PfsShellClient.IsSuccessfulSession(result))
+                throw new InvalidOperationException($"无法读取 PFS 目录“{relativePath}”。连接可能已断开。");
+            entries = PfsShellClient.ParseDirectoryEntries(result.StandardOutput);
+        }
+
+        foreach (var entry in entries)
         {
             var childRelativePath = CombineRemotePath(relativePath, PfsNameEncoding.ToDisplay(entry.Name));
             if (entry.IsDirectory)
@@ -2205,25 +2271,47 @@ internal sealed class MainForm : Form
             var destination = Path.Combine(stagingDirectory, relativeDirectory);
             Directory.CreateDirectory(destination);
             UpdateVirtualExportProgress(progress, file, 0, isCompleted: false);
-            var result = await _pfs.ExportAsync(
-                device,
-                partition,
-                file.RemoteDirectory,
-                file.Name,
-                destination,
-                CancellationToken.None,
-                bytes =>
-                {
-                    UpdateVirtualExportProgress(progress, file, bytes, isCompleted: false);
-                    return Task.CompletedTask;
-                });
+            // 剪贴板/拖出落地时展示取消按钮（COM 路径尽力支持）。
+            var ct = EnsureTransferCancellationFromAnyThread();
             var localPath = Path.Combine(destination, PfsNameEncoding.ToDisplay(file.Name));
-            if (!File.Exists(localPath))
+            if (PfsNetProtocol.IsNetworkDevice(device))
             {
-                if (!string.IsNullOrWhiteSpace(result.CombinedOutput))
-                    AppendLog(result.CombinedOutput);
-                throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
+                await _pfsNet.MountAsync(partition, CancellationToken.None);
+                await _pfsNet.GetFileAsync(
+                    file.RemoteDirectory,
+                    file.Name,
+                    localPath,
+                    ct,
+                    bytes =>
+                    {
+                        UpdateVirtualExportProgress(progress, file, bytes, isCompleted: false);
+                        return Task.CompletedTask;
+                    });
             }
+            else
+            {
+                var result = await _pfs.ExportAsync(
+                    device,
+                    partition,
+                    file.RemoteDirectory,
+                    file.Name,
+                    destination,
+                    ct,
+                    bytes =>
+                    {
+                        UpdateVirtualExportProgress(progress, file, bytes, isCompleted: false);
+                        return Task.CompletedTask;
+                    });
+                if (!File.Exists(localPath))
+                {
+                    if (!string.IsNullOrWhiteSpace(result.CombinedOutput))
+                        AppendLog(result.CombinedOutput);
+                    throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
+                }
+            }
+
+            if (!File.Exists(localPath))
+                throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
             UpdateVirtualExportProgress(progress, file, new FileInfo(localPath).Length, isCompleted: true);
             completed = true;
             return localPath;
@@ -2231,7 +2319,10 @@ internal sealed class MainForm : Form
         finally
         {
             if (!completed)
+            {
                 HideVirtualExportProgress();
+                EndTransferCancellationFromAnyThread();
+            }
             EndFileTransfer();
         }
     }
@@ -2241,12 +2332,26 @@ internal sealed class MainForm : Form
         if (IsDisposed || !IsHandleCreated) return;
         BeginInvoke(() =>
         {
+            EndTransferCancellation();
+            if (error is OperationCanceledException)
+            {
+                AppendLog("传输已取消。");
+                _statusLabel.Text = "传输已取消";
+                return;
+            }
             AppendLog(error.ToString());
             ShowWarning($"粘贴失败：{error.Message}");
         });
     }
 
     private static string LocalItemName(string path) => Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+
+    /// <summary>导入冲突/缓存键：PfsNet 用 Unicode PFS 名；pfsshell 用 UTF-8 线名。</summary>
+    private static string RemoteEntryKey(string device, string localName)
+    {
+        var pfsName = PfsNameEncoding.ToPfsFileName(localName);
+        return PfsNetProtocol.IsNetworkDevice(device) ? pfsName : PfsNameEncoding.ToShell(pfsName);
+    }
 
     private static bool ClipboardHasImportableItems()
     {
@@ -2480,6 +2585,8 @@ internal sealed class MainForm : Form
             _statusLabel.Text = snapshot.IsCompletedAll
                 ? $"复制到 Windows 完成：{FormatBytes(snapshot.TotalBytes)}"
                 : $"复制到 PC：{FormatBytes(snapshot.DisplayedBytes)} / {FormatBytes(snapshot.TotalBytes)} · {snapshot.CompletedFiles} / {snapshot.TotalFiles}";
+            if (snapshot.IsCompletedAll)
+                EndTransferCancellation();
         }
 
         if (InvokeRequired)
@@ -2499,6 +2606,7 @@ internal sealed class MainForm : Form
                 return;
             _progressBar.Visible = false;
             _transferSpeedLabel.Visible = false;
+            EndTransferCancellation();
         }
 
         if (InvokeRequired)
@@ -2551,6 +2659,11 @@ internal sealed class MainForm : Form
         }
         AppendLog(status);
         try { await action(); }
+        catch (OperationCanceledException)
+        {
+            AppendLog("传输已取消。");
+            _statusLabel.Text = "传输已取消";
+        }
         catch (Exception ex) { AppendLog(ex.ToString()); ShowWarning(ex.Message); }
         finally
         {
@@ -2564,6 +2677,90 @@ internal sealed class MainForm : Form
                 }
                 UseWaitCursor = false;
             }
+        }
+    }
+
+    private CancellationToken BeginTransferCancellation()
+    {
+        EndTransferCancellation();
+        _transferCts = new CancellationTokenSource();
+        _cancelTransferButton.Visible = true;
+        _cancelTransferButton.Enabled = true;
+        return _transferCts.Token;
+    }
+
+    private void EndTransferCancellation()
+    {
+        _cancelTransferButton.Visible = false;
+        _cancelTransferButton.Enabled = false;
+        var cts = _transferCts;
+        _transferCts = null;
+        cts?.Dispose();
+    }
+
+    private CancellationToken EnsureTransferCancellationFromAnyThread()
+    {
+        if (IsDisposed)
+            return CancellationToken.None;
+        if (InvokeRequired)
+            return (CancellationToken)Invoke(EnsureTransferCancellationFromAnyThread);
+        return _transferCts?.Token ?? BeginTransferCancellation();
+    }
+
+    private void EndTransferCancellationFromAnyThread()
+    {
+        if (IsDisposed || !IsHandleCreated)
+            return;
+        if (InvokeRequired)
+        {
+            BeginInvoke(EndTransferCancellation);
+            return;
+        }
+        EndTransferCancellation();
+    }
+
+    private void RequestCancelTransfer()
+    {
+        try { _transferCts?.Cancel(); }
+        catch { /* 忽略重复取消 */ }
+        if (_cancelTransferButton.Visible)
+        {
+            _cancelTransferButton.Enabled = false;
+            _statusLabel.Text = "正在取消传输…";
+            AppendLog("用户请求取消传输。");
+        }
+    }
+
+    private static string AppDataDirectory =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PS2-HDD-File-Manager");
+
+    private static string LastPfsNetIpPath => Path.Combine(AppDataDirectory, "last-pfsnet-ip.txt");
+
+    private static string? LoadLastPfsNetIp()
+    {
+        try
+        {
+            if (!File.Exists(LastPfsNetIpPath))
+                return null;
+            var ip = File.ReadAllText(LastPfsNetIpPath).Trim();
+            return string.IsNullOrWhiteSpace(ip) ? null : ip;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void SaveLastPfsNetIp(string ipAddress)
+    {
+        try
+        {
+            Directory.CreateDirectory(AppDataDirectory);
+            File.WriteAllText(LastPfsNetIpPath, ipAddress);
+        }
+        catch
+        {
+            /* 设置写入失败不影响连接 */
         }
     }
 

@@ -201,6 +201,196 @@ internal sealed class PfsNetClient : IDisposable
             await SendSimpleAsync(PfsNetProtocol.CmdRename, ms.ToArray(), ct);
         }, cancellationToken);
 
+    /// <summary>Put：本机 listen 45062 → PUT_BEGIN → accept → 原始字节流 → PUT_END（T1）。</summary>
+    public Task PutFileAsync(
+        string remoteDirectory,
+        string remoteFileName,
+        string localFilePath,
+        bool overwrite,
+        CancellationToken cancellationToken,
+        Func<long, Task>? progress = null) =>
+        WithLockAsync(async ct =>
+        {
+            EnsureMounted();
+            EnsureDataChannel();
+            localFilePath = Path.GetFullPath(localFilePath);
+            var totalBytes = (ulong)new FileInfo(localFilePath).Length;
+
+            using var listener = CreateDataListener();
+            listener.Start();
+            var acceptTask = AcceptDataAsync(listener, ct);
+            var accepted = false;
+            try
+            {
+                // 先挂起 accept，再发 PUT_BEGIN，缩小 PS2 回连与 PC accept 之间的空窗
+                using var ms = new MemoryStream();
+                using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+                {
+                    PfsNetCodec.WriteString(writer, NormalizePath(remoteDirectory));
+                    PfsNetCodec.WriteString(writer, remoteFileName);
+                    writer.Write(totalBytes);
+                    writer.Write(overwrite ? 1u : 0u);
+                }
+
+                await SendSimpleAsync(PfsNetProtocol.CmdPutBegin, ms.ToArray(), ct);
+
+                using var dataClient = await acceptTask;
+                accepted = true;
+                // 取消时主动关闭数据口，避免 WriteAsync 在部分平台上迟迟不响应 CT。
+                using var cancelClose = ct.Register(() => { try { dataClient.Client.Close(); } catch { } });
+                try
+                {
+                    dataClient.SendBufferSize = 256 * 1024;
+                    dataClient.NoDelay = true;
+                }
+                catch { /* 平台可能不支持，忽略 */ }
+                await using var dataStream = dataClient.GetStream();
+                await using var file = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                var buffer = new byte[128 * 1024];
+                long sent = 0;
+                while (sent < (long)totalBytes)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var toRead = (int)Math.Min(buffer.Length, (long)totalBytes - sent);
+                    var n = await file.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                    if (n <= 0)
+                        throw new IOException("本地文件读取提前结束。");
+                    await dataStream.WriteAsync(buffer.AsMemory(0, n), ct);
+                    sent += n;
+                    if (progress is not null)
+                        await progress(sent);
+                }
+
+                await dataStream.FlushAsync(ct);
+                dataClient.Close();
+                await SendSimpleAsync(PfsNetProtocol.CmdPutEnd, ReadOnlyMemory<byte>.Empty, ct);
+            }
+            catch (Exception ex)
+            {
+                try { await SendSimpleAsync(PfsNetProtocol.CmdPutAbort, ReadOnlyMemory<byte>.Empty, CancellationToken.None); }
+                catch { /* 尽力取消 */ }
+                if (ct.IsCancellationRequested)
+                    throw new OperationCanceledException("传输已取消。", ex, ct);
+                throw;
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
+                if (!accepted)
+                {
+                    try { (await acceptTask).Dispose(); }
+                    catch { /* BEGIN 失败或 listener 已停 */ }
+                }
+            }
+        }, cancellationToken);
+
+    /// <summary>Get：本机 listen 45062 → GET_BEGIN → accept → 收原始字节 → GET_END。</summary>
+    public Task GetFileAsync(
+        string remoteDirectory,
+        string remoteFileName,
+        string localFilePath,
+        CancellationToken cancellationToken,
+        Func<long, Task>? progress = null) =>
+        WithLockAsync(async ct =>
+        {
+            EnsureMounted();
+            EnsureDataChannel();
+            localFilePath = Path.GetFullPath(localFilePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(localFilePath)!);
+
+            using var listener = CreateDataListener();
+            listener.Start();
+            // 与 Put 对称：先挂起 accept，再发 GET_BEGIN；PS2 回 OK 后再回连。
+            var acceptTask = AcceptDataAsync(listener, ct);
+            var accepted = false;
+            ulong totalBytes = 0;
+            long received = 0;
+            string peerInfo = "(未接受)";
+            var replyReady = false;
+            try
+            {
+                using var ms = new MemoryStream();
+                using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+                {
+                    PfsNetCodec.WriteString(writer, NormalizePath(remoteDirectory));
+                    PfsNetCodec.WriteString(writer, remoteFileName);
+                    writer.Write(0UL); // offset
+                    writer.Write(0UL); // length=0 → 整文件
+                }
+
+                var reply = await SendAsync(PfsNetProtocol.CmdGetBegin, ms.ToArray(), ct);
+                if (reply.Length < 8)
+                    throw new InvalidOperationException("GET_BEGIN 响应缺少 total_bytes。");
+                totalBytes = BinaryPrimitives.ReadUInt64LittleEndian(reply.AsSpan(0, 8));
+                replyReady = true;
+                System.Diagnostics.Debug.WriteLine(
+                    $"[PfsNet Get] GET_BEGIN 回复已收 total_bytes={totalBytes} path={NormalizePath(remoteDirectory)}/{remoteFileName}");
+
+                using var dataClient = await acceptTask;
+                accepted = true;
+                // 取消时主动关闭数据口，避免 ReadAsync 在部分平台上迟迟不响应 CT。
+                using var cancelClose = ct.Register(() => { try { dataClient.Client.Close(); } catch { } });
+                try
+                {
+                    dataClient.ReceiveBufferSize = 256 * 1024;
+                    dataClient.SendBufferSize = 256 * 1024;
+                    dataClient.NoDelay = true;
+                }
+                catch { /* 平台可能不支持，忽略 */ }
+                peerInfo = dataClient.Client.RemoteEndPoint?.ToString() ?? "(未知)";
+                System.Diagnostics.Debug.WriteLine($"[PfsNet Get] accept 完成 peer={peerInfo}");
+
+                await using var dataStream = dataClient.GetStream();
+                await using var file = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                var buffer = new byte[128 * 1024];
+                while (received < (long)totalBytes)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var toRead = (int)Math.Min(buffer.Length, (long)totalBytes - received);
+                    var n = await dataStream.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                    if (n <= 0)
+                    {
+                        // 取消关闭套接字时 Read 会返回 0，优先按取消处理。
+                        ct.ThrowIfCancellationRequested();
+                        throw new IOException(
+                            $"数据通道在文件传完前断开（已收 {received}/{totalBytes}，对端 {peerInfo}）。");
+                    }
+                    if (received == 0)
+                        System.Diagnostics.Debug.WriteLine($"[PfsNet Get] 首包 {n} 字节");
+                    await file.WriteAsync(buffer.AsMemory(0, n), ct);
+                    received += n;
+                    if (progress is not null)
+                        await progress(received);
+                }
+
+                await file.FlushAsync(ct);
+                System.Diagnostics.Debug.WriteLine($"[PfsNet Get] 完成 {received}/{totalBytes}，对端 {peerInfo}");
+                // 先 GET_END 再关数据口，让 PS2 侧有机会在 END 时再 close（避免过早 RST）
+                await SendSimpleAsync(PfsNetProtocol.CmdGetEnd, ReadOnlyMemory<byte>.Empty, ct);
+                dataClient.Close();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[PfsNet Get] 失败 replyReady={replyReady} accepted={accepted} peer={peerInfo} received={received}/{totalBytes}");
+                try { await SendSimpleAsync(PfsNetProtocol.CmdGetAbort, ReadOnlyMemory<byte>.Empty, CancellationToken.None); }
+                catch { /* 尽力取消 */ }
+                try { if (File.Exists(localFilePath)) File.Delete(localFilePath); } catch { }
+                if (ct.IsCancellationRequested)
+                    throw new OperationCanceledException("传输已取消。", ex, ct);
+                throw;
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
+                if (!accepted)
+                {
+                    try { (await acceptTask).Dispose(); }
+                    catch { /* BEGIN 失败或 listener 已停 */ }
+                }
+            }
+        }, cancellationToken);
+
     private Task PathNameCommandAsync(uint command, string parentPath, string name, CancellationToken cancellationToken) =>
         WithLockAsync(async ct =>
         {
@@ -214,6 +404,33 @@ internal sealed class PfsNetClient : IDisposable
 
             await SendSimpleAsync(command, ms.ToArray(), ct);
         }, cancellationToken);
+
+    private void EnsureDataChannel()
+    {
+        if ((_features & PfsNetProtocol.FeatDataChannel) == 0)
+            throw new InvalidOperationException("PS2 未声明 FEAT_DATA_CHANNEL，无法 Put/Get。请更新并运行新版 PfsNetServer.elf。");
+    }
+
+    private static TcpListener CreateDataListener()
+    {
+        var listener = new TcpListener(IPAddress.Any, PfsNetProtocol.DataPort);
+        listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        return listener;
+    }
+
+    private static async Task<TcpClient> AcceptDataAsync(TcpListener listener, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        try
+        {
+            return await listener.AcceptTcpClientAsync(timeout.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException("等待 PS2 回连数据口 45062 超时。请检查 PC 防火墙是否放行入站 TCP 45062。");
+        }
+    }
 
     private async Task HelloUnlockedAsync(CancellationToken cancellationToken)
     {

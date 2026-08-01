@@ -1,4 +1,4 @@
-# ps2-server（PfsNet P1）
+# ps2-server（PfsNet P2）
 
 无操作网络 PFS 服务：开机自动 DHCP/静态 IP，监听 **45061**，屏幕显示 IP。PC 用「PFS 网络」连接。
 
@@ -8,13 +8,14 @@
 2. 该 SDK **已编译出 IRX**（至少含 `iop/irx/ps2fs.irx`、`ps2hdd.irx`、`netman.irx`、`smap.irx` 等）
 3. **PS2 工具链**：`mips64r5900el-ps2-elf-gcc` + `bin2c`（通常在 WSL 的 `/usr/local/ps2dev`）
 
-## 本阶段（P1）已实现
+## 本阶段（P2）已实现
 
 - HELLO / PING  
 - LIST_PARTITIONS / GET_APA_FREE / GET_PFS_FREE（PFS free 为占位增强项）  
 - MOUNT / UMOUNT（M1，断线强制 umount）  
 - LIST_DIR / MKDIR / RMDIR / REMOVE / RENAME  
-- features：`FEAT_FILE_OPS`（数据通道 Put/Get、APA 扇区/变更返回 `ERR_UNSUPPORTED`）
+- PUT / GET（D1 数据回连 45062 + T1 临时名写入后 rename）  
+- features：`FEAT_FILE_OPS | FEAT_DATA_CHANNEL`（APA 扇区/变更仍返回 `ERR_UNSUPPORTED`）
 
 ## 编译
 
@@ -31,7 +32,7 @@ make clean && make
 或在 Windows：
 
 ```powershell
-.\scripts\build.ps1 -Ps2Sdk C:\GitHub\ps2sdk -Ps2Dev /usr/local/ps2dev
+.\scripts\build.ps1 -Docker
 ```
 
 产物：`PfsNetServer.elf`
@@ -39,3 +40,4 @@ make clean && make
 ## 与 HDLGameInstaller
 
 同端口 45061/45062，**不要同时运行**。握手魔数为 `PFSN`，误连会拒。
+PC 防火墙需放行入站 **TCP 45062**（Put/Get 数据回连）。

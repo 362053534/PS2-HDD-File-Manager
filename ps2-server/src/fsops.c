@@ -2,27 +2,82 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <kernel.h>
+#include <debug.h>
 
 #include <fileXio_rpc.h>
 #include <hdd-ioctl.h>
+#include <io_common.h>
 #include <iox_stat.h>
 
 #include "pfsnet.h"
 
+#define PFSNET_XFER_NONE 0
+#define PFSNET_XFER_PUT 1
+#define PFSNET_XFER_GET 2
+/* 64KiB：对齐 HDD/SIF 大批次；HDL 侧 RW 缓冲更大，此处兼顾 IOP 内存 */
+#define PFSNET_XFER_BUF 65536
+#define PFSNET_PUT_OVERWRITE 1u
+
 static char g_mountedPartition[APA_IDMAX];
 static int g_mounted;
+
+/* 进行中的 Put/Get（控制线程内同步收发载荷，END/ABORT 再提交） */
+static struct {
+    int kind;
+    int fileFd;
+    int dataSock;
+    uint32_t flags;
+    uint64_t totalBytes;
+    char tempPath[768];
+    char finalPath[768];
+} g_xfer;
+
+static uint8_t g_xferBuf[PFSNET_XFER_BUF] __attribute__((aligned(64)));
+static uint32_t g_tempSeq;
+
+static void clearXferState(void)
+{
+    g_xfer.kind = PFSNET_XFER_NONE;
+    g_xfer.fileFd = -1;
+    g_xfer.dataSock = -1;
+    g_xfer.flags = 0;
+    g_xfer.totalBytes = 0;
+    g_xfer.tempPath[0] = '\0';
+    g_xfer.finalPath[0] = '\0';
+}
+
+static void abortXferCleanup(void)
+{
+    if (g_xfer.dataSock >= 0) {
+        close(g_xfer.dataSock);
+        g_xfer.dataSock = -1;
+    }
+    if (g_xfer.fileFd >= 0) {
+        fileXioClose(g_xfer.fileFd);
+        g_xfer.fileFd = -1;
+    }
+    if (g_xfer.kind == PFSNET_XFER_PUT && g_xfer.tempPath[0] != '\0')
+        fileXioRemove(g_xfer.tempPath);
+    clearXferState();
+}
 
 int pfsnetFsInit(void)
 {
     g_mounted = 0;
     g_mountedPartition[0] = '\0';
+    clearXferState();
     return 0;
 }
 
 void pfsnetFsForceUmount(void)
 {
+    abortXferCleanup();
     if (g_mounted) {
         fileXioUmount(PFSNET_MOUNT_POINT);
         g_mounted = 0;
@@ -129,6 +184,9 @@ static int doMount(const char *partition)
     char device[64];
     int result;
 
+    if (g_xfer.kind != PFSNET_XFER_NONE)
+        return PFSNET_ERR_BUSY;
+
     if (g_mounted) {
         if (strcmp(g_mountedPartition, partition) == 0)
             return PFSNET_OK;
@@ -150,6 +208,8 @@ static int doMount(const char *partition)
 
 static int doUmount(void)
 {
+    if (g_xfer.kind != PFSNET_XFER_NONE)
+        return PFSNET_ERR_BUSY;
     if (!g_mounted)
         return PFSNET_OK;
     fileXioUmount(PFSNET_MOUNT_POINT);
@@ -386,6 +446,328 @@ static int handleRename(struct PfsNetClient *client, const uint8_t *payload, uin
     return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
 }
 
+static int xferSendAll(int sock, const void *buf, int len)
+{
+    const char *ptr = (const char *)buf;
+    int sent = 0;
+
+    while (sent < len) {
+        int n = send(sock, ptr + sent, len - sent, 0);
+        if (n > 0) {
+            sent += n;
+            continue;
+        }
+        /* 阻塞 socket：成功路径不应休眠；n<=0 视为硬错误 */
+        return -1;
+    }
+    return sent;
+}
+
+static int xferRecvAll(int sock, void *buf, int len)
+{
+    char *ptr = (char *)buf;
+    int got = 0;
+    while (got < len) {
+        int n = recv(sock, ptr + got, len - got, 0);
+        if (n <= 0)
+            return -1;
+        got += n;
+    }
+    return got;
+}
+
+/* 数据通道：关 Nagle，尽量加大收发缓冲（SNDBUF 在部分 lwIP 上可能无效） */
+static void tuneDataSocket(int sock)
+{
+    int yes = 1;
+    int buf = 128 * 1024;
+
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+}
+
+/* 向控制连接对端（PC）的 45062 回连数据通道 */
+static int connectDataChannel(struct PfsNetClient *client)
+{
+    int sock;
+    struct sockaddr_in addr;
+
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0)
+        return -1;
+
+    tuneDataSocket(sock);
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PFSNET_DATA_PORT);
+    addr.sin_addr = client->peer.sin_addr;
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+static int pathExists(const char *fullPath)
+{
+    iox_stat_t st;
+    return fileXioGetStat(fullPath, &st) >= 0;
+}
+
+static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, uint32_t payloadLen)
+{
+    char parent[512];
+    char finalName[256];
+    char tempName[32];
+    uint64_t totalBytes = 0;
+    uint32_t flags = 0;
+    uint32_t off = 0, consumed = 0;
+    int rc, fd, dataSock;
+    uint64_t got = 0;
+
+    if (!g_mounted)
+        return pfsnetSendResponse(client, PFSNET_ERR_NOT_MOUNTED, NULL, 0);
+    if (g_xfer.kind != PFSNET_XFER_NONE)
+        return pfsnetSendResponse(client, PFSNET_ERR_BUSY, NULL, 0);
+
+    rc = pfsnetReadString(payload, payloadLen, off, parent, sizeof(parent), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    off += consumed;
+    rc = pfsnetReadString(payload, payloadLen, off, finalName, sizeof(finalName), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    off += consumed;
+    if (off + 12 > payloadLen || finalName[0] == '\0')
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    memcpy(&totalBytes, payload + off, 8);
+    off += 8;
+    memcpy(&flags, payload + off, 4);
+
+    joinPfsPath(g_xfer.finalPath, sizeof(g_xfer.finalPath), parent, finalName);
+    if (pathExists(g_xfer.finalPath) && (flags & PFSNET_PUT_OVERWRITE) == 0)
+        return pfsnetSendResponse(client, PFSNET_ERR_EXIST, NULL, 0);
+
+    g_tempSeq++;
+    snprintf(tempName, sizeof(tempName), ".pfsnet_%08x", (unsigned)g_tempSeq);
+    joinPfsPath(g_xfer.tempPath, sizeof(g_xfer.tempPath), parent, tempName);
+
+    /* 必须用 FIO_O_*；newlib O_WRONLY(=1) 会被 IOP 当成 FIO_O_RDONLY */
+    fd = fileXioOpen(g_xfer.tempPath, FIO_O_WRONLY | FIO_O_CREAT | FIO_O_TRUNC, 0666);
+    if (fd < 0)
+        return pfsnetSendResponse(client, mapErrno(fd), NULL, 0);
+
+    /* 先回成功，再回连数据口（PROTOCOL §5.4） */
+    if (pfsnetSendResponse(client, PFSNET_OK, NULL, 0) < 0) {
+        fileXioClose(fd);
+        fileXioRemove(g_xfer.tempPath);
+        clearXferState();
+        return -1;
+    }
+
+    dataSock = connectDataChannel(client);
+    if (dataSock < 0) {
+        fileXioClose(fd);
+        fileXioRemove(g_xfer.tempPath);
+        clearXferState();
+        return 0;
+    }
+
+    while (got < totalBytes) {
+        uint64_t remain = totalBytes - got;
+        int chunk = remain > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)remain;
+        int n = xferRecvAll(dataSock, g_xferBuf, chunk);
+        int wr, written = 0;
+        if (n < 0)
+            break;
+        while (written < chunk) {
+            wr = fileXioWrite(fd, g_xferBuf + written, chunk - written);
+            if (wr <= 0) {
+                n = -1;
+                break;
+            }
+            written += wr;
+        }
+        if (n < 0)
+            break;
+        got += (uint64_t)chunk;
+    }
+
+    close(dataSock);
+    fileXioClose(fd);
+
+    if (got != totalBytes) {
+        fileXioRemove(g_xfer.tempPath);
+        clearXferState();
+        return 0;
+    }
+
+    g_xfer.kind = PFSNET_XFER_PUT;
+    g_xfer.fileFd = -1;
+    g_xfer.dataSock = -1;
+    g_xfer.flags = flags;
+    g_xfer.totalBytes = totalBytes;
+    return 0;
+}
+
+static int handlePutEnd(struct PfsNetClient *client)
+{
+    int result;
+
+    if (g_xfer.kind != PFSNET_XFER_PUT)
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    if ((g_xfer.flags & PFSNET_PUT_OVERWRITE) && pathExists(g_xfer.finalPath)) {
+        result = fileXioRemove(g_xfer.finalPath);
+        if (result < 0) {
+            abortXferCleanup();
+            return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
+        }
+    }
+
+    result = fileXioRename(g_xfer.tempPath, g_xfer.finalPath);
+    if (result < 0) {
+        abortXferCleanup();
+        return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
+    }
+
+    clearXferState();
+    return pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
+}
+
+static int handlePutAbort(struct PfsNetClient *client)
+{
+    abortXferCleanup();
+    return pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
+}
+
+static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, uint32_t payloadLen)
+{
+    char parent[512];
+    char name[256];
+    char full[768];
+    uint64_t offset = 0, length = 0, fileSize = 0, toSend = 0, sent = 0;
+    uint32_t off = 0, consumed = 0;
+    int rc, fd, dataSock;
+    iox_stat_t st;
+    uint8_t reply[8];
+
+    if (!g_mounted)
+        return pfsnetSendResponse(client, PFSNET_ERR_NOT_MOUNTED, NULL, 0);
+    if (g_xfer.kind != PFSNET_XFER_NONE)
+        return pfsnetSendResponse(client, PFSNET_ERR_BUSY, NULL, 0);
+
+    rc = pfsnetReadString(payload, payloadLen, off, parent, sizeof(parent), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    off += consumed;
+    rc = pfsnetReadString(payload, payloadLen, off, name, sizeof(name), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    off += consumed;
+    if (off + 16 > payloadLen || name[0] == '\0')
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    memcpy(&offset, payload + off, 8);
+    off += 8;
+    memcpy(&length, payload + off, 8);
+
+    joinPfsPath(full, sizeof(full), parent, name);
+    if (fileXioGetStat(full, &st) < 0)
+        return pfsnetSendResponse(client, PFSNET_ERR_NOENT, NULL, 0);
+    if (st.mode & FIO_S_IFDIR)
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    fileSize = ((uint64_t)st.hisize << 32) | (uint64_t)st.size;
+    if (offset > fileSize)
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+    toSend = length == 0 ? (fileSize - offset) : length;
+    if (offset + toSend > fileSize)
+        toSend = fileSize - offset;
+
+    /* 必须用 FIO_O_RDONLY(=1)；newlib O_RDONLY(=0) 会使 open 成功但读到 0 字节 */
+    fd = fileXioOpen(full, FIO_O_RDONLY, 0);
+    if (fd < 0)
+        return pfsnetSendResponse(client, mapErrno(fd), NULL, 0);
+
+    if (offset > 0) {
+        /* fileXioLseek 偏移为 32 位；V1 大文件 offset 预留为 0 */
+        if (offset > 0x7FFFFFFFu) {
+            fileXioClose(fd);
+            return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+        }
+        if (fileXioLseek(fd, (int)offset, SEEK_SET) < 0) {
+            fileXioClose(fd);
+            return pfsnetSendResponse(client, PFSNET_ERR_IO, NULL, 0);
+        }
+    }
+
+    /* 与 Put 对称：先回 GET_BEGIN OK（含 total_bytes），再回连数据口后发字节 */
+    memcpy(reply, &toSend, 8);
+    if (pfsnetSendResponse(client, PFSNET_OK, reply, 8) < 0) {
+        fileXioClose(fd);
+        return -1;
+    }
+
+    dataSock = connectDataChannel(client);
+    if (dataSock < 0) {
+        fileXioClose(fd);
+        return 0;
+    }
+
+    while (sent < toSend) {
+        uint64_t remain = toSend - sent;
+        int chunk = remain > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)remain;
+        int rd = fileXioRead(fd, g_xferBuf, chunk);
+        if (rd < 0)
+            break;
+        if (rd == 0)
+            break; /* 真 EOF */
+        if (xferSendAll(dataSock, g_xferBuf, rd) < 0)
+            break;
+        sent += (uint64_t)rd;
+        /* 注意：rd < chunk 时不得当作结束。fileXio/PFS 允许短读，Put 侧写循环已按此处理。 */
+    }
+
+    fileXioClose(fd);
+
+    if (sent != toSend) {
+        close(dataSock);
+        return 0;
+    }
+
+    /* 半关闭写端发出 FIN；socket 留到 GET_END 再 close，避免 PC 未读完时 abortive close 丢尾部数据 */
+    shutdown(dataSock, SHUT_WR);
+
+    g_xfer.kind = PFSNET_XFER_GET;
+    g_xfer.fileFd = -1;
+    g_xfer.dataSock = dataSock;
+    g_xfer.totalBytes = toSend;
+    return 0;
+}
+
+static int handleGetEnd(struct PfsNetClient *client)
+{
+    if (g_xfer.kind != PFSNET_XFER_GET)
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+    if (g_xfer.dataSock >= 0) {
+        close(g_xfer.dataSock);
+        g_xfer.dataSock = -1;
+    }
+    clearXferState();
+    return pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
+}
+
+static int handleGetAbort(struct PfsNetClient *client)
+{
+    abortXferCleanup();
+    return pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
+}
+
 int pfsnetHandleCommand(struct PfsNetClient *client, uint32_t command, const uint8_t *payload, uint32_t payloadLen)
 {
     char partition[APA_IDMAX];
@@ -426,11 +808,23 @@ int pfsnetHandleCommand(struct PfsNetClient *client, uint32_t command, const uin
             return handleRename(client, payload, payloadLen);
 
         case PFSNET_CMD_PUT_BEGIN:
+            return handlePutBegin(client, payload, payloadLen);
+
         case PFSNET_CMD_PUT_END:
+            return handlePutEnd(client);
+
         case PFSNET_CMD_PUT_ABORT:
+            return handlePutAbort(client);
+
         case PFSNET_CMD_GET_BEGIN:
+            return handleGetBegin(client, payload, payloadLen);
+
         case PFSNET_CMD_GET_END:
+            return handleGetEnd(client);
+
         case PFSNET_CMD_GET_ABORT:
+            return handleGetAbort(client);
+
         case PFSNET_CMD_READ_SECTORS:
         case PFSNET_CMD_APA_CREATE_PFS:
         case PFSNET_CMD_APA_REMOVE:
