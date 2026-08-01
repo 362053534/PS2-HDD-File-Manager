@@ -4,8 +4,9 @@ using System.Text;
 namespace PfsExplorerLite.Services;
 
 /// <summary>
-/// PFS 文件名与 Windows 本地路径均按 UTF-8 字节经 Latin-1 保真传输；
-/// PFS 目录项按 UTF-8 原始字节存放（不再使用 GBK）。
+/// PFS 文件名与 Windows 本地路径均按 UTF-8 字节经 Latin-1 保真传输（pfsshell）；
+/// PfsNet 协议侧已是 UTF-8 解码后的 Unicode；PFS 目录项按 UTF-8 原始字节存放。
+/// 参考本地 PS2SDK smbman：盘上/本地路径为 UTF-8 字节，边界处再转协议编码（SMB 为 UTF-16）。
 /// </summary>
 internal static class PfsNameEncoding
 {
@@ -66,9 +67,16 @@ internal static class PfsNameEncoding
         return TruncateUtf8(text, MaxPfsFileNameBytes);
     }
 
+    /// <summary>
+    /// 显示名：pfsshell 线名（Latin-1 保真的 UTF-8 字节）→ Unicode；
+    /// 若已是 Unicode（如 PfsNet 已 UTF-8 解码的字符串），原样返回。
+    /// </summary>
     public static string ToDisplay(string shellName)
     {
         if (string.IsNullOrEmpty(shellName) || IsAscii(shellName))
+            return shellName;
+        // 含 >0xFF 码点说明已是解码后的 Unicode；再走 Latin-1 会把中文替换成 '?'。
+        if (shellName.Any(static c => c > 0xFF))
             return shellName;
         return Utf8Encoding.GetString(WireEncoding.GetBytes(shellName));
     }
