@@ -6,9 +6,11 @@ EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
 	NETMAN_irx.o SMAP_irx.o
 
 EE_INCS := -I./include -I$(PS2SDK)/ports/include -I$(PS2SDK)/ee/include -I$(PS2SDK)/common/include
-EE_CFLAGS += -Os -DNEWLIB_PORT_AWARE -D_EE
-EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib
-EE_LIBS = -lpatches -lfileXio -ldebug -lps2ip -lnetman -lcdvd -lkernel -lc
+# 对齐 HDDTester：DUMMY_* / KERNEL_NOPATCH + gc-sections；勿链 -lcdvd / ps2time
+EE_CFLAGS += -Os -fdata-sections -ffunction-sections -DNEWLIB_PORT_AWARE \
+	-DDUMMY_TIMEZONE -DDUMMY_LIBC_INIT -DKERNEL_NOPATCH -D_EE
+EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections -T$(PS2SDK)/ee/startup/linkfile
+EE_LIBS = -lpatches -lkernel -ldebug -lfileXio -lps2ip -lnetman
 
 EE_TEMP_FILES = IOMANX_irx.c FILEXIO_irx.c POWEROFF_irx.c DEV9_irx.c ATAD_irx.c HDD_irx.c PFS_irx.c \
 	SIO2MAN_irx.c MCMAN_irx.c MCSERV_irx.c NETMAN_irx.c SMAP_irx.c

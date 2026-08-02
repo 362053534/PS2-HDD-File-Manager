@@ -16,7 +16,7 @@
 
 struct PfsNetClient;
 
-/* 网络配置优先：DHCP → OPL → uLE(IPCONFIG.DAT) → 静态兜底 */
+/* 网络配置：OPL 静态则直接采用；否则 DHCP，失败再 uLE/默认静态兜底 */
 enum PfsNetIpSource {
     PFSNET_IP_SRC_IPCONFIG = 1, /* uLE: mc?:/SYS-CONF/IPCONFIG.DAT */
     PFSNET_IP_SRC_OPL = 2,      /* OPL: mc?:/OPL/conf_network.cfg */
@@ -40,6 +40,7 @@ const char *pfsnetIpSourceName(int source);
 int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw);
 int ethApplyIPConfig(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw);
 int ethWaitLinkAndDhcp(int use_dhcp);
+int ethLinkIsUp(void);
 void ethGetIpDisplay(char *out, int outLen);
 
 int pfsnetFsInit(void);

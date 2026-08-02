@@ -236,6 +236,5 @@ int pfsnetStartServer(void)
         return -1;
     }
     StartThread(g_serverThreadId, NULL);
-    scr_printf("server: listening on :%u\n", PFSNET_COMMAND_PORT);
     return 0;
 }

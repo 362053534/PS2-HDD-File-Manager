@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -43,8 +44,8 @@ static struct {
     char finalPath[768];
 } g_xfer;
 
-/* [0]/[1] 乒乓：HDD 与 TCP 重叠 */
-static uint8_t g_xferBuf[2][PFSNET_XFER_BUF] __attribute__((aligned(64)));
+/* [0]/[1] 乒乓：堆上分配，避免 ~1MiB BSS 拖慢 crt0 清零 / 撑大 ELF MemSiz */
+static uint8_t *g_xferBuf[2];
 static uint32_t g_tempSeq;
 
 /* 网络收发工作线程（主线程专跑 fileXio，避免并发 RPC） */
@@ -95,6 +96,16 @@ int pfsnetFsInit(void)
     g_mountedPartition[0] = '\0';
     g_mountedTotalBytes = 0;
     clearXferState();
+
+    if (!g_xferBuf[0])
+        g_xferBuf[0] = (uint8_t *)memalign(64, PFSNET_XFER_BUF);
+    if (!g_xferBuf[1])
+        g_xferBuf[1] = (uint8_t *)memalign(64, PFSNET_XFER_BUF);
+    if (!g_xferBuf[0] || !g_xferBuf[1]) {
+        scr_printf("FATAL: xfer buf alloc failed\n");
+        return -1;
+    }
+
     initIoWorker();
     return 0;
 }
@@ -598,7 +609,8 @@ static int initIoWorker(void)
     th.stack = g_ioStack;
     th.stack_size = sizeof(g_ioStack);
     th.gp_reg = &_gp;
-    th.initial_priority = 0x3f; /* 略高于客户端线程，便于在 fileXio 阻塞时推进 TCP */
+    /* 必须低于客户端(0x40)：若 I/O 线程更高优，recv/send 有数据时会饿死 fileXio，双缓冲退化成串行≈半速 */
+    th.initial_priority = 0x41;
     th.attr = 0;
     th.option = 0;
 
@@ -631,11 +643,11 @@ static int ioEnd(void)
     return g_ioResult;
 }
 
-/* 数据通道：关 Nagle，尽量加大收发缓冲（SNDBUF 在部分 lwIP 上可能无效） */
+/* 数据通道：关 Nagle；缓冲对齐 XFER 块，避免 512KiB 收发被 256KiB 窗反复截断 */
 static void tuneDataSocket(int sock)
 {
     int yes = 1;
-    int buf = 256 * 1024;
+    int buf = PFSNET_XFER_BUF;
 
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));

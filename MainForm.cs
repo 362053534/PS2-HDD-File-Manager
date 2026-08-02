@@ -1504,7 +1504,7 @@ internal sealed class MainForm : Form
         // PfsNet 拖出暂不支持（避免 staging 双写与 0KB 占位）；请用复制后粘贴。
         if (PfsNetProtocol.IsNetworkDevice(device))
         {
-            MessageBox.Show(this, "网络传输不支持拖拽操作", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show(this, "网络传输不支持拖拽到PC", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
@@ -2624,21 +2624,34 @@ internal sealed class MainForm : Form
 
     private void SetImportProgress(ImportProgressState progress, string localFilePath, long currentFileBytes, bool isCompleted)
     {
-        var fileName = Path.GetFileName(localFilePath);
+        // 计数在调用线程同步更新，避免 ConfigureAwait(false) 后 BeginInvoke 晚于 EndImportProgress
         if (isCompleted)
         {
             progress.CompletedFiles++;
             progress.CompletedBytes = Math.Min(progress.TotalBytes, progress.CompletedBytes + currentFileBytes);
         }
 
-        var displayedBytes = Math.Min(progress.TotalBytes, progress.CompletedBytes + Math.Max(0, currentFileBytes));
-        var fraction = progress.TotalBytes <= 0 ? 0d : (double)displayedBytes / progress.TotalBytes;
-        _progressBar.Value = Math.Clamp((int)Math.Round(fraction * _progressBar.Maximum), 0, _progressBar.Maximum);
+        var fileName = Path.GetFileName(localFilePath);
+        var displayedBytes = Math.Min(progress.TotalBytes, progress.CompletedBytes + (isCompleted ? 0 : Math.Max(0, currentFileBytes)));
+        var completedFiles = progress.CompletedFiles;
+        var totalFiles = progress.TotalFiles;
+        var totalBytes = progress.TotalBytes;
         var elapsedSeconds = Math.Max(progress.Timer.Elapsed.TotalSeconds, 0.001);
-        _transferSpeedLabel.Text = FormatTransferSpeed(displayedBytes / elapsedSeconds);
         var action = isCompleted ? "已导入" : "正在导入";
-        var displayedFileNumber = isCompleted ? progress.CompletedFiles : progress.CompletedFiles + 1;
-        _statusLabel.Text = $"{action}：{FormatBytes(displayedBytes)} / {FormatBytes(progress.TotalBytes)} · {displayedFileNumber} / {progress.TotalFiles} 个文件 · {fileName}";
+        var displayedFileNumber = isCompleted ? completedFiles : completedFiles + 1;
+
+        void Update()
+        {
+            var fraction = totalBytes <= 0 ? 0d : (double)displayedBytes / totalBytes;
+            _progressBar.Value = Math.Clamp((int)Math.Round(fraction * _progressBar.Maximum), 0, _progressBar.Maximum);
+            _transferSpeedLabel.Text = FormatTransferSpeed(displayedBytes / elapsedSeconds);
+            _statusLabel.Text = $"{action}：{FormatBytes(displayedBytes)} / {FormatBytes(totalBytes)} · {displayedFileNumber} / {totalFiles} 个文件 · {fileName}";
+        }
+
+        if (InvokeRequired)
+            BeginInvoke((Action)Update);
+        else
+            Update();
     }
 
     private void EndImportProgress(ImportProgressState progress)

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <kernel.h>
+#include <timer.h>
 #include <debug.h>
 #include <netman.h>
 #include <ps2ip.h>
@@ -10,22 +11,27 @@
 /* GCC14 constructor 写入 .init_array，而 PS2 crt0 只遍历 .ctors，需手动填充 */
 extern void __ps2ipeeOpsInitializeImpl(void);
 
-static void EthStatusCheckCb(s32 alarm_id, u16 time, void *common)
+/* 约 msec 毫秒忙等：不用 SetAlarm/SleepThread（NOPATCH 下可能永不唤醒） */
+static void busyWaitMs(unsigned int msec)
 {
-    (void)alarm_id;
-    (void)time;
-    iWakeupThread(*(int *)common);
+    u64 start;
+    u64 ticks;
+
+    StartTimerSystemTime();
+    start = GetTimerSystemTime();
+    ticks = (u64)msec * ((u64)kBUSCLK / 1000ULL);
+    while ((GetTimerSystemTime() - start) < ticks) {
+    }
 }
 
+/* 有界等待：约 100ms/次，最多 ~30s；超时返回 -1，绝不静默死等 */
 static int WaitValidNetState(int (*checkingFunction)(void))
 {
-    int threadId = GetThreadId();
     int retry;
 
     for (retry = 0; checkingFunction() == 0; retry++) {
-        SetAlarm(1000 * 16, &EthStatusCheckCb, &threadId);
-        SleepThread();
-        if (retry >= 10)
+        busyWaitMs(100);
+        if (retry >= 300)
             return -1;
     }
     return 0;
@@ -34,6 +40,11 @@ static int WaitValidNetState(int (*checkingFunction)(void))
 static int ethGetLinkStatus(void)
 {
     return NetManIoctl(NETMAN_NETIF_IOCTL_GET_LINK_STATUS, NULL, 0, NULL, 0) == NETMAN_NETIF_ETH_LINK_STATE_UP;
+}
+
+int ethLinkIsUp(void)
+{
+    return ethGetLinkStatus();
 }
 
 static int ethGetDhcpStatus(void)
@@ -115,9 +126,10 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
     }
 
     r = ps2ipInit((struct ip4_addr *)initIp, (struct ip4_addr *)initNm, (struct ip4_addr *)initGw);
-    scr_printf("ps2ipInit: %d\n", r);
-    if (r != 0)
+    if (r != 0) {
+        scr_printf("WARN: ps2ipInit failed (%d)\n", r);
         return -1;
+    }
 
     stackReady = 1;
 
@@ -131,10 +143,17 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
 
 int ethWaitLinkAndDhcp(int use_dhcp)
 {
-    if (WaitValidNetState(&ethGetLinkStatus) < 0)
+    /* 无载波时 IP 仍可能已写入，但无法收发——必须视为失败 */
+    if (WaitValidNetState(&ethGetLinkStatus) < 0) {
+        scr_printf("WARN: link timeout (no carrier)\n");
         return -1;
-    if (use_dhcp)
-        return WaitValidNetState(&ethGetDhcpStatus);
+    }
+    if (use_dhcp) {
+        if (WaitValidNetState(&ethGetDhcpStatus) < 0) {
+            scr_printf("WARN: dhcp timeout\n");
+            return -1;
+        }
+    }
     return 0;
 }
 

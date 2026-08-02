@@ -246,9 +246,9 @@ internal sealed class PfsNetClient : IDisposable
                     writer.Write(overwrite ? 1u : 0u);
                 }
 
-                await SendSimpleAsync(PfsNetProtocol.CmdPutBegin, ms.ToArray(), ct);
+                await SendSimpleAsync(PfsNetProtocol.CmdPutBegin, ms.ToArray(), ct).ConfigureAwait(false);
 
-                using var dataClient = await acceptTask;
+                using var dataClient = await acceptTask.ConfigureAwait(false);
                 accepted = true;
                 // 取消时主动关闭数据口，避免 WriteAsync 在部分平台上迟迟不响应 CT。
                 using var cancelClose = ct.Register(() => { try { dataClient.Client.Close(); } catch { } });
@@ -266,18 +266,18 @@ internal sealed class PfsNetClient : IDisposable
                 {
                     ct.ThrowIfCancellationRequested();
                     var toRead = (int)Math.Min(buffer.Length, (long)totalBytes - sent);
-                    var n = await file.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                    var n = await file.ReadAsync(buffer.AsMemory(0, toRead), ct).ConfigureAwait(false);
                     if (n <= 0)
                         throw new IOException("本地文件读取提前结束。");
-                    await dataStream.WriteAsync(buffer.AsMemory(0, n), ct);
+                    await dataStream.WriteAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false);
                     sent += n;
                     if (progress is not null)
-                        await progress(sent);
+                        await progress(sent).ConfigureAwait(false);
                 }
 
-                await dataStream.FlushAsync(ct);
+                await dataStream.FlushAsync(ct).ConfigureAwait(false);
                 dataClient.Close();
-                await SendSimpleAsync(PfsNetProtocol.CmdPutEnd, ReadOnlyMemory<byte>.Empty, ct);
+                await SendSimpleAsync(PfsNetProtocol.CmdPutEnd, ReadOnlyMemory<byte>.Empty, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -395,7 +395,7 @@ internal sealed class PfsNetClient : IDisposable
             {
                 ct.ThrowIfCancellationRequested();
                 var toRead = (int)Math.Min(buffer.Length, (long)totalBytes - received);
-                var n = await dataStream.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                var n = await dataStream.ReadAsync(buffer.AsMemory(0, toRead), ct).ConfigureAwait(false);
                 if (n <= 0)
                 {
                     // 取消关闭套接字时 Read 会返回 0，优先按取消处理。
@@ -403,15 +403,15 @@ internal sealed class PfsNetClient : IDisposable
                     throw new IOException(
                         $"数据通道在文件传完前断开（已收 {received}/{totalBytes}，对端 {peerInfo}）。");
                 }
-                await destination.WriteAsync(buffer.AsMemory(0, n), ct);
+                await destination.WriteAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false);
                 received += n;
                 if (progress is not null)
-                    await progress(received);
+                    await progress(received).ConfigureAwait(false);
             }
 
-            await destination.FlushAsync(ct);
+            await destination.FlushAsync(ct).ConfigureAwait(false);
             // 先 GET_END 再关数据口，让 PS2 侧有机会在 END 时再 close（避免过早 RST）
-            await SendSimpleAsync(PfsNetProtocol.CmdGetEnd, ReadOnlyMemory<byte>.Empty, ct);
+            await SendSimpleAsync(PfsNetProtocol.CmdGetEnd, ReadOnlyMemory<byte>.Empty, ct).ConfigureAwait(false);
             dataClient.Close();
         }
         catch (Exception ex)

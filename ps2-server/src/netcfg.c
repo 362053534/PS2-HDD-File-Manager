@@ -3,7 +3,6 @@
 #include <string.h>
 #include <ctype.h>
 
-#include <debug.h>
 #include <fileXio_rpc.h>
 #include <io_common.h>
 
@@ -33,22 +32,17 @@ static int readFileText(const char *path, char *buf, int bufMax, int *outLen)
         return -1;
 
     fd = fileXioOpen(path, FIO_O_RDONLY, 0);
-    if (fd < 0) {
-        scr_printf("  skip %s (open %d)\n", path, fd);
+    if (fd < 0)
         return -1;
-    }
 
     n = fileXioRead(fd, buf, bufMax - 1);
     fileXioClose(fd);
-    if (n <= 0) {
-        scr_printf("  skip %s (read %d)\n", path, n);
+    if (n <= 0)
         return -1;
-    }
 
     buf[n] = '\0';
     if (outLen)
         *outLen = n;
-    scr_printf("  ok   %s (%d bytes)\n", path, n);
     return 0;
 }
 
@@ -65,23 +59,18 @@ static int tryLoadIpconfigDat(PfsNetIpConfig *cfg)
     unsigned int ip[4], nm[4], gw[4];
     unsigned int i;
 
-    scr_printf("Trying IPCONFIG.DAT...\n");
     for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         if (readFileText(paths[i], buf, sizeof(buf), NULL) < 0)
             continue;
         if (sscanf(buf, "%u.%u.%u.%u %u.%u.%u.%u %u.%u.%u.%u",
                    &ip[0], &ip[1], &ip[2], &ip[3],
                    &nm[0], &nm[1], &nm[2], &nm[3],
-                   &gw[0], &gw[1], &gw[2], &gw[3]) != 12) {
-            scr_printf("  skip %s (bad format)\n", paths[i]);
+                   &gw[0], &gw[1], &gw[2], &gw[3]) != 12)
             continue;
-        }
         if (ip[0] > 255 || ip[1] > 255 || ip[2] > 255 || ip[3] > 255 ||
             nm[0] > 255 || nm[1] > 255 || nm[2] > 255 || nm[3] > 255 ||
-            gw[0] > 255 || gw[1] > 255 || gw[2] > 255 || gw[3] > 255) {
-            scr_printf("  skip %s (bad octets)\n", paths[i]);
+            gw[0] > 255 || gw[1] > 255 || gw[2] > 255 || gw[3] > 255)
             continue;
-        }
 
         IP4_ADDR(&cfg->ip, ip[0], ip[1], ip[2], ip[3]);
         IP4_ADDR(&cfg->nm, nm[0], nm[1], nm[2], nm[3]);
@@ -141,7 +130,6 @@ static int tryLoadOplConf(PfsNetIpConfig *cfg)
     const char *nl;
     int lineLen;
 
-    scr_printf("Trying OPL conf_network.cfg...\n");
     for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         if (readFileText(paths[i], buf, sizeof(buf), NULL) < 0)
             continue;
@@ -193,10 +181,8 @@ static int tryLoadOplConf(PfsNetIpConfig *cfg)
         }
 
         /* 至少识别到 DHCP 键或完整静态三项，才视为有效 OPL 配置 */
-        if (!hasDhcpKey && !(hasIp && hasNm && hasGw)) {
-            scr_printf("  skip %s (no usable keys)\n", paths[i]);
+        if (!hasDhcpKey && !(hasIp && hasNm && hasGw))
             continue;
-        }
 
         if (useDhcp) {
             cfg->useDhcp = 1;
@@ -204,16 +190,12 @@ static int tryLoadOplConf(PfsNetIpConfig *cfg)
             IP4_ADDR(&cfg->nm, 0, 0, 0, 0);
             IP4_ADDR(&cfg->gw, 0, 0, 0, 0);
         } else {
-            if (!hasIp || !hasNm || !hasGw) {
-                scr_printf("  skip %s (static incomplete)\n", paths[i]);
+            if (!hasIp || !hasNm || !hasGw)
                 continue;
-            }
             if (parseIpv4(ipText, &cfg->ip) < 0 ||
                 parseIpv4(nmText, &cfg->nm) < 0 ||
-                parseIpv4(gwText, &cfg->gw) < 0) {
-                scr_printf("  skip %s (bad IP fields)\n", paths[i]);
+                parseIpv4(gwText, &cfg->gw) < 0)
                 continue;
-            }
             cfg->useDhcp = 0;
         }
 
@@ -245,22 +227,23 @@ int pfsnetLoadIpConfig(PfsNetIpConfig *cfg)
     if (!cfg)
         return -1;
 
-    /* 优先 DHCP；OPL / uLE 静态仅预载为失败兜底，不在此处关闭 DHCP */
+    /* OPL 静态则直接采用；OPL DHCP / 无 OPL 时优先 DHCP，uLE 仅作失败兜底 IP */
     pfsnetIpConfigInitDefault(cfg);
 
     memset(&fileCfg, 0, sizeof(fileCfg));
     if (tryLoadOplConf(&fileCfg) == 0) {
         if (!fileCfg.useDhcp) {
+            /* OPL ps2_ip_use_dhcp=0：尊重静态，禁止再被 DHCP-first 覆盖 */
             cfg->ip = fileCfg.ip;
             cfg->nm = fileCfg.nm;
             cfg->gw = fileCfg.gw;
             cfg->source = PFSNET_IP_SRC_OPL;
-            cfg->useDhcp = 1;
+            cfg->useDhcp = 0;
             strncpy(cfg->sourcePath, fileCfg.sourcePath, sizeof(cfg->sourcePath) - 1);
             cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
             return 0;
         }
-        /* OPL 声明 DHCP：与最高优先一致，再看 uLE 是否有静态兜底 */
+        /* OPL 声明 DHCP：保持 useDhcp=1，再预载 uLE 静态作 DHCP 失败兜底 */
     }
     if (tryLoadIpconfigDat(&fileCfg) == 0) {
         cfg->ip = fileCfg.ip;
@@ -274,7 +257,6 @@ int pfsnetLoadIpConfig(PfsNetIpConfig *cfg)
     }
 
     /* 无记忆卡静态配置：DHCP + InitDefault 中的静态种子作最终兜底 */
-    scr_printf("No MC static IP config, default DHCP\n");
     return 0;
 }
 
