@@ -1866,7 +1866,7 @@ internal sealed class MainForm : Form
         var fileLength = new FileInfo(localItem).Length;
         var fileRequirement = EstimateFileRequirement(fileLength, spaceBudget.ZoneSizeBytes);
         await ReservePfsSpaceAsync(device, partition, spaceBudget, fileRequirement, name, isDirectory: false);
-        SetImportProgress(progress, localItem, 0, isCompleted: false);
+        // 入队阶段不刷进度：碎文件会在扫描时把 UI 刷爆；真正写入时再报总体进度
         pendingImports.Add(new PfsImportRequest(remoteDirectory, localItem));
         entries[entryKey] = new PfsEntry(entryKey, false, string.Empty);
     }
@@ -1889,7 +1889,6 @@ internal sealed class MainForm : Form
                 cancellationToken.ThrowIfCancellationRequested();
                 var fileLength = new FileInfo(item.LocalFilePath).Length;
                 var remoteName = PfsNameEncoding.ToPfsFileName(Path.GetFileName(item.LocalFilePath));
-                var uiUpdateTimer = Stopwatch.StartNew();
                 await _pfsNet.PutFileAsync(
                     item.RemoteDirectory,
                     remoteName,
@@ -1898,12 +1897,8 @@ internal sealed class MainForm : Form
                     cancellationToken,
                     bytes =>
                     {
-                        var transferred = Math.Clamp(bytes, 0, fileLength);
-                        if (transferred >= fileLength || uiUpdateTimer.ElapsedMilliseconds >= 1000)
-                        {
-                            SetImportProgress(progress, item.LocalFilePath, transferred, isCompleted: false);
-                            uiUpdateTimer.Restart();
-                        }
+                        // UI 限频在 SetImportProgress 内统一处理（碎文件按总体字节推进）
+                        SetImportProgress(progress, item.LocalFilePath, Math.Clamp(bytes, 0, fileLength), isCompleted: false);
                         return Task.CompletedTask;
                     });
                 SetImportProgress(progress, item.LocalFilePath, fileLength, isCompleted: true);
@@ -1922,7 +1917,6 @@ internal sealed class MainForm : Form
         if (pendingImports.Count > 1 && distinctTargets)
         {
             var completed = new HashSet<PfsImportRequest>();
-            var uiUpdateTimer = Stopwatch.StartNew();
             var batch = await _pfs.ImportBatchAsync(
                 device,
                 partition,
@@ -1939,11 +1933,7 @@ internal sealed class MainForm : Form
                         return;
                     }
 
-                    if (uiUpdateTimer.ElapsedMilliseconds >= 1000)
-                    {
-                        SetImportProgress(progress, item.LocalFilePath, transferred, isCompleted: false);
-                        uiUpdateTimer.Restart();
-                    }
+                    SetImportProgress(progress, item.LocalFilePath, transferred, isCompleted: false);
                     await Task.CompletedTask;
                 });
 
@@ -1989,7 +1979,6 @@ internal sealed class MainForm : Form
         long fileLength,
         ImportProgressState progress)
     {
-        var uiUpdateTimer = Stopwatch.StartNew();
         return await _pfs.ImportAsync(
             device,
             partition,
@@ -1998,12 +1987,7 @@ internal sealed class MainForm : Form
             CancellationToken.None,
             bytes =>
             {
-                var transferred = Math.Clamp(bytes, 0, fileLength);
-                if (transferred >= fileLength || uiUpdateTimer.ElapsedMilliseconds >= 1000)
-                {
-                    SetImportProgress(progress, localFile, transferred, isCompleted: false);
-                    uiUpdateTimer.Restart();
-                }
+                SetImportProgress(progress, localFile, Math.Clamp(bytes, 0, fileLength), isCompleted: false);
                 return Task.CompletedTask;
             });
     }
@@ -2631,6 +2615,11 @@ internal sealed class MainForm : Form
             progress.CompletedBytes = Math.Min(progress.TotalBytes, progress.CompletedBytes + currentFileBytes);
         }
 
+        // 碎文件会每文件触发回调；限制 UI 刷新频率，避免 BeginInvoke 塞满消息队列导致卡顿
+        var allDone = progress.TotalFiles > 0 && progress.CompletedFiles >= progress.TotalFiles;
+        if (!allDone && !progress.ShouldPostUi(ProgressUiMinIntervalMs))
+            return;
+
         var fileName = Path.GetFileName(localFilePath);
         var displayedBytes = Math.Min(progress.TotalBytes, progress.CompletedBytes + (isCompleted ? 0 : Math.Max(0, currentFileBytes)));
         var completedFiles = progress.CompletedFiles;
@@ -2642,10 +2631,15 @@ internal sealed class MainForm : Form
 
         void Update()
         {
-            var fraction = totalBytes <= 0 ? 0d : (double)displayedBytes / totalBytes;
+            // 总字节未知时按文件数显示总体进度，避免条一直停在 0
+            var fraction = totalBytes > 0
+                ? (double)displayedBytes / totalBytes
+                : (totalFiles > 0 ? (double)completedFiles / totalFiles : 0d);
             _progressBar.Value = Math.Clamp((int)Math.Round(fraction * _progressBar.Maximum), 0, _progressBar.Maximum);
             _transferSpeedLabel.Text = FormatTransferSpeed(displayedBytes / elapsedSeconds);
-            _statusLabel.Text = $"{action}：{FormatBytes(displayedBytes)} / {FormatBytes(totalBytes)} · {displayedFileNumber} / {totalFiles} 个文件 · {fileName}";
+            _statusLabel.Text = totalBytes > 0
+                ? $"{action}：{FormatBytes(displayedBytes)} / {FormatBytes(totalBytes)} · {displayedFileNumber} / {totalFiles} 个文件 · {fileName}"
+                : $"{action}：{displayedFileNumber} / {totalFiles} 个文件 · {fileName}";
         }
 
         if (InvokeRequired)
@@ -2697,21 +2691,31 @@ internal sealed class MainForm : Form
         if (IsDisposed || !IsHandleCreated)
             return;
 
+        // 碎文件/每块回调都会进这里；限频刷新，保留总体字节进度
+        if (!snapshot.IsCompletedAll && !progress.ShouldPostUi(ProgressUiMinIntervalMs))
+            return;
+
         void Update()
         {
             if (IsDisposed)
                 return;
             _progressBar.Minimum = 0;
             _progressBar.Maximum = 1000;
-            _progressBar.Value = snapshot.TotalBytes <= 0
-                ? (snapshot.IsCompleted ? 1000 : 0)
-                : Math.Clamp((int)Math.Round((double)snapshot.DisplayedBytes / snapshot.TotalBytes * 1000), 0, 1000);
+            _progressBar.Value = snapshot.TotalBytes > 0
+                ? Math.Clamp((int)Math.Round((double)snapshot.DisplayedBytes / snapshot.TotalBytes * 1000), 0, 1000)
+                : (snapshot.TotalFiles <= 0
+                    ? 0
+                    : Math.Clamp((int)Math.Round((double)snapshot.CompletedFiles / snapshot.TotalFiles * 1000), 0, 1000));
             _progressBar.Visible = !snapshot.IsCompletedAll;
             _transferSpeedLabel.Text = FormatTransferSpeed(snapshot.SpeedBytesPerSecond);
             _transferSpeedLabel.Visible = !snapshot.IsCompletedAll;
             _statusLabel.Text = snapshot.IsCompletedAll
-                ? $"复制到 Windows 完成：{FormatBytes(snapshot.TotalBytes)}"
-                : $"复制到 PC：{FormatBytes(snapshot.DisplayedBytes)} / {FormatBytes(snapshot.TotalBytes)} · {snapshot.CompletedFiles} / {snapshot.TotalFiles}";
+                ? (snapshot.TotalBytes > 0
+                    ? $"复制到 Windows 完成：{FormatBytes(snapshot.TotalBytes)}"
+                    : $"复制到 Windows 完成：{snapshot.TotalFiles} 个文件")
+                : (snapshot.TotalBytes > 0
+                    ? $"复制到 PC：{FormatBytes(snapshot.DisplayedBytes)} / {FormatBytes(snapshot.TotalBytes)} · {snapshot.CompletedFiles} / {snapshot.TotalFiles}"
+                    : $"复制到 PC：{snapshot.CompletedFiles} / {snapshot.TotalFiles} 个文件");
             if (snapshot.IsCompletedAll)
                 EndTransferCancellation();
         }
@@ -2905,11 +2909,15 @@ internal sealed class MainForm : Form
     private sealed record DeviceItem(string Path, string Display) { public override string ToString() => Display; }
     private sealed record PfsClipboardSelection(string Name, bool IsDirectory, long Size);
 
+    // 进度条/状态栏刷新下限（毫秒）；碎文件传输时避免每文件 BeginInvoke
+    private const int ProgressUiMinIntervalMs = 150;
+
     private sealed class VirtualExportProgressState
     {
         private readonly object _gate = new();
         private readonly HashSet<string> _completedPaths = new(StringComparer.OrdinalIgnoreCase);
         private Stopwatch? _timer;
+        private Stopwatch? _uiThrottle;
         private long _totalBytes;
         private long _completedBytes;
         private int _totalFiles;
@@ -2925,6 +2933,24 @@ internal sealed class MainForm : Form
                 _completedFiles = 0;
                 _completedPaths.Clear();
                 _timer = null;
+                _uiThrottle = null;
+            }
+        }
+
+        public bool ShouldPostUi(int minIntervalMs)
+        {
+            lock (_gate)
+            {
+                if (_uiThrottle is null)
+                {
+                    _uiThrottle = Stopwatch.StartNew();
+                    return true;
+                }
+
+                if (_uiThrottle.ElapsedMilliseconds < minIntervalMs)
+                    return false;
+                _uiThrottle.Restart();
+                return true;
             }
         }
 
@@ -2934,11 +2960,18 @@ internal sealed class MainForm : Form
             {
                 _timer ??= Stopwatch.StartNew();
                 var current = Math.Max(currentBytes, 0);
-                var displayed = Math.Min(_totalBytes, _completedBytes + current);
+                // 列表尺寸未知时允许累计已传字节，进度条仍按总体推进
+                var displayed = _totalBytes > 0
+                    ? Math.Min(_totalBytes, _completedBytes + current)
+                    : _completedBytes + current;
                 if (isCompleted && _completedPaths.Add(file.RelativePath))
                 {
                     _completedFiles++;
-                    _completedBytes = Math.Min(_totalBytes, _completedBytes + (file.Size > 0 ? file.Size : current));
+                    var add = file.Size > 0 ? file.Size : current;
+                    if (_totalBytes > 0)
+                        _completedBytes = Math.Min(_totalBytes, _completedBytes + add);
+                    else
+                        _completedBytes += add;
                     displayed = _completedBytes;
                 }
 
@@ -2973,6 +3006,21 @@ internal sealed class MainForm : Form
         public int CompletedFiles { get; set; }
         public long CompletedBytes { get; set; }
         public Stopwatch Timer { get; } = Stopwatch.StartNew();
+        private Stopwatch? _uiThrottle;
+
+        public bool ShouldPostUi(int minIntervalMs)
+        {
+            if (_uiThrottle is null)
+            {
+                _uiThrottle = Stopwatch.StartNew();
+                return true;
+            }
+
+            if (_uiThrottle.ElapsedMilliseconds < minIntervalMs)
+                return false;
+            _uiThrottle.Restart();
+            return true;
+        }
     }
 
     private sealed class ImportSpaceBudget
