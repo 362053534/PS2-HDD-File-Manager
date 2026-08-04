@@ -1026,6 +1026,234 @@ static int handleGetAbort(struct PfsNetClient *client)
     return pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
 }
 
+/* APA 创建用的主/子分区尺寸阶梯（对齐 libhdd / pfsshell） */
+static const char *const g_apaSizeStr[] = {
+    "128M", "256M", "512M", "1G", "2G", "4G", "8G", "16G", "32G"
+};
+static const int g_apaSizeMb[] = {
+    128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
+};
+
+static int parseSizeToMb(const char *sizeStr, int *outMb)
+{
+    char buf[32];
+    size_t n;
+    unsigned long v;
+    char unit;
+
+    if (!sizeStr || !outMb)
+        return PFSNET_ERR_INVAL;
+    n = strlen(sizeStr);
+    if (n < 2 || n >= sizeof(buf))
+        return PFSNET_ERR_INVAL;
+    memcpy(buf, sizeStr, n + 1);
+    unit = buf[n - 1];
+    buf[n - 1] = '\0';
+    v = strtoul(buf, NULL, 10);
+    if (v == 0)
+        return PFSNET_ERR_INVAL;
+    if (unit == 'M' || unit == 'm')
+        *outMb = (int)v;
+    else if (unit == 'G' || unit == 'g')
+        *outMb = (int)(v * 1024ul);
+    else
+        return PFSNET_ERR_INVAL;
+    if ((*outMb % 128) != 0)
+        return PFSNET_ERR_INVAL;
+    return PFSNET_OK;
+}
+
+static int formatPfsPartition(const char *name)
+{
+    /* 对齐 pfsshell mkpfs：zone 8192 + -f 片段参数 */
+    int formatArg[3] = {8192, 0x00002d66, 0};
+    char device[8 + APA_IDMAX];
+
+    snprintf(device, sizeof(device), "hdd0:%s", name);
+    return fileXioFormat("pfs:", device, (const char *)formatArg, sizeof(formatArg));
+}
+
+static int handleReadSectors(struct PfsNetClient *client, const uint8_t *payload, uint32_t payloadLen)
+{
+    uint64_t lba64;
+    uint32_t count;
+    hddAtaTransfer_t arg;
+    int rv;
+    uint32_t bytes;
+
+    if (payloadLen < 12)
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+    memcpy(&lba64, payload, 8);
+    memcpy(&count, payload + 8, 4);
+    if (count == 0 || count > 256 || lba64 > 0xFFFFFFFFu)
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    bytes = count * 512u;
+    if (!g_xferBuf[0])
+        return pfsnetSendResponse(client, PFSNET_ERR_IO, NULL, 0);
+
+    arg.lba = (u32)lba64;
+    arg.size = count;
+    rv = fileXioDevctl("hdd0:", HDIOC_READSECTOR, &arg, sizeof(arg), g_xferBuf[0], (int)bytes);
+    if (rv != 0)
+        return pfsnetSendResponse(client, mapErrno(rv < 0 ? rv : -EIO), NULL, 0);
+    return pfsnetSendResponse(client, PFSNET_OK, g_xferBuf[0], bytes);
+}
+
+static int createApaPfsPartition(const char *name, int sizeMb)
+{
+    char openStr[8 + APA_IDMAX + 32];
+    char checkStr[8 + APA_IDMAX];
+    int maxIndex, useIndex, partSize, left, fd, rv, maxMb;
+
+    if (isSystemPartitionName(name))
+        return PFSNET_ERR_INVAL;
+
+    snprintf(checkStr, sizeof(checkStr), "hdd0:%s", name);
+    fd = fileXioOpen(checkStr, FIO_O_RDONLY, 0);
+    if (fd >= 0 || fd == -EACCES) {
+        if (fd >= 0)
+            fileXioClose(fd);
+        return PFSNET_ERR_EXIST;
+    }
+
+    maxMb = (int)((u32)fileXioDevctl("hdd0:", HDIOC_MAXSECTOR, NULL, 0, NULL, 0) / 2048u);
+    for (maxIndex = 0; maxIndex < 9; maxIndex++) {
+        if (g_apaSizeMb[maxIndex] == maxMb)
+            break;
+    }
+    if (maxIndex >= 9)
+        maxIndex = 8;
+
+    for (useIndex = maxIndex; useIndex > 0 && g_apaSizeMb[useIndex] > sizeMb; useIndex--)
+        ;
+
+    fd = -1;
+    for (; useIndex >= 0; useIndex--) {
+        partSize = g_apaSizeMb[useIndex];
+        snprintf(openStr, sizeof(openStr), "hdd0:%s,,,%s,PFS", name, g_apaSizeStr[useIndex]);
+        fd = fileXioOpen(openStr, FIO_O_RDWR | FIO_O_CREAT, 0);
+        if (fd >= 0)
+            break;
+        if (fd != -ENOSPC)
+            return mapErrno(fd);
+    }
+    if (fd < 0)
+        return PFSNET_ERR_NOSPC;
+
+    left = sizeMb - g_apaSizeMb[useIndex];
+    while (left > 0 && useIndex >= 0) {
+        if (g_apaSizeMb[useIndex] > left) {
+            while (useIndex > 0 && g_apaSizeMb[useIndex] > left)
+                useIndex--;
+            if (g_apaSizeMb[useIndex] > left)
+                break;
+        }
+        rv = fileXioIoctl2(fd, HIOCADDSUB, (void *)g_apaSizeStr[useIndex],
+                           (int)strlen(g_apaSizeStr[useIndex]) + 1, NULL, 0);
+        if (rv == -ENOSPC) {
+            useIndex--;
+            continue;
+        }
+        if (rv == -EFBIG)
+            break;
+        if (rv < 0) {
+            fileXioClose(fd);
+            fileXioRemove(checkStr);
+            return mapErrno(rv);
+        }
+        left -= g_apaSizeMb[useIndex];
+    }
+
+    fileXioClose(fd);
+    rv = formatPfsPartition(name);
+    if (rv < 0) {
+        fileXioRemove(checkStr);
+        return mapErrno(rv);
+    }
+    /* left>0 表示未能凑满请求容量；与本地核验一致，由 PC 写后校验决定是否回滚 */
+    (void)left;
+    return PFSNET_OK;
+}
+
+static int handleApaCreatePfs(struct PfsNetClient *client, const uint8_t *payload, uint32_t payloadLen)
+{
+    char name[APA_IDMAX];
+    char sizeStr[32];
+    uint32_t off = 0, consumed = 0;
+    int rc, sizeMb;
+
+    if (g_mounted || g_xfer.kind != PFSNET_XFER_NONE)
+        return pfsnetSendResponse(client, PFSNET_ERR_BUSY, NULL, 0);
+
+    rc = pfsnetReadString(payload, payloadLen, off, name, sizeof(name), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    off += consumed;
+    rc = pfsnetReadString(payload, payloadLen, off, sizeStr, sizeof(sizeStr), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    if (name[0] == '\0')
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    rc = parseSizeToMb(sizeStr, &sizeMb);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+
+    return pfsnetSendResponse(client, createApaPfsPartition(name, sizeMb), NULL, 0);
+}
+
+static int handleApaRemove(struct PfsNetClient *client, const uint8_t *payload, uint32_t payloadLen)
+{
+    char name[APA_IDMAX];
+    char path[8 + APA_IDMAX];
+    uint32_t consumed = 0;
+    int rc, rv;
+
+    if (g_mounted || g_xfer.kind != PFSNET_XFER_NONE)
+        return pfsnetSendResponse(client, PFSNET_ERR_BUSY, NULL, 0);
+
+    rc = pfsnetReadString(payload, payloadLen, 0, name, sizeof(name), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    if (name[0] == '\0' || isSystemPartitionName(name))
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    snprintf(path, sizeof(path), "hdd0:%s", name);
+    rv = fileXioRemove(path);
+    return pfsnetSendResponse(client, mapErrno(rv), NULL, 0);
+}
+
+static int handleApaRename(struct PfsNetClient *client, const uint8_t *payload, uint32_t payloadLen)
+{
+    char oldName[APA_IDMAX];
+    char newName[APA_IDMAX];
+    char oldPath[8 + APA_IDMAX];
+    char newPath[8 + APA_IDMAX];
+    uint32_t off = 0, consumed = 0;
+    int rc, rv;
+
+    if (g_mounted || g_xfer.kind != PFSNET_XFER_NONE)
+        return pfsnetSendResponse(client, PFSNET_ERR_BUSY, NULL, 0);
+
+    rc = pfsnetReadString(payload, payloadLen, off, oldName, sizeof(oldName), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    off += consumed;
+    rc = pfsnetReadString(payload, payloadLen, off, newName, sizeof(newName), &consumed);
+    if (rc != PFSNET_OK)
+        return pfsnetSendResponse(client, rc, NULL, 0);
+    if (oldName[0] == '\0' || newName[0] == '\0')
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+    if (isSystemPartitionName(oldName) || isSystemPartitionName(newName))
+        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+
+    snprintf(oldPath, sizeof(oldPath), "hdd0:%s", oldName);
+    snprintf(newPath, sizeof(newPath), "hdd0:%s", newName);
+    rv = fileXioRename(oldPath, newPath);
+    return pfsnetSendResponse(client, mapErrno(rv), NULL, 0);
+}
+
 int pfsnetHandleCommand(struct PfsNetClient *client, uint32_t command, const uint8_t *payload, uint32_t payloadLen)
 {
     char partition[APA_IDMAX];
@@ -1084,10 +1312,16 @@ int pfsnetHandleCommand(struct PfsNetClient *client, uint32_t command, const uin
             return handleGetAbort(client);
 
         case PFSNET_CMD_READ_SECTORS:
+            return handleReadSectors(client, payload, payloadLen);
+
         case PFSNET_CMD_APA_CREATE_PFS:
+            return handleApaCreatePfs(client, payload, payloadLen);
+
         case PFSNET_CMD_APA_REMOVE:
+            return handleApaRemove(client, payload, payloadLen);
+
         case PFSNET_CMD_APA_RENAME:
-            return pfsnetSendResponse(client, PFSNET_ERR_UNSUPPORTED, NULL, 0);
+            return handleApaRename(client, payload, payloadLen);
 
         default:
             return pfsnetSendResponse(client, PFSNET_ERR_UNSUPPORTED, NULL, 0);

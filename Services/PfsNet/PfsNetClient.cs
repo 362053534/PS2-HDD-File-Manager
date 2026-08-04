@@ -190,6 +190,64 @@ internal sealed class PfsNetClient : IDisposable
                 BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(16, 4)));
         }, cancellationToken);
 
+    public Task<byte[]> ReadSectorsAsync(ulong lba, uint count, CancellationToken cancellationToken) =>
+        WithLockAsync(async ct =>
+        {
+            EnsureConnected();
+            if ((_features & PfsNetProtocol.FeatApaSector) == 0)
+                throw new InvalidOperationException("PS2 未声明 FEAT_APA_SECTOR。请更新 PfsNetServer.elf。");
+            if (count == 0 || count > 256)
+                throw new ArgumentOutOfRangeException(nameof(count), "单次最多读取 256 扇区。");
+
+            var req = new byte[12];
+            BinaryPrimitives.WriteUInt64LittleEndian(req.AsSpan(0, 8), lba);
+            BinaryPrimitives.WriteUInt32LittleEndian(req.AsSpan(8, 4), count);
+            var payload = await SendAsync(PfsNetProtocol.CmdReadSectors, req, ct);
+            var expect = checked((int)count * 512);
+            if (payload.Length != expect)
+                throw new InvalidOperationException($"READ_SECTORS 返回长度不符（{payload.Length}/{expect}）。");
+            return payload;
+        }, cancellationToken);
+
+    public Task ApaCreatePfsAsync(string name, string size, CancellationToken cancellationToken) =>
+        WithLockAsync(async ct =>
+        {
+            EnsureConnected();
+            EnsureApaMutate();
+            using var ms = new MemoryStream();
+            using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+            {
+                PfsNetCodec.WriteString(writer, name);
+                PfsNetCodec.WriteString(writer, size);
+            }
+            await SendSimpleAsync(PfsNetProtocol.CmdApaCreatePfs, ms.ToArray(), ct);
+        }, cancellationToken);
+
+    public Task ApaRemoveAsync(string name, CancellationToken cancellationToken) =>
+        WithLockAsync(async ct =>
+        {
+            EnsureConnected();
+            EnsureApaMutate();
+            using var ms = new MemoryStream();
+            using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+                PfsNetCodec.WriteString(writer, name);
+            await SendSimpleAsync(PfsNetProtocol.CmdApaRemove, ms.ToArray(), ct);
+        }, cancellationToken);
+
+    public Task ApaRenameAsync(string oldName, string newName, CancellationToken cancellationToken) =>
+        WithLockAsync(async ct =>
+        {
+            EnsureConnected();
+            EnsureApaMutate();
+            using var ms = new MemoryStream();
+            using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+            {
+                PfsNetCodec.WriteString(writer, oldName);
+                PfsNetCodec.WriteString(writer, newName);
+            }
+            await SendSimpleAsync(PfsNetProtocol.CmdApaRename, ms.ToArray(), ct);
+        }, cancellationToken);
+
     public Task MkdirAsync(string parentPath, string name, CancellationToken cancellationToken) =>
         PathNameCommandAsync(PfsNetProtocol.CmdMkdir, parentPath, name, cancellationToken);
 
@@ -462,6 +520,12 @@ internal sealed class PfsNetClient : IDisposable
     {
         if ((_features & PfsNetProtocol.FeatDataChannel) == 0)
             throw new InvalidOperationException("PS2 未声明 FEAT_DATA_CHANNEL，无法 Put/Get。请更新并运行新版 PfsNetServer.elf。");
+    }
+
+    private void EnsureApaMutate()
+    {
+        if ((_features & PfsNetProtocol.FeatApaMutate) == 0)
+            throw new InvalidOperationException("PS2 未声明 FEAT_APA_MUTATE。请更新并运行新版 PfsNetServer.elf。");
     }
 
     private static TcpListener CreateDataListener()

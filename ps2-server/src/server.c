@@ -80,7 +80,8 @@ static int handleHello(struct PfsNetClient *client, const uint8_t *payload, uint
     if (version != PFSNET_PROTOCOL_VERSION)
         return pfsnetSendResponse(client, PFSNET_ERR_VERSION, NULL, 0);
 
-    features = PFSNET_FEAT_FILE_OPS | PFSNET_FEAT_DATA_CHANNEL;
+    features = PFSNET_FEAT_FILE_OPS | PFSNET_FEAT_DATA_CHANNEL
+        | PFSNET_FEAT_APA_SECTOR | PFSNET_FEAT_APA_MUTATE;
     reply[0] = PFSNET_MAGIC;
     reply[1] = PFSNET_PROTOCOL_VERSION;
     reply[2] = features;

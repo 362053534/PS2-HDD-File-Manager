@@ -409,15 +409,40 @@ internal sealed class MainForm : Form
         await LoadPartitionsAsync();
     }
 
+    private async Task EnsureNetworkUnmountedForApaAsync()
+    {
+        if (_pfsNet.MountedPartition is null)
+            return;
+        await _pfsNet.UmountAsync(CancellationToken.None);
+        _activePartition = null;
+        _currentPath = "/";
+    }
+
+    private async Task<ApaPartitionTable> ReadApaLayoutAsync(string device, CancellationToken cancellationToken)
+    {
+        if (!PfsNetProtocol.IsNetworkDevice(device))
+            return await _apaPartitionTableReader.ReadAsync(device, cancellationToken);
+
+        if (!_pfsNet.SupportsApaMutate)
+            throw new InvalidOperationException("当前 PfsNet 未启用 APA 扇区校验/分区变更。");
+        await EnsureNetworkUnmountedForApaAsync();
+        var space = await _pfsNet.GetApaFreeAsync(cancellationToken);
+        if (space.TotalBytes == 0)
+            throw new InvalidOperationException("GET_APA_FREE 返回总容量为 0，无法校验分区表。");
+        var source = new PfsNetApaSectorSource(_pfsNet, checked((long)space.TotalBytes));
+        return await _apaPartitionTableReader.ReadAsync(source, cancellationToken);
+    }
+
     private async Task CreatePfsPartitionAsync()
     {
         if (!TryGetDevice(out var device)) return;
         if (RejectNetworkPartitionMutationIfNeeded(device)) return;
 
+        var isNet = PfsNetProtocol.IsNetworkDevice(device);
         ApaPartitionTable layout;
         try
         {
-            layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            layout = await ReadApaLayoutAsync(device, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -457,19 +482,24 @@ internal sealed class MainForm : Form
         await RunBusyAsync($"正在创建 PFS 分区“{request.Name}” ({normalizedSize})…", async () =>
         {
             // 用户打开确认框期间来源可能已改变：再次读取、校验并预检，避免在过期布局上写入。
-            var currentLayout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var currentLayout = await ReadApaLayoutAsync(device, CancellationToken.None);
             if (currentLayout.Partitions.Any(partition => !partition.IsSubPartition && partition.Name.Equals(request.Name, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException($"分区“{request.Name}”已存在，已取消创建。");
             if (requestedBytes > currentLayout.FreeBytes)
                 throw new InvalidOperationException("APA 未分配空间已变化且不足，已取消创建。");
 
-            // pfsshell/PS2SDK 负责依照当前硬盘支持的单分区上限，自动创建主分区及所需子分区。
-            var create = await _pfs.CreatePfsPartitionAsync(device, request.Name, normalizedSize, CancellationToken.None);
-            AppendResult(create);
-            if (!PfsShellClient.IsSuccessfulSession(create))
-                throw new InvalidOperationException("pfsshell 未能创建 PFS 分区，请查看诊断输出。");
+            if (isNet)
+                await _pfsNet.ApaCreatePfsAsync(request.Name, normalizedSize, CancellationToken.None);
+            else
+            {
+                // pfsshell/PS2SDK 负责依照当前硬盘支持的单分区上限，自动创建主分区及所需子分区。
+                var create = await _pfs.CreatePfsPartitionAsync(device, request.Name, normalizedSize, CancellationToken.None);
+                AppendResult(create);
+                if (!PfsShellClient.IsSuccessfulSession(create))
+                    throw new InvalidOperationException("pfsshell 未能创建 PFS 分区，请查看诊断输出。");
+            }
 
-            var afterCreate = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var afterCreate = await ReadApaLayoutAsync(device, CancellationToken.None);
             var createdPartition = afterCreate.Partitions.SingleOrDefault(partition =>
                 !partition.IsSubPartition && partition.Name.Equals(request.Name, StringComparison.OrdinalIgnoreCase));
             var hasExactSize = createdPartition is not null && createdPartition.Type == 0x0100 && createdPartition.TotalBytes == requestedBytes;
@@ -479,23 +509,47 @@ internal sealed class MainForm : Form
             {
                 var actualSize = createdPartition is null ? "未找到" : FormatBytes(createdPartition.TotalBytes);
                 AppendLog($"创建后核验失败：请求 {FormatBytes(requestedBytes)}，实际 {actualSize}。将尝试删除不完整分区。");
-                var rollback = await _pfs.RemovePartitionAsync(device, request.Name, CancellationToken.None);
-                AppendResult(rollback);
-                if (!PfsShellClient.IsSuccessfulSession(rollback))
-                    throw new InvalidOperationException($"新分区容量核验失败，且自动清理失败。请立即停止写入并备份硬盘；诊断中的分区名为“{request.Name}”。");
+                if (isNet)
+                    await _pfsNet.ApaRemoveAsync(request.Name, CancellationToken.None);
+                else
+                {
+                    var rollback = await _pfs.RemovePartitionAsync(device, request.Name, CancellationToken.None);
+                    AppendResult(rollback);
+                    if (!PfsShellClient.IsSuccessfulSession(rollback))
+                        throw new InvalidOperationException($"新分区容量核验失败，且自动清理失败。请立即停止写入并备份硬盘；诊断中的分区名为“{request.Name}”。");
+                }
                 throw new InvalidOperationException($"空间布局无法完整创建 {FormatBytes(requestedBytes)} 的分区；已自动删除未完成分区，未保留任何新分区。");
             }
 
-            var verifyMount = await _pfs.ListDirectoryAsync(device, request.Name, "/", CancellationToken.None);
-            AppendResult(verifyMount);
-            if (!PfsShellClient.IsSuccessfulSession(verifyMount))
+            if (isNet)
             {
-                AppendLog("PFS 格式化后无法挂载，将尝试删除新分区。");
-                var rollback = await _pfs.RemovePartitionAsync(device, request.Name, CancellationToken.None);
-                AppendResult(rollback);
-                if (!PfsShellClient.IsSuccessfulSession(rollback))
-                    throw new InvalidOperationException($"新分区无法验证挂载且自动清理失败。请立即停止写入并备份硬盘；诊断中的分区名为“{request.Name}”。");
-                throw new InvalidOperationException("新分区无法通过 PFS 挂载验证，已自动删除。");
+                await _pfsNet.MountAsync(request.Name, CancellationToken.None);
+                try
+                {
+                    _ = await _pfsNet.ListDirAsync("/", CancellationToken.None);
+                }
+                catch
+                {
+                    try { await _pfsNet.UmountAsync(CancellationToken.None); } catch { }
+                    AppendLog("PFS 格式化后无法挂载，将尝试删除新分区。");
+                    await _pfsNet.ApaRemoveAsync(request.Name, CancellationToken.None);
+                    throw new InvalidOperationException("新分区无法通过 PFS 挂载验证，已自动删除。");
+                }
+                await _pfsNet.UmountAsync(CancellationToken.None);
+            }
+            else
+            {
+                var verifyMount = await _pfs.ListDirectoryAsync(device, request.Name, "/", CancellationToken.None);
+                AppendResult(verifyMount);
+                if (!PfsShellClient.IsSuccessfulSession(verifyMount))
+                {
+                    AppendLog("PFS 格式化后无法挂载，将尝试删除新分区。");
+                    var rollback = await _pfs.RemovePartitionAsync(device, request.Name, CancellationToken.None);
+                    AppendResult(rollback);
+                    if (!PfsShellClient.IsSuccessfulSession(rollback))
+                        throw new InvalidOperationException($"新分区无法验证挂载且自动清理失败。请立即停止写入并备份硬盘；诊断中的分区名为“{request.Name}”。");
+                    throw new InvalidOperationException("新分区无法通过 PFS 挂载验证，已自动删除。");
+                }
             }
 
             created = true;
@@ -528,11 +582,12 @@ internal sealed class MainForm : Form
             return;
         }
 
+        var isNet = PfsNetProtocol.IsNetworkDevice(device);
         ApaPartitionTable layout;
         ApaPartitionInfo? target;
         try
         {
-            layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            layout = await ReadApaLayoutAsync(device, CancellationToken.None);
             target = layout.Partitions.SingleOrDefault(partition =>
                 !partition.IsSubPartition && partition.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
         }
@@ -560,9 +615,12 @@ internal sealed class MainForm : Form
                 MessageBoxIcon.Warning) != DialogResult.Yes)
             return;
 
+        var secondConfirm = isNet
+            ? $"最后确认：立即删除“{name}”？\n\n程序将通过 PfsNet 删除分区，并在删除后重新校验 APA 分区表。"
+            : $"最后确认：立即删除“{name}”？\n\n程序将使用 pfsshell 的标准 rmpart 操作，并在删除后重新校验 APA 分区表。";
         if (MessageBox.Show(
                 this,
-                $"最后确认：立即删除“{name}”？\n\n程序将使用 pfsshell 的标准 rmpart 操作，并在删除后重新校验 APA 分区表。",
+                secondConfirm,
                 "第二次确认：永久删除",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning,
@@ -573,7 +631,7 @@ internal sealed class MainForm : Form
         await RunBusyAsync($"正在删除 PFS 分区“{name}”…", async () =>
         {
             // 两次确认期间不信任旧状态：再次完整校验，防止目标已变化或分区表异常。
-            var beforeDelete = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var beforeDelete = await ReadApaLayoutAsync(device, CancellationToken.None);
             var currentTarget = beforeDelete.Partitions.SingleOrDefault(partition =>
                 !partition.IsSubPartition && partition.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
             if (currentTarget is null || currentTarget.Type != 0x0100 || currentTarget.TotalBytes != target.TotalBytes)
@@ -581,24 +639,38 @@ internal sealed class MainForm : Form
             if (IsProtectedPartitionName(currentTarget.Name))
                 throw new InvalidOperationException("目标属于系统保留分区，已取消删除。");
 
-            var result = await _pfs.RemovePartitionAsync(device, name, CancellationToken.None);
-            AppendResult(result);
+            if (isNet)
+                await _pfsNet.ApaRemoveAsync(name, CancellationToken.None);
+            else
+            {
+                var result = await _pfs.RemovePartitionAsync(device, name, CancellationToken.None);
+                AppendResult(result);
 
-            // 此版本 pfsshell 的 rmpart 在成功后仍会打印 "No such file" / exit -2。
-            // 因此不能以工具文本作为结论，必须以删除后可通过校验的 APA 表为准。
-            // 删除后只读重扫 APA 链：必须能通过校验、目标必须消失、可用空间必须增加。
-            var afterDelete = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+                // 此版本 pfsshell 的 rmpart 在成功后仍会打印 "No such file" / exit -2。
+                // 因此不能以工具文本作为结论，必须以删除后可通过校验的 APA 表为准。
+                var afterDeleteLocal = await ReadApaLayoutAsync(device, CancellationToken.None);
+                var stillExistsLocal = afterDeleteLocal.Partitions.Any(partition =>
+                    !partition.IsSubPartition && partition.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (stillExistsLocal || afterDeleteLocal.FreeBytes <= beforeDelete.FreeBytes)
+                {
+                    var toolState = PfsShellClient.IsSuccessfulSession(result) ? "" : "pfsshell 同时报告了错误。";
+                    throw new InvalidOperationException($"删除后的 APA 分区表校验未通过，目标分区仍存在或未分配空间未增加。{toolState}请立即停止写入、保留硬盘现状并查看诊断输出。");
+                }
+
+                deleted = true;
+                if (!PfsShellClient.IsSuccessfulSession(result))
+                    AppendLog("pfsshell 的 rmpart 返回了旧版误报，但 APA 分区表复核确认删除已成功。");
+                AppendLog($"已删除并重新校验 PFS 分区“{name}”（{size}）。APA 未分配空间已增加。");
+                return;
+            }
+
+            var afterDelete = await ReadApaLayoutAsync(device, CancellationToken.None);
             var stillExists = afterDelete.Partitions.Any(partition =>
                 !partition.IsSubPartition && partition.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
             if (stillExists || afterDelete.FreeBytes <= beforeDelete.FreeBytes)
-            {
-                var toolState = PfsShellClient.IsSuccessfulSession(result) ? "" : "pfsshell 同时报告了错误。";
-                throw new InvalidOperationException($"删除后的 APA 分区表校验未通过，目标分区仍存在或未分配空间未增加。{toolState}请立即停止写入、保留硬盘现状并查看诊断输出。");
-            }
+                throw new InvalidOperationException("删除后的 APA 分区表校验未通过，目标分区仍存在或未分配空间未增加。请立即停止写入、保留硬盘现状并查看诊断输出。");
 
             deleted = true;
-            if (!PfsShellClient.IsSuccessfulSession(result))
-                AppendLog("pfsshell 的 rmpart 返回了旧版误报，但 APA 分区表复核确认删除已成功。");
             AppendLog($"已删除并重新校验 PFS 分区“{name}”（{size}）。APA 未分配空间已增加。");
         });
 
@@ -640,9 +712,10 @@ internal sealed class MainForm : Form
         }
 
         ApaPartitionInfo? target;
+        var isNet = PfsNetProtocol.IsNetworkDevice(device);
         try
         {
-            var layout = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var layout = await ReadApaLayoutAsync(device, CancellationToken.None);
             target = layout.Partitions.SingleOrDefault(partition =>
                 !partition.IsSubPartition && partition.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase));
             if (target is null || target.Type != 0x0100)
@@ -676,7 +749,7 @@ internal sealed class MainForm : Form
         var renamed = false;
         await RunBusyAsync($"正在重命名 PFS 分区“{oldName}”…", async () =>
         {
-            var beforeRename = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var beforeRename = await ReadApaLayoutAsync(device, CancellationToken.None);
             var currentTarget = beforeRename.Partitions.SingleOrDefault(partition =>
                 !partition.IsSubPartition && partition.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase));
             if (currentTarget is null || currentTarget.Type != 0x0100 || !SamePartitionLayout(currentTarget, target!))
@@ -685,12 +758,17 @@ internal sealed class MainForm : Form
                     !partition.IsSubPartition && partition.Name.Equals(newName, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidOperationException("重命名前发现系统保留名称或同名分区，已取消操作。");
 
-            var result = await _pfs.RenamePartitionAsync(device, oldName, newName, CancellationToken.None);
-            AppendResult(result);
-            if (!PfsShellClient.IsSuccessfulSession(result))
-                throw new InvalidOperationException("pfsshell 未能重命名 PFS 分区，请查看诊断输出。");
+            if (isNet)
+                await _pfsNet.ApaRenameAsync(oldName, newName, CancellationToken.None);
+            else
+            {
+                var result = await _pfs.RenamePartitionAsync(device, oldName, newName, CancellationToken.None);
+                AppendResult(result);
+                if (!PfsShellClient.IsSuccessfulSession(result))
+                    throw new InvalidOperationException("pfsshell 未能重命名 PFS 分区，请查看诊断输出。");
+            }
 
-            var afterRename = await _apaPartitionTableReader.ReadAsync(device, CancellationToken.None);
+            var afterRename = await ReadApaLayoutAsync(device, CancellationToken.None);
             var renamedTarget = afterRename.Partitions.SingleOrDefault(partition =>
                 !partition.IsSubPartition && partition.Name.Equals(newName, StringComparison.OrdinalIgnoreCase));
             var oldTarget = afterRename.Partitions.Any(partition =>

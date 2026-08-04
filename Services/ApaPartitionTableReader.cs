@@ -21,6 +21,13 @@ internal sealed record ApaPartitionInfo(
 
 internal sealed record ApaSubPartitionInfo(uint StartSector, uint LengthSectors);
 
+/// <summary>按 LBA 提供原始扇区；网络与本地共用同一套 APA 校验逻辑。</summary>
+internal interface IApaSectorSource
+{
+    long TotalBytes { get; }
+    Task ReadSectorsAsync(ulong lba, int count, Memory<byte> destination, CancellationToken cancellationToken);
+}
+
 /// <summary>Read-only APA layout reader used to preflight and verify destructive partition operations.</summary>
 internal sealed class ApaPartitionTableReader
 {
@@ -31,19 +38,24 @@ internal sealed class ApaPartitionTableReader
     private const ulong ApaAllocationUnitSectors = 0x40000; // 128 MiB
 
     public Task<ApaPartitionTable> ReadAsync(string devicePath, CancellationToken cancellationToken) =>
-        Task.Run(() => Read(devicePath, cancellationToken), cancellationToken);
+        Task.Run(() =>
+        {
+            using var stream = new FileStream(
+                devicePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite,
+                HeaderBytes,
+                FileOptions.RandomAccess);
+            return Read(new StreamApaSectorSource(stream), cancellationToken);
+        }, cancellationToken);
 
-    private static ApaPartitionTable Read(string devicePath, CancellationToken cancellationToken)
+    public Task<ApaPartitionTable> ReadAsync(IApaSectorSource source, CancellationToken cancellationToken) =>
+        Task.Run(() => Read(source, cancellationToken), cancellationToken);
+
+    private static ApaPartitionTable Read(IApaSectorSource source, CancellationToken cancellationToken)
     {
-        using var stream = new FileStream(
-            devicePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite,
-            HeaderBytes,
-            FileOptions.RandomAccess);
-
-        var totalBytes = stream.Length;
+        var totalBytes = source.TotalBytes;
         if (totalBytes < HeaderBytes)
             throw new InvalidDataException("磁盘容量不足，无法读取 APA 分区表。");
         var totalSectors = (ulong)totalBytes / SectorSize;
@@ -65,8 +77,7 @@ internal sealed class ApaPartitionTableReader
             if (offset < 0 || offset > totalBytes - HeaderBytes)
                 throw new InvalidDataException("APA 分区表包含无效的扇区地址。");
 
-            stream.Position = offset;
-            stream.ReadExactly(buffer);
+            source.ReadSectorsAsync(sector, 2, buffer, cancellationToken).GetAwaiter().GetResult();
 
             if (BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(4, 4)) != ApaMagic)
                 throw new InvalidDataException("未读取到有效的 APA 分区表。");
@@ -138,7 +149,23 @@ internal sealed class ApaPartitionTableReader
     {
         uint sum = 0;
         for (var offset = 4; offset < HeaderBytes; offset += 4)
-            sum = unchecked(sum + BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(offset, 4)));
-        return sum == BinaryPrimitives.ReadUInt32LittleEndian(header[..4]);
+            sum += BinaryPrimitives.ReadUInt32LittleEndian(header[offset..]);
+        return sum == BinaryPrimitives.ReadUInt32LittleEndian(header);
+    }
+
+    private sealed class StreamApaSectorSource(FileStream stream) : IApaSectorSource
+    {
+        public long TotalBytes => stream.Length;
+
+        public Task ReadSectorsAsync(ulong lba, int count, Memory<byte> destination, CancellationToken cancellationToken)
+        {
+            var bytes = checked(count * SectorSize);
+            if (destination.Length < bytes)
+                throw new ArgumentException("目标缓冲区过小。", nameof(destination));
+            stream.Position = checked((long)lba * SectorSize);
+            stream.ReadExactly(destination.Span[..bytes]);
+            return Task.CompletedTask;
+        }
     }
 }
+

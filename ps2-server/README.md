@@ -1,4 +1,4 @@
-# ps2-server（PfsNet P2）
+# ps2-server（PfsNet P3）
 
 无操作网络 PFS 服务：开机自动 DHCP/静态 IP，监听 **45061**，屏幕显示 IP。PC 用「PFS 网络」连接。
 
@@ -8,14 +8,16 @@
 2. 该 SDK **已编译出 IRX**（至少含 `iop/irx/ps2fs.irx`、`ps2hdd.irx`、`netman.irx`、`smap.irx` 等）
 3. **PS2 工具链**：`mips64r5900el-ps2-elf-gcc` + `bin2c`（通常在 WSL 的 `/usr/local/ps2dev`）
 
-## 本阶段（P2）已实现
+## 本阶段（P3）已实现
 
 - HELLO / PING  
-- LIST_PARTITIONS / GET_APA_FREE / GET_PFS_FREE（PFS free 为占位增强项）  
+- LIST_PARTITIONS / GET_APA_FREE / GET_PFS_FREE  
 - MOUNT / UMOUNT（M1，断线强制 umount）  
 - LIST_DIR / MKDIR / RMDIR / REMOVE / RENAME  
 - PUT / GET（D1 数据回连 45062 + T1 临时名写入后 rename）  
-- features：`FEAT_FILE_OPS | FEAT_DATA_CHANNEL`（APA 扇区/变更仍返回 `ERR_UNSUPPORTED`）
+- READ_SECTORS（A1，控制通道，单次 ≤256 扇区）  
+- APA_CREATE_PFS / APA_REMOVE / APA_RENAME（须先 umount）  
+- features：`FEAT_FILE_OPS | FEAT_DATA_CHANNEL | FEAT_APA_SECTOR | FEAT_APA_MUTATE`
 
 ## 编译
 
