@@ -254,23 +254,33 @@ internal sealed class PfsShellClient
         var names = new List<string>();
         foreach (var line in UsefulLines(output))
         {
-            var named = Regex.Match(line, @"(?:^|\s)(?<name>[+_.A-Za-z0-9-]{1,32})(?:\s+\d+(?:\.\d+)?[KMG]?)?\s+(?:PFS|CFS|HDL|REISER|EXT2(?:SWAP)?|MBR)\b", RegexOptions.IgnoreCase);
+            // 允许空格（如 "PGEN 1.1"）；APA 名最长 32 字节，与 PfsNet fileXio 一致。
+            var named = Regex.Match(line, @"(?:^|\s)(?<name>[+_.A-Za-z0-9-][+_. A-Za-z0-9-]{0,30}?)(?:\s+\d+(?:\.\d+)?[KMG]?)?\s+(?:PFS|CFS|HDL|REISER|EXT2(?:SWAP)?|MBR)\b", RegexOptions.IgnoreCase);
             if (named.Success)
             {
-                names.Add(named.Groups["name"].Value);
+                var name = named.Groups["name"].Value.Trim();
+                if (name.Length > 0)
+                    names.Add(name);
                 continue;
             }
 
-            var sizeFirst = Regex.Match(line.Trim(), @"^\d+(?:\.\d+)?\s+[KMGT]i?B\s+(?<name>[+_.A-Za-z0-9-]{1,32})/?$", RegexOptions.IgnoreCase);
+            // pfsshell ls：如 "0.12 GiB  PGEN 1.1/"
+            var sizeFirst = Regex.Match(line.Trim(), @"^\d+(?:\.\d+)?\s+[KMGT]i?B\s+(?<name>.{1,32}?)/?$", RegexOptions.IgnoreCase);
             if (sizeFirst.Success)
             {
-                names.Add(sizeFirst.Groups["name"].Value);
+                var name = sizeFirst.Groups["name"].Value.Trim();
+                if (name.Length > 0)
+                    names.Add(name);
                 continue;
             }
 
-            var simpleName = Regex.Match(line.Trim(), @"^(?<name>[+_.A-Za-z0-9-]{1,32})/?$");
+            var simpleName = Regex.Match(line.Trim(), @"^(?<name>[+_.A-Za-z0-9-][+_. A-Za-z0-9-]{0,30})/?$");
             if (simpleName.Success)
-                names.Add(simpleName.Groups["name"].Value);
+            {
+                var name = simpleName.Groups["name"].Value.Trim();
+                if (name.Length > 0)
+                    names.Add(name);
+            }
         }
 
         return names.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(name => name).ToList();
