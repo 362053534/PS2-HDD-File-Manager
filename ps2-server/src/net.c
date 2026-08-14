@@ -21,6 +21,8 @@ static void busyWaitMs(unsigned int msec)
     start = GetTimerSystemTime();
     ticks = (u64)msec * ((u64)kBUSCLK / 1000ULL);
     while ((GetTimerSystemTime() - start) < ticks) {
+        /* 让出 CPU，避免忙等饿死 tcpip 线程上的 DHCP 客户端 */
+        RotateThreadReadyQueue(0);
     }
 }
 
@@ -54,9 +56,15 @@ static int ethGetDhcpStatus(void)
     /* EE ps2ip_getconfig：找到返回 1，未找到返回 0 */
     if (ps2ip_getconfig("sm0", &ip_info) <= 0)
         return 0;
+    /* dhcp 客户端尚未启动时 dhcp_enabled=0，必须继续等（不能误判为成功） */
     if (!ip_info.dhcp_enabled)
-        return 1;
-    return (ip_info.dhcp_status == DHCP_STATE_BOUND || ip_info.dhcp_status == DHCP_STATE_OFF);
+        return 0;
+    if (ip_info.dhcp_status != DHCP_STATE_BOUND)
+        return 0;
+    /* BOUND 但地址仍为 0 时继续等 */
+    if (ip_info.ipaddr.s_addr == 0)
+        return 0;
+    return 1;
 }
 
 /* 与 HDL/sample 一致：仅在模式变化时调用 SetLinkMode，失败不阻断后续 ps2ipInit */
