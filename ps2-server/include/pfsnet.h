@@ -42,6 +42,7 @@ int ethApplyIPConfig(int use_dhcp, const struct ip4_addr *ip, const struct ip4_a
 int ethWaitLinkAndDhcp(int use_dhcp);
 int ethLinkIsUp(void);
 void ethGetIpDisplay(char *out, int outLen);
+int ethReadCurrentConfig(struct ip4_addr *ip, struct ip4_addr *nm, struct ip4_addr *gw);
 
 int pfsnetFsInit(void);
 void pfsnetFsForceUmount(void);

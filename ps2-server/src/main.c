@@ -154,6 +154,7 @@ int main(int argc, char *argv[])
     printIpConfig(&cfg);
 
     if (cfg.useDhcp) {
+        scr_printf("Waiting for link + DHCP...\n");
         if (ethInit(1, &cfg.ip, &cfg.nm, &cfg.gw) < 0 || ethWaitLinkAndDhcp(1) < 0) {
             scr_printf("DHCP failed, static fallback\n");
             cfg.useDhcp = 0;
@@ -175,6 +176,8 @@ int main(int argc, char *argv[])
             cfg.source = PFSNET_IP_SRC_DHCP;
             strncpy(cfg.sourcePath, "DHCP", sizeof(cfg.sourcePath) - 1);
             cfg.sourcePath[sizeof(cfg.sourcePath) - 1] = '\0';
+            /* 把租约写回，避免屏上 NM/GW 仍是 0.0.0.0 */
+            ethReadCurrentConfig(&cfg.ip, &cfg.nm, &cfg.gw);
         }
     } else {
         /* OPL（或其它）已给出静态：不走 DHCP */

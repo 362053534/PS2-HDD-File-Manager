@@ -2,6 +2,7 @@
 #include <string.h>
 #include <kernel.h>
 #include <timer.h>
+#include <delaythread.h>
 #include <debug.h>
 #include <netman.h>
 #include <ps2ip.h>
@@ -11,30 +12,58 @@
 /* GCC14 constructor 写入 .init_array，而 PS2 crt0 只遍历 .ctors，需手动填充 */
 extern void __ps2ipeeOpsInitializeImpl(void);
 
-/* 约 msec 毫秒忙等：不用 SetAlarm/SleepThread（NOPATCH 下可能永不唤醒） */
-static void busyWaitMs(unsigned int msec)
+#define ETH_TCPIP_PRIO 0x58 /* lwIP tcpip 线程，见 PS2SDK lwipopts.h */
+
+/*
+ * 等链路/DHCP 时必须真正让出 CPU，否则主线程（通常优先级 0）会饿死
+ * 优先级 0x58 的 tcpip/DHCP 定时器。
+ *
+ * 不能照搬 OPL 的 SetAlarm+WaitSema：本 ELF 使用 KERNEL_NOPATCH /
+ * DISABLE_PATCHED_FUNCTIONS()，InitAlarm() 是空函数，H-SYNC SetAlarm
+ * 回调永不触发，WaitSema 会永久卡死。
+ *
+ * DelayThread 走硬件 SetTimerAlarm（InitTimer，不依赖补丁），阻塞主线程
+ * 的同时允许 tcpip 运行。若 DelayThread 失败，把本线程降到 tcpip 之下再忙等。
+ */
+static void sleepMs(unsigned int msec)
 {
+    int tid;
+    int oldPrio;
+    ee_thread_status_t status;
     u64 start;
     u64 ticks;
 
-    StartTimerSystemTime();
+    if (msec == 0)
+        return;
+    if (DelayThread((s32)msec * 1000) == 0)
+        return;
+
+    tid = GetThreadId();
+    oldPrio = 1;
+    memset(&status, 0, sizeof(status));
+    if (ReferThreadStatus(tid, &status) >= 0 && status.current_priority > 0)
+        oldPrio = status.current_priority;
+
+    /* 降到 tcpip 之下，否则主线程空转仍会饿死 DHCP */
+    ChangeThreadPriority(tid, ETH_TCPIP_PRIO + 8);
+
     start = GetTimerSystemTime();
     ticks = (u64)msec * ((u64)kBUSCLK / 1000ULL);
-    while ((GetTimerSystemTime() - start) < ticks) {
-        /* 让出 CPU，避免忙等饿死 tcpip 线程上的 DHCP 客户端 */
-        RotateThreadReadyQueue(0);
-    }
+    while ((GetTimerSystemTime() - start) < ticks)
+        RotateThreadReadyQueue(ETH_TCPIP_PRIO);
+
+    ChangeThreadPriority(tid, oldPrio);
 }
 
-/* 有界等待：约 100ms/次，最多 ~30s；超时返回 -1，绝不静默死等 */
+/* 1s/次，最多 30s（与 OPL 相同上限）；超时返回 -1，绝不静默死等 */
 static int WaitValidNetState(int (*checkingFunction)(void))
 {
-    int retry;
+    int retry_cycles;
 
-    for (retry = 0; checkingFunction() == 0; retry++) {
-        busyWaitMs(100);
-        if (retry >= 300)
+    for (retry_cycles = 0; checkingFunction() == 0; retry_cycles++) {
+        if (retry_cycles >= 30)
             return -1;
+        sleepMs(1000);
     }
     return 0;
 }
@@ -91,15 +120,27 @@ int ethApplyIPConfig(int use_dhcp, const struct ip4_addr *ip, const struct ip4_a
     if ((result = ps2ip_getconfig("sm0", &ip_info)) <= 0)
         return -1;
 
-    if (use_dhcp) {
-        ip_info.dhcp_enabled = 1;
-    } else {
-        ip4_addr_set((struct ip4_addr *)&ip_info.ipaddr, ip);
-        ip4_addr_set((struct ip4_addr *)&ip_info.netmask, nm);
-        ip4_addr_set((struct ip4_addr *)&ip_info.gw, gw);
-        ip_info.dhcp_enabled = 0;
+    /* 与 OPL ethApplyIPConfig 相同：仅在模式或静态地址变化时写入 */
+    if ((use_dhcp != (int)ip_info.dhcp_enabled) ||
+        (!use_dhcp &&
+         (!ip4_addr_cmp(ip, (struct ip4_addr *)&ip_info.ipaddr) ||
+          !ip4_addr_cmp(nm, (struct ip4_addr *)&ip_info.netmask) ||
+          !ip4_addr_cmp(gw, (struct ip4_addr *)&ip_info.gw)))) {
+        if (use_dhcp) {
+            /* LWIP_DHCP_CHECK_LINK_UP=1：须在链路起来后调用；地址清零再 dhcp_start */
+            ip4_addr_set_zero((struct ip4_addr *)&ip_info.ipaddr);
+            ip4_addr_set_zero((struct ip4_addr *)&ip_info.netmask);
+            ip4_addr_set_zero((struct ip4_addr *)&ip_info.gw);
+            ip_info.dhcp_enabled = 1;
+        } else {
+            ip4_addr_set((struct ip4_addr *)&ip_info.ipaddr, ip);
+            ip4_addr_set((struct ip4_addr *)&ip_info.netmask, nm);
+            ip4_addr_set((struct ip4_addr *)&ip_info.gw, gw);
+            ip_info.dhcp_enabled = 0;
+        }
+        return ps2ip_setconfig(&ip_info) ? 0 : -1;
     }
-    return ps2ip_setconfig(&ip_info) ? 0 : -1;
+    return 0;
 }
 
 int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw)
@@ -112,12 +153,14 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
     const struct ip4_addr *initGw = gw;
     int r;
 
-    /* 与 HDL 一致：链路模式失败不在此中止（否则永远到不了 ps2ipInit） */
+    StartTimerSystemTime();
+
+    /* 与 HDL/OPL 一致：链路模式失败不在此中止（否则永远到不了 ps2ipInit） */
     ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO);
 
     /* 已初始化过：只改 IP 配置（DHCP 失败转静态时不能再次 ps2ipInit） */
     if (stackReady)
-        return ethApplyIPConfig(use_dhcp, ip, nm, gw);
+        return use_dhcp ? 0 : ethApplyIPConfig(0, ip, nm, gw);
 
     if (!opsReady) {
         __ps2ipeeOpsInitializeImpl();
@@ -141,22 +184,37 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
 
     stackReady = 1;
 
-    if (use_dhcp)
-        return ethApplyIPConfig(1, ip, nm, gw);
-
-    /* 静态：地址已由 ps2ipInit 写入；再 setconfig 确保 dhcp 关闭（失败不回滚已写入地址） */
-    ethApplyIPConfig(0, ip, nm, gw);
+    /* DHCP 按 OPL：等链路起来后再 ethApplyIPConfig，见 ethWaitLinkAndDhcp */
+    if (!use_dhcp)
+        ethApplyIPConfig(0, ip, nm, gw);
     return 0;
 }
 
 int ethWaitLinkAndDhcp(int use_dhcp)
 {
-    /* 无载波时 IP 仍可能已写入，但无法收发——必须视为失败 */
+    struct ip4_addr zeroIp, zeroNm, zeroGw;
+
+    /* OPL ethInitApplyConfig：先等到链路，必要时重试 SetLinkMode，再启动 DHCP */
+    do {
+        if (WaitValidNetState(&ethGetLinkStatus) < 0) {
+            scr_printf("WARN: link timeout (no carrier)\n");
+            return -1;
+        }
+    } while (ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO) != 0);
+
     if (WaitValidNetState(&ethGetLinkStatus) < 0) {
         scr_printf("WARN: link timeout (no carrier)\n");
         return -1;
     }
+
     if (use_dhcp) {
+        ip4_addr_set_zero(&zeroIp);
+        ip4_addr_set_zero(&zeroNm);
+        ip4_addr_set_zero(&zeroGw);
+        if (ethApplyIPConfig(1, &zeroIp, &zeroNm, &zeroGw) < 0) {
+            scr_printf("WARN: dhcp start failed\n");
+            return -1;
+        }
         if (WaitValidNetState(&ethGetDhcpStatus) < 0) {
             scr_printf("WARN: dhcp timeout\n");
             return -1;
@@ -184,4 +242,19 @@ void ethGetIpDisplay(char *out, int outLen)
              (unsigned)ip4_addr2((struct ip4_addr *)&ip_info.ipaddr),
              (unsigned)ip4_addr3((struct ip4_addr *)&ip_info.ipaddr),
              (unsigned)ip4_addr4((struct ip4_addr *)&ip_info.ipaddr));
+}
+
+int ethReadCurrentConfig(struct ip4_addr *ip, struct ip4_addr *nm, struct ip4_addr *gw)
+{
+    t_ip_info ip_info;
+
+    if (ps2ip_getconfig("sm0", &ip_info) <= 0)
+        return -1;
+    if (ip)
+        ip4_addr_set(ip, (struct ip4_addr *)&ip_info.ipaddr);
+    if (nm)
+        ip4_addr_set(nm, (struct ip4_addr *)&ip_info.netmask);
+    if (gw)
+        ip4_addr_set(gw, (struct ip4_addr *)&ip_info.gw);
+    return 0;
 }
