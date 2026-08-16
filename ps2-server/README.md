@@ -4,9 +4,13 @@
 
 ## 依赖
 
-1. **魔改 PS2SDK**：`C:\GitHub\ps2sdk`（你的 fork；路径/UTF-8 字节按本工具约定透传）
+参考源与编译镜像**只允许** [362053534](https://github.com/362053534) 的仓库，见仓库根目录 [`AGENTS.md`](../AGENTS.md)。不要对照官方 OPL / ps2dev SDK。
+
+1. **PS2SDK**（362053534 fork）：`C:\GitHub\ps2sdk`（路径/UTF-8 字节按本工具约定透传）
 2. 该 SDK **已编译出 IRX**（至少含 `iop/irx/ps2fs.irx`、`ps2hdd.irx`、`netman.irx`、`smap.irx` 等）
 3. **PS2 工具链**：`mips64r5900el-ps2-elf-gcc` + `bin2c`（通常在 WSL 的 `/usr/local/ps2dev`）
+4. **OPL 行为对照**：`C:\GitHub\Open-PS2-Loader`（https://github.com/362053534/Open-PS2-Loader）
+5. **Docker 编译镜像**：`ghcr.io/362053534/ps2homebrew:main`
 
 ## 本阶段（P3）已实现
 

@@ -16,14 +16,15 @@ extern void __ps2ipeeOpsInitializeImpl(void);
 
 /*
  * 等链路/DHCP 时必须真正让出 CPU，否则主线程（通常优先级 0）会饿死
- * 优先级 0x58 的 tcpip/DHCP 定时器。
+ * 优先级 0x58 的 tcpip/DHCP 定时器（362053534 ps2sdk lwipopts.h）。
  *
- * 不能照搬 OPL 的 SetAlarm+WaitSema：本 ELF 使用 KERNEL_NOPATCH /
- * DISABLE_PATCHED_FUNCTIONS()，InitAlarm() 是空函数，H-SYNC SetAlarm
- * 回调永不触发，WaitSema 会永久卡死。
+ * 362053534 OPL ethsupport.c 用 SetAlarm+WaitSema，但 OPL 会打内核补丁。
+ * 本 ELF 使用 KERNEL_NOPATCH / DISABLE_PATCHED_FUNCTIONS()，InitAlarm()
+ * 是空函数，H-SYNC SetAlarm 回调永不触发，WaitSema 会永久卡死。
  *
- * DelayThread 走硬件 SetTimerAlarm（InitTimer，不依赖补丁），阻塞主线程
- * 的同时允许 tcpip 运行。若 DelayThread 失败，把本线程降到 tcpip 之下再忙等。
+ * 因此等待走 362053534 ps2sdk 的 DelayThread（硬件 SetTimerAlarm），
+ * 阻塞主线程同时允许 tcpip 运行。若 DelayThread 失败，把本线程降到
+ * tcpip 之下再忙等。
  */
 static void sleepMs(unsigned int msec)
 {

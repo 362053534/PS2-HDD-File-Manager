@@ -16,10 +16,10 @@
 
 struct PfsNetClient;
 
-/* 网络配置：OPL 静态则直接采用；否则 DHCP，失败再 uLE/默认静态兜底 */
+/* 网络配置：只读 conf_network.cfg / IPCONFIG.DAT。DHCP 调用 applyDhcp，不另开一套 */
 enum PfsNetIpSource {
-    PFSNET_IP_SRC_IPCONFIG = 1, /* uLE: mc?:/SYS-CONF/IPCONFIG.DAT */
-    PFSNET_IP_SRC_OPL = 2,      /* OPL: mc?:/OPL/conf_network.cfg */
+    PFSNET_IP_SRC_IPCONFIG = 1, /* uLE IPCONFIG.DAT（MC/USB/HDD） */
+    PFSNET_IP_SRC_OPL = 2,      /* OPL conf_network.cfg（MC/USB/HDD） */
     PFSNET_IP_SRC_DHCP = 3,
     PFSNET_IP_SRC_STATIC = 4
 };
@@ -30,11 +30,12 @@ typedef struct PfsNetIpConfig {
     struct ip4_addr ip;
     struct ip4_addr nm;
     struct ip4_addr gw;
-    char sourcePath[64];
+    char sourcePath[80];
 } PfsNetIpConfig;
 
 void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg);
-int pfsnetLoadIpConfig(PfsNetIpConfig *cfg);
+/* bootPath 为 argv[0]，用于 OPL 式「先搜启动设备」；可为 NULL */
+int pfsnetLoadIpConfig(PfsNetIpConfig *cfg, const char *bootPath);
 const char *pfsnetIpSourceName(int source);
 
 int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw);
@@ -52,6 +53,7 @@ const char *pfsnetMountedPartition(void);
 int pfsnetHandleCommand(struct PfsNetClient *client, uint32_t command, const uint8_t *payload, uint32_t payloadLen);
 
 int pfsnetStartServer(void);
+void pfsnetStopServer(void);
 
 /* 从载荷读取 length-prefixed UTF-8 字符串；成功返回消耗字节数，失败 <0 */
 int pfsnetReadString(const uint8_t *payload, uint32_t payloadLen, uint32_t offset, char *out, int outMax, uint32_t *consumed);

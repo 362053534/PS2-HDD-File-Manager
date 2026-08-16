@@ -196,6 +196,8 @@ int pfsnetStartServer(void)
     ee_thread_t thread;
     int yes = 1;
 
+    g_serverThreadId = -1;
+
     g_listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (g_listenSocket < 0) {
         scr_printf("server: socket failed (%d)\n", g_listenSocket);
@@ -238,4 +240,29 @@ int pfsnetStartServer(void)
     }
     StartThread(g_serverThreadId, NULL);
     return 0;
+}
+
+void pfsnetStopServer(void)
+{
+    if (g_client.running) {
+        g_client.running = 0;
+        if (g_client.socket >= 0) {
+            close(g_client.socket);
+            g_client.socket = -1;
+        }
+        if (g_client.threadId > 0) {
+            TerminateThread(g_client.threadId);
+            DeleteThread(g_client.threadId);
+            g_client.threadId = -1;
+        }
+    }
+    if (g_listenSocket >= 0) {
+        close(g_listenSocket);
+        g_listenSocket = -1;
+    }
+    if (g_serverThreadId > 0) {
+        TerminateThread(g_serverThreadId);
+        DeleteThread(g_serverThreadId);
+        g_serverThreadId = -1;
+    }
 }

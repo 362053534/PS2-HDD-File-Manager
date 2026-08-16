@@ -5,8 +5,13 @@
 
 #include <fileXio_rpc.h>
 #include <io_common.h>
+#include <delaythread.h>
 
 #include "pfsnet.h"
+
+#define PFSNET_MAX_BDM_DEVICES 5
+#define PFSNET_USB_RETRY 15
+#define PFSNET_USB_RETRY_US 200000
 
 static int parseIpv4(const char *text, struct ip4_addr *out)
 {
@@ -46,48 +51,50 @@ static int readFileText(const char *path, char *buf, int bufMax, int *outLen)
     return 0;
 }
 
-/* uLE / LaunchELF：IPCONFIG.DAT "A.B.C.D A.B.C.D A.B.C.D" = IP NM GW */
-static int tryLoadIpconfigDat(PfsNetIpConfig *cfg)
+static int fileExists(const char *path)
 {
-    static const char *paths[] = {
-        "mc0:/SYS-CONF/IPCONFIG.DAT",
-        "mc1:/SYS-CONF/IPCONFIG.DAT",
-        "mc0:SYS-CONF/IPCONFIG.DAT",
-        "mc1:SYS-CONF/IPCONFIG.DAT",
-    };
-    char buf[256];
-    unsigned int ip[4], nm[4], gw[4];
-    unsigned int i;
+    int fd;
 
-    for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-        if (readFileText(paths[i], buf, sizeof(buf), NULL) < 0)
-            continue;
-        if (sscanf(buf, "%u.%u.%u.%u %u.%u.%u.%u %u.%u.%u.%u",
-                   &ip[0], &ip[1], &ip[2], &ip[3],
-                   &nm[0], &nm[1], &nm[2], &nm[3],
-                   &gw[0], &gw[1], &gw[2], &gw[3]) != 12)
-            continue;
-        if (ip[0] > 255 || ip[1] > 255 || ip[2] > 255 || ip[3] > 255 ||
-            nm[0] > 255 || nm[1] > 255 || nm[2] > 255 || nm[3] > 255 ||
-            gw[0] > 255 || gw[1] > 255 || gw[2] > 255 || gw[3] > 255)
-            continue;
-
-        IP4_ADDR(&cfg->ip, ip[0], ip[1], ip[2], ip[3]);
-        IP4_ADDR(&cfg->nm, nm[0], nm[1], nm[2], nm[3]);
-        IP4_ADDR(&cfg->gw, gw[0], gw[1], gw[2], gw[3]);
-        cfg->useDhcp = 0;
-        cfg->source = PFSNET_IP_SRC_IPCONFIG;
-        strncpy(cfg->sourcePath, paths[i], sizeof(cfg->sourcePath) - 1);
-        cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
+    if (!path || !path[0])
         return 0;
-    }
-    return -1;
+    fd = fileXioOpen(path, FIO_O_RDONLY, 0);
+    if (fd < 0)
+        return 0;
+    fileXioClose(fd);
+    return 1;
+}
+
+static void joinPrefix(char *out, int outMax, const char *prefix, const char *name)
+{
+    size_t n;
+
+    if (!out || outMax <= 0)
+        return;
+    out[0] = '\0';
+    if (!prefix || !name)
+        return;
+    n = strlen(prefix);
+    if (n > 0 && (prefix[n - 1] == '/' || prefix[n - 1] == ':'))
+        snprintf(out, outMax, "%s%s", prefix, name);
+    else
+        snprintf(out, outMax, "%s/%s", prefix, name);
+}
+
+static int prefixHasNetworkFile(const char *prefix)
+{
+    char path[96];
+
+    /* 只认网络文件，不读 conf_opl.cfg */
+    joinPrefix(path, sizeof(path), prefix, "conf_network.cfg");
+    if (fileExists(path))
+        return 1;
+    joinPrefix(path, sizeof(path), prefix, "IPCONFIG.DAT");
+    return fileExists(path);
 }
 
 static void trimInPlace(char *s)
 {
     char *start;
-    char *end;
     size_t len;
 
     if (!s)
@@ -102,21 +109,39 @@ static void trimInPlace(char *s)
         s[len - 1] = '\0';
         len--;
     }
-    end = strchr(s, '\r');
-    if (end)
-        *end = '\0';
+    start = strchr(s, '\r');
+    if (start)
+        *start = '\0';
 }
 
-/* OPL conf_network.cfg: key=value */
-static int tryLoadOplConf(PfsNetIpConfig *cfg)
+static int parseIpconfigText(const char *buf, PfsNetIpConfig *cfg, const char *path)
 {
-    static const char *paths[] = {
-        "mc0:/OPL/conf_network.cfg",
-        "mc1:/OPL/conf_network.cfg",
-        "mc0:OPL/conf_network.cfg",
-        "mc1:OPL/conf_network.cfg",
-    };
-    char buf[2048];
+    unsigned int ip[4], nm[4], gw[4];
+
+    if (!buf || !cfg)
+        return -1;
+    if (sscanf(buf, "%u.%u.%u.%u %u.%u.%u.%u %u.%u.%u.%u",
+               &ip[0], &ip[1], &ip[2], &ip[3],
+               &nm[0], &nm[1], &nm[2], &nm[3],
+               &gw[0], &gw[1], &gw[2], &gw[3]) != 12)
+        return -1;
+    if (ip[0] > 255 || ip[1] > 255 || ip[2] > 255 || ip[3] > 255 ||
+        nm[0] > 255 || nm[1] > 255 || nm[2] > 255 || nm[3] > 255 ||
+        gw[0] > 255 || gw[1] > 255 || gw[2] > 255 || gw[3] > 255)
+        return -1;
+
+    IP4_ADDR(&cfg->ip, ip[0], ip[1], ip[2], ip[3]);
+    IP4_ADDR(&cfg->nm, nm[0], nm[1], nm[2], nm[3]);
+    IP4_ADDR(&cfg->gw, gw[0], gw[1], gw[2], gw[3]);
+    cfg->useDhcp = 0;
+    cfg->source = PFSNET_IP_SRC_IPCONFIG;
+    strncpy(cfg->sourcePath, path ? path : "IPCONFIG.DAT", sizeof(cfg->sourcePath) - 1);
+    cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
+    return 0;
+}
+
+static int parseOplNetworkText(const char *buf, PfsNetIpConfig *cfg, const char *path)
+{
     char line[256];
     char key[64];
     char val[128];
@@ -125,86 +150,327 @@ static int tryLoadOplConf(PfsNetIpConfig *cfg)
     char gwText[32] = "";
     int useDhcp = 1;
     int hasIp = 0, hasNm = 0, hasGw = 0, hasDhcpKey = 0;
-    unsigned int i;
     const char *p;
     const char *nl;
     int lineLen;
 
-    for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-        if (readFileText(paths[i], buf, sizeof(buf), NULL) < 0)
-            continue;
+    if (!buf || !cfg)
+        return -1;
 
-        useDhcp = 1;
-        hasIp = hasNm = hasGw = hasDhcpKey = 0;
-        ipText[0] = nmText[0] = gwText[0] = '\0';
-
-        p = buf;
-        while (*p) {
-            nl = strchr(p, '\n');
-            if (nl) {
-                lineLen = (int)(nl - p);
-                if (lineLen >= (int)sizeof(line))
-                    lineLen = (int)sizeof(line) - 1;
-                memcpy(line, p, lineLen);
-                line[lineLen] = '\0';
-                p = nl + 1;
-            } else {
-                strncpy(line, p, sizeof(line) - 1);
-                line[sizeof(line) - 1] = '\0';
-                p += strlen(p);
-            }
-
-            trimInPlace(line);
-            if (line[0] == '\0' || line[0] == '#' || line[0] == ';')
-                continue;
-            if (sscanf(line, "%63[^=]=%127[^\n]", key, val) != 2)
-                continue;
-            trimInPlace(key);
-            trimInPlace(val);
-
-            if (strcmp(key, "ps2_ip_use_dhcp") == 0) {
-                useDhcp = (atoi(val) != 0);
-                hasDhcpKey = 1;
-            } else if (strcmp(key, "ps2_ip_addr") == 0) {
-                strncpy(ipText, val, sizeof(ipText) - 1);
-                ipText[sizeof(ipText) - 1] = '\0';
-                hasIp = 1;
-            } else if (strcmp(key, "ps2_netmask") == 0) {
-                strncpy(nmText, val, sizeof(nmText) - 1);
-                nmText[sizeof(nmText) - 1] = '\0';
-                hasNm = 1;
-            } else if (strcmp(key, "ps2_gateway") == 0) {
-                strncpy(gwText, val, sizeof(gwText) - 1);
-                gwText[sizeof(gwText) - 1] = '\0';
-                hasGw = 1;
-            }
-        }
-
-        /* 至少识别到 DHCP 键或完整静态三项，才视为有效 OPL 配置 */
-        if (!hasDhcpKey && !(hasIp && hasNm && hasGw))
-            continue;
-
-        if (useDhcp) {
-            cfg->useDhcp = 1;
-            IP4_ADDR(&cfg->ip, 0, 0, 0, 0);
-            IP4_ADDR(&cfg->nm, 0, 0, 0, 0);
-            IP4_ADDR(&cfg->gw, 0, 0, 0, 0);
+    p = buf;
+    while (*p) {
+        nl = strchr(p, '\n');
+        if (nl) {
+            lineLen = (int)(nl - p);
+            if (lineLen >= (int)sizeof(line))
+                lineLen = (int)sizeof(line) - 1;
+            memcpy(line, p, lineLen);
+            line[lineLen] = '\0';
+            p = nl + 1;
         } else {
-            if (!hasIp || !hasNm || !hasGw)
-                continue;
-            if (parseIpv4(ipText, &cfg->ip) < 0 ||
-                parseIpv4(nmText, &cfg->nm) < 0 ||
-                parseIpv4(gwText, &cfg->gw) < 0)
-                continue;
-            cfg->useDhcp = 0;
+            strncpy(line, p, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+            p += strlen(p);
         }
 
-        cfg->source = PFSNET_IP_SRC_OPL;
-        strncpy(cfg->sourcePath, paths[i], sizeof(cfg->sourcePath) - 1);
-        cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
+        trimInPlace(line);
+        if (line[0] == '\0' || line[0] == '#' || line[0] == ';')
+            continue;
+        if (sscanf(line, "%63[^=]=%127[^\n]", key, val) != 2)
+            continue;
+        trimInPlace(key);
+        trimInPlace(val);
+
+        if (strcmp(key, "ps2_ip_use_dhcp") == 0) {
+            useDhcp = (atoi(val) != 0);
+            hasDhcpKey = 1;
+        } else if (strcmp(key, "ps2_ip_addr") == 0) {
+            strncpy(ipText, val, sizeof(ipText) - 1);
+            ipText[sizeof(ipText) - 1] = '\0';
+            hasIp = 1;
+        } else if (strcmp(key, "ps2_netmask") == 0) {
+            strncpy(nmText, val, sizeof(nmText) - 1);
+            nmText[sizeof(nmText) - 1] = '\0';
+            hasNm = 1;
+        } else if (strcmp(key, "ps2_gateway") == 0) {
+            strncpy(gwText, val, sizeof(gwText) - 1);
+            gwText[sizeof(gwText) - 1] = '\0';
+            hasGw = 1;
+        }
+    }
+
+    if (!hasDhcpKey && !(hasIp && hasNm && hasGw))
+        return -1;
+
+    /* DHCP 只置标志，真正申请地址走 main 里第一阶段 ethInit/ethWaitLinkAndDhcp。
+     * 静态三项若写了，留下作 DHCP 失败兜底，不另开一套 DHCP。 */
+    if (hasIp && hasNm && hasGw) {
+        if (parseIpv4(ipText, &cfg->ip) < 0 ||
+            parseIpv4(nmText, &cfg->nm) < 0 ||
+            parseIpv4(gwText, &cfg->gw) < 0)
+            return -1;
+    } else if (!useDhcp) {
+        return -1;
+    } else {
+        IP4_ADDR(&cfg->ip, 0, 0, 0, 0);
+        IP4_ADDR(&cfg->nm, 0, 0, 0, 0);
+        IP4_ADDR(&cfg->gw, 0, 0, 0, 0);
+    }
+    cfg->useDhcp = useDhcp;
+
+    cfg->source = PFSNET_IP_SRC_OPL;
+    strncpy(cfg->sourcePath, path ? path : "conf_network.cfg", sizeof(cfg->sourcePath) - 1);
+    cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
+    return 0;
+}
+
+static int loadOplNetworkFile(const char *path, PfsNetIpConfig *cfg)
+{
+    char buf[2048];
+
+    if (readFileText(path, buf, sizeof(buf), NULL) < 0)
+        return -1;
+    return parseOplNetworkText(buf, cfg, path);
+}
+
+static int loadIpconfigFile(const char *path, PfsNetIpConfig *cfg)
+{
+    char buf[256];
+
+    if (readFileText(path, buf, sizeof(buf), NULL) < 0)
+        return -1;
+    return parseIpconfigText(buf, cfg, path);
+}
+
+/* 从选定前缀读网络配置：先 conf_network.cfg，没有再 IPCONFIG.DAT */
+static int loadNetworkFromPrefix(const char *prefix, PfsNetIpConfig *cfg)
+{
+    char path[96];
+
+    joinPrefix(path, sizeof(path), prefix, "conf_network.cfg");
+    if (loadOplNetworkFile(path, cfg) == 0)
+        return 0;
+    joinPrefix(path, sizeof(path), prefix, "IPCONFIG.DAT");
+    if (loadIpconfigFile(path, cfg) == 0)
+        return 0;
+    return -1;
+}
+
+/* 记忆卡 uLE 遗留路径：OPL configInit(NULL) 时 legacy 固定为 mc?:SYS-CONF/IPCONFIG.DAT */
+static int loadMcLegacyIpconfig(PfsNetIpConfig *cfg)
+{
+    static const char *paths[] = {
+        "mc0:/SYS-CONF/IPCONFIG.DAT",
+        "mc1:/SYS-CONF/IPCONFIG.DAT",
+        "mc0:SYS-CONF/IPCONFIG.DAT",
+        "mc1:SYS-CONF/IPCONFIG.DAT",
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (loadIpconfigFile(paths[i], cfg) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+static int findMcOplPrefix(char *outPrefix, int outMax)
+{
+    static const char *prefixes[] = {
+        "mc0:/OPL/",
+        "mc1:/OPL/",
+        "mc0:OPL/",
+        "mc1:OPL/",
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        if (!prefixHasNetworkFile(prefixes[i]))
+            continue;
+        strncpy(outPrefix, prefixes[i], outMax - 1);
+        outPrefix[outMax - 1] = '\0';
         return 0;
     }
     return -1;
+}
+
+static int findBdmOplPrefixOnce(char *outPrefix, int outMax)
+{
+    char prefix[40];
+    int i;
+
+    /* 362053534 设备顺序：mass0–4 根目录，再 massN:OPL/（只找网络文件） */
+    for (i = 0; i < PFSNET_MAX_BDM_DEVICES; i++) {
+        snprintf(prefix, sizeof(prefix), "mass%d:", i);
+        if (prefixHasNetworkFile(prefix)) {
+            strncpy(outPrefix, prefix, outMax - 1);
+            outPrefix[outMax - 1] = '\0';
+            return 0;
+        }
+        snprintf(prefix, sizeof(prefix), "mass%d:OPL/", i);
+        if (prefixHasNetworkFile(prefix)) {
+            strncpy(outPrefix, prefix, outMax - 1);
+            outPrefix[outMax - 1] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* 扫 mass0–mass4 的 conf_network.cfg / IPCONFIG.DAT；U 盘枚举需要等一会儿 */
+static int findBdmOplPrefix(char *outPrefix, int outMax)
+{
+    int retry;
+
+    if (findBdmOplPrefixOnce(outPrefix, outMax) == 0)
+        return 0;
+    for (retry = 0; retry < PFSNET_USB_RETRY; retry++) {
+        DelayThread(PFSNET_USB_RETRY_US);
+        if (findBdmOplPrefixOnce(outPrefix, outMax) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+static int readHddPartitionName(char *outName, int outMax)
+{
+    char buf[512];
+    char line[128];
+    char key[64];
+    char val[64];
+    const char *p;
+    const char *nl;
+    int lineLen;
+
+    if (readFileText("pfs0:OPL/conf_hdd.cfg", buf, sizeof(buf), NULL) < 0 &&
+        readFileText("pfs0:/OPL/conf_hdd.cfg", buf, sizeof(buf), NULL) < 0)
+        return -1;
+
+    p = buf;
+    while (*p) {
+        nl = strchr(p, '\n');
+        if (nl) {
+            lineLen = (int)(nl - p);
+            if (lineLen >= (int)sizeof(line))
+                lineLen = (int)sizeof(line) - 1;
+            memcpy(line, p, lineLen);
+            line[lineLen] = '\0';
+            p = nl + 1;
+        } else {
+            strncpy(line, p, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+            p += strlen(p);
+        }
+        trimInPlace(line);
+        if (sscanf(line, "%63[^=]=%63[^\n]", key, val) != 2)
+            continue;
+        trimInPlace(key);
+        trimInPlace(val);
+        if (strcmp(key, "hdd_partition") != 0)
+            continue;
+        strncpy(outName, val, outMax - 1);
+        outName[outMax - 1] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+/*
+ * OPL hddLoadSupportModules + checkLoadConfigHDD：
+ * 读 __common/OPL/conf_hdd.cfg 得到分区（默认 +OPL），挂到 pfs0:。
+ * 分区名以 + 开头时配置在根目录；否则在 pfs0:OPL/。
+ */
+static int findHddOplPrefix(char *outPrefix, int outMax)
+{
+    char partName[40];
+    char device[48];
+    const char *prefix;
+    int mounted = 0;
+
+    fileXioUmount(PFSNET_MOUNT_POINT);
+
+    strncpy(partName, "+OPL", sizeof(partName) - 1);
+    partName[sizeof(partName) - 1] = '\0';
+    if (fileXioMount(PFSNET_MOUNT_POINT, "hdd0:__common", FILEXIO_MOUNTFLAG_READONLY) >= 0) {
+        readHddPartitionName(partName, sizeof(partName));
+        fileXioUmount(PFSNET_MOUNT_POINT);
+    }
+
+    if (strncmp(partName, "hdd0:", 5) == 0)
+        strncpy(device, partName, sizeof(device) - 1);
+    else
+        snprintf(device, sizeof(device), "hdd0:%s", partName);
+    device[sizeof(device) - 1] = '\0';
+
+    /* 362053534 checkLoadConfigHDD：hddLoadSupportModules 失败则 100ms 重试，最多 2 秒 */
+    {
+        int retry;
+
+        for (retry = 0; retry < 20 && !mounted; retry++) {
+            if (fileXioMount(PFSNET_MOUNT_POINT, device, FILEXIO_MOUNTFLAG_READONLY) >= 0)
+                mounted = 1;
+            else if (strcmp(device, "hdd0:+OPL") != 0 &&
+                     fileXioMount(PFSNET_MOUNT_POINT, "hdd0:+OPL", FILEXIO_MOUNTFLAG_READONLY) >= 0) {
+                strncpy(device, "hdd0:+OPL", sizeof(device) - 1);
+                mounted = 1;
+            } else if (fileXioMount(PFSNET_MOUNT_POINT, "hdd0:__common", FILEXIO_MOUNTFLAG_READONLY) >= 0) {
+                strncpy(device, "hdd0:__common", sizeof(device) - 1);
+                mounted = 1;
+            }
+            if (!mounted)
+                DelayThread(100000);
+        }
+    }
+    if (!mounted)
+        return -1;
+
+    /* hdd0:+OPL → device[5]=='+'；其它分区用 pfs0:OPL/ */
+    if (strlen(device) > 5 && device[5] == '+')
+        prefix = "pfs0:";
+    else
+        prefix = "pfs0:OPL/";
+
+    if (!prefixHasNetworkFile(prefix) && strcmp(prefix, "pfs0:") == 0 && prefixHasNetworkFile("pfs0:OPL/"))
+        prefix = "pfs0:OPL/";
+
+    if (!prefixHasNetworkFile(prefix)) {
+        fileXioUmount(PFSNET_MOUNT_POINT);
+        return -1;
+    }
+
+    strncpy(outPrefix, prefix, outMax - 1);
+    outPrefix[outMax - 1] = '\0';
+    return 0;
+}
+
+static void umountHddConfig(const char *prefix)
+{
+    if (prefix && strncmp(prefix, "pfs0:", 5) == 0)
+        fileXioUmount(PFSNET_MOUNT_POINT);
+}
+
+static int bootIsMass(const char *bootPath)
+{
+    return bootPath && !strncmp(bootPath, "mass", 4) &&
+           (bootPath[4] == ':' || bootPath[5] == ':');
+}
+
+static int bootIsHdd(const char *bootPath)
+{
+    if (!bootPath)
+        return 0;
+    if (!strncmp(bootPath, "hdd", 3) && (bootPath[3] == ':' || bootPath[4] == ':'))
+        return 1;
+    if (!strncmp(bootPath, "pfs", 3) && (bootPath[3] == ':' || bootPath[4] == ':'))
+        return 1;
+    return 0;
+}
+
+static int loadFromDevicePrefix(const char *prefix, PfsNetIpConfig *cfg)
+{
+    int r = loadNetworkFromPrefix(prefix, cfg);
+    umountHddConfig(prefix);
+    return r;
 }
 
 void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg)
@@ -220,43 +486,64 @@ void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg)
     strncpy(cfg->sourcePath, "DHCP", sizeof(cfg->sourcePath) - 1);
 }
 
-int pfsnetLoadIpConfig(PfsNetIpConfig *cfg)
+int pfsnetLoadIpConfig(PfsNetIpConfig *cfg, const char *bootPath)
 {
     PfsNetIpConfig fileCfg;
+    PfsNetIpConfig fallback;
+    char prefix[40];
+    int mcHasOpl;
+    int haveFallback = 0;
 
     if (!cfg)
         return -1;
 
-    /* OPL 静态则直接采用；OPL DHCP / 无 OPL 时优先 DHCP，uLE 仅作失败兜底 IP */
+    /*
+     * 只搜网络文件（conf_network.cfg / IPCONFIG.DAT），不读 conf_opl.cfg。
+     * 按原样返回文件：静态则 useDhcp=0；ps2_ip_use_dhcp=1 则 useDhcp=1（由调用方 applyDhcp）。
+     */
     pfsnetIpConfigInitDefault(cfg);
+    memset(&fallback, 0, sizeof(fallback));
 
-    memset(&fileCfg, 0, sizeof(fileCfg));
-    if (tryLoadOplConf(&fileCfg) == 0) {
-        if (!fileCfg.useDhcp) {
-            /* OPL ps2_ip_use_dhcp=0：尊重静态，禁止再被 DHCP-first 覆盖 */
-            cfg->ip = fileCfg.ip;
-            cfg->nm = fileCfg.nm;
-            cfg->gw = fileCfg.gw;
-            cfg->source = PFSNET_IP_SRC_OPL;
-            cfg->useDhcp = 0;
-            strncpy(cfg->sourcePath, fileCfg.sourcePath, sizeof(cfg->sourcePath) - 1);
-            cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
-            return 0;
+    mcHasOpl = (findMcOplPrefix(prefix, sizeof(prefix)) == 0);
+    if (mcHasOpl) {
+        if (loadNetworkFromPrefix(prefix, &fileCfg) == 0)
+            fallback = fileCfg, haveFallback = 1;
+    }
+    if (!haveFallback && loadMcLegacyIpconfig(&fileCfg) == 0)
+        fallback = fileCfg, haveFallback = 1;
+
+    if (!haveFallback) {
+        int foundAlt = 0;
+        int usbTried = 0;
+        int hddTried = 0;
+
+        if (bootIsMass(bootPath)) {
+            usbTried = 1;
+            if (findBdmOplPrefix(prefix, sizeof(prefix)) == 0)
+                foundAlt = 1;
+        } else if (bootIsHdd(bootPath)) {
+            hddTried = 1;
+            if (findHddOplPrefix(prefix, sizeof(prefix)) == 0)
+                foundAlt = 1;
         }
-        /* OPL 声明 DHCP：保持 useDhcp=1，再预载 uLE 静态作 DHCP 失败兜底 */
-    }
-    if (tryLoadIpconfigDat(&fileCfg) == 0) {
-        cfg->ip = fileCfg.ip;
-        cfg->nm = fileCfg.nm;
-        cfg->gw = fileCfg.gw;
-        cfg->source = PFSNET_IP_SRC_IPCONFIG;
-        cfg->useDhcp = 1;
-        strncpy(cfg->sourcePath, fileCfg.sourcePath, sizeof(cfg->sourcePath) - 1);
-        cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
-        return 0;
+
+        if (!foundAlt && !usbTried && findBdmOplPrefix(prefix, sizeof(prefix)) == 0)
+            foundAlt = 1;
+        if (!foundAlt && !hddTried && findHddOplPrefix(prefix, sizeof(prefix)) == 0)
+            foundAlt = 1;
+
+        if (foundAlt && loadFromDevicePrefix(prefix, &fileCfg) == 0) {
+            fallback = fileCfg;
+            haveFallback = 1;
+        } else if (foundAlt) {
+            umountHddConfig(prefix);
+        }
     }
 
-    /* 无记忆卡静态配置：DHCP + InitDefault 中的静态种子作最终兜底 */
+    if (!haveFallback)
+        return 0;
+
+    *cfg = fallback;
     return 0;
 }
 

@@ -3,17 +3,20 @@ EE_BIN = PfsNetServer.elf
 EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
 	IOMANX_irx.o FILEXIO_irx.o POWEROFF_irx.o DEV9_irx.o ATAD_irx.o HDD_irx.o PFS_irx.o \
 	SIO2MAN_irx.o MCMAN_irx.o MCSERV_irx.o \
-	NETMAN_irx.o SMAP_irx.o
+	BDM_irx.o BDMFS_FATFS_irx.o USBD_irx.o USBMASS_BD_irx.o \
+	NETMAN_irx.o SMAP_irx.o PADMAN_irx.o
 
 EE_INCS := -I./include -I$(PS2SDK)/ports/include -I$(PS2SDK)/ee/include -I$(PS2SDK)/common/include
 # 对齐 HDDTester：DUMMY_* / KERNEL_NOPATCH + gc-sections；勿链 -lcdvd / ps2time
 EE_CFLAGS += -Os -fdata-sections -ffunction-sections -DNEWLIB_PORT_AWARE \
 	-DDUMMY_TIMEZONE -DDUMMY_LIBC_INIT -DKERNEL_NOPATCH -D_EE
 EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections -T$(PS2SDK)/ee/startup/linkfile
-EE_LIBS = -lpatches -lkernel -ldebug -lfileXio -lps2ip -lnetman
+EE_LIBS = -lpatches -lkernel -ldebug -lfileXio -lps2ip -lnetman -lpad
 
 EE_TEMP_FILES = IOMANX_irx.c FILEXIO_irx.c POWEROFF_irx.c DEV9_irx.c ATAD_irx.c HDD_irx.c PFS_irx.c \
-	SIO2MAN_irx.c MCMAN_irx.c MCSERV_irx.c NETMAN_irx.c SMAP_irx.c
+	SIO2MAN_irx.c MCMAN_irx.c MCSERV_irx.c \
+	BDM_irx.c BDMFS_FATFS_irx.c USBD_irx.c USBMASS_BD_irx.c \
+	NETMAN_irx.c SMAP_irx.c PADMAN_irx.c
 
 # 默认指向本机魔改 PS2SDK 源码树（需先 make install 或已有 iop/irx）
 PS2SDK ?= /mnt/c/GitHub/ps2sdk
@@ -61,11 +64,26 @@ MCMAN_irx.c:
 MCSERV_irx.c:
 	bin2c $(PS2SDK)/iop/irx/mcserv.irx MCSERV_irx.c MCSERV_irx
 
+BDM_irx.c:
+	bin2c $(PS2SDK)/iop/irx/bdm.irx BDM_irx.c BDM_irx
+
+BDMFS_FATFS_irx.c:
+	bin2c $(PS2SDK)/iop/irx/bdmfs_fatfs.irx BDMFS_FATFS_irx.c BDMFS_FATFS_irx
+
+USBD_irx.c:
+	bin2c $(PS2SDK)/iop/irx/usbd.irx USBD_irx.c USBD_irx
+
+USBMASS_BD_irx.c:
+	bin2c $(PS2SDK)/iop/irx/usbmass_bd.irx USBMASS_BD_irx.c USBMASS_BD_irx
+
 NETMAN_irx.c:
 	bin2c $(PS2SDK)/iop/irx/netman.irx NETMAN_irx.c NETMAN_irx
 
 SMAP_irx.c:
 	bin2c $(PS2SDK)/iop/irx/smap.irx SMAP_irx.c SMAP_irx
+
+PADMAN_irx.c:
+	bin2c $(PS2SDK)/iop/irx/padman.irx PADMAN_irx.c PADMAN_irx
 
 include $(PS2SDK)/samples/Makefile.pref
 
