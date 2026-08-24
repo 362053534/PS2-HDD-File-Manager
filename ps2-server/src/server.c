@@ -3,44 +3,94 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <timer.h>
 #include <ps2ip.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <debug.h>
+#include <delaythread.h>
 
 #include "pfsnet.h"
+
+static volatile int g_trafficDepth;
+static u64 g_trafficIdleSince;
+
+void pfsnetTrafficBegin(void)
+{
+    int old = DIntr();
+
+    g_trafficDepth++;
+    if (old)
+        EIntr();
+}
+
+void pfsnetTrafficEnd(void)
+{
+    int old = DIntr();
+
+    if (g_trafficDepth > 0)
+        g_trafficDepth--;
+    if (g_trafficDepth == 0)
+        g_trafficIdleSince = GetTimerSystemTime();
+    if (old)
+        EIntr();
+}
+
+int pfsnetPadPollAllowed(void)
+{
+    u64 idleNeed = 2ULL * (u64)kBUSCLK;
+
+    if (g_trafficDepth > 0)
+        return 0;
+    if (g_trafficIdleSince == 0)
+        return 1;
+    return (GetTimerSystemTime() - g_trafficIdleSince) >= idleNeed;
+}
 
 extern void *_gp;
 
 static uint8_t g_serverStack[PFSNET_SERVER_STACK] __attribute__((aligned(16)));
 static int g_listenSocket = -1;
 static int g_serverThreadId = -1;
+static volatile int g_serverStop;
 static struct PfsNetClient g_client;
 
 static int sendAll(int sock, const void *buf, int len)
 {
     const char *ptr = (const char *)buf;
     int sent = 0;
+    int ok = 1;
+
+    pfsnetTrafficBegin();
     while (sent < len) {
         int n = send(sock, ptr + sent, len - sent, 0);
-        if (n <= 0)
-            return -1;
+        if (n <= 0) {
+            ok = 0;
+            break;
+        }
         sent += n;
     }
-    return sent;
+    pfsnetTrafficEnd();
+    return ok ? sent : -1;
 }
 
 static int recvAll(int sock, void *buf, int len)
 {
     char *ptr = (char *)buf;
     int got = 0;
+    int ok = 1;
+
+    pfsnetTrafficBegin();
     while (got < len) {
         int n = recv(sock, ptr + got, len - got, 0);
-        if (n <= 0)
-            return -1;
+        if (n <= 0) {
+            ok = 0;
+            break;
+        }
         got += n;
     }
-    return got;
+    pfsnetTrafficEnd();
+    return ok ? got : -1;
 }
 
 int pfsnetSendResponse(struct PfsNetClient *client, int result, const void *payload, uint32_t payloadLen)
@@ -166,11 +216,16 @@ static void serverThread(void *arg)
 
     (void)arg;
 
-    while (1) {
+    while (!g_serverStop) {
         addrLen = sizeof(addr);
         clientSock = accept(g_listenSocket, (struct sockaddr *)&addr, &addrLen);
-        if (clientSock < 0)
+        if (g_serverStop)
+            break;
+        if (clientSock < 0) {
+            /* close listen 后 accept 会立刻失败；必须让出 CPU，否则 0x3f 忙等饿死退出路径 */
+            DelayThread(20000);
             continue;
+        }
 
         /* 单客户端：若旧连接仍在，先踢掉 */
         if (g_client.running) {
@@ -188,6 +243,7 @@ static void serverThread(void *arg)
             scr_printf("Client thread failed.\n");
         }
     }
+    ExitDeleteThread();
 }
 
 int pfsnetStartServer(void)
@@ -197,6 +253,7 @@ int pfsnetStartServer(void)
     int yes = 1;
 
     g_serverThreadId = -1;
+    g_serverStop = 0;
 
     g_listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (g_listenSocket < 0) {
@@ -244,25 +301,25 @@ int pfsnetStartServer(void)
 
 void pfsnetStopServer(void)
 {
-    if (g_client.running) {
-        g_client.running = 0;
-        if (g_client.socket >= 0) {
-            close(g_client.socket);
-            g_client.socket = -1;
-        }
-        if (g_client.threadId > 0) {
-            TerminateThread(g_client.threadId);
-            DeleteThread(g_client.threadId);
-            g_client.threadId = -1;
-        }
+    int listenFd;
+    int clientFd;
+
+    /* 协作式停服：只关 socket 让 accept/recv 返回。禁止 TerminateThread——
+     * 线程若卡在 lwIP/IOP RPC，杀掉会把后续 umount / 退出一起卡死。 */
+    g_serverStop = 1;
+    g_client.running = 0;
+
+    clientFd = g_client.socket;
+    g_client.socket = -1;
+    if (clientFd >= 0) {
+        shutdown(clientFd, SHUT_RDWR);
+        close(clientFd);
     }
-    if (g_listenSocket >= 0) {
-        close(g_listenSocket);
-        g_listenSocket = -1;
-    }
-    if (g_serverThreadId > 0) {
-        TerminateThread(g_serverThreadId);
-        DeleteThread(g_serverThreadId);
-        g_serverThreadId = -1;
+
+    listenFd = g_listenSocket;
+    g_listenSocket = -1;
+    if (listenFd >= 0) {
+        shutdown(listenFd, SHUT_RDWR);
+        close(listenFd);
     }
 }

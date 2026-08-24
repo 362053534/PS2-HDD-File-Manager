@@ -14,6 +14,7 @@
 #include <ps2sdkapi.h>
 #include <libpad.h>
 #include <delaythread.h>
+#include <hdd-ioctl.h>
 
 #include "pfsnet.h"
 
@@ -69,7 +70,16 @@ extern unsigned char PADMAN_irx[];
 extern unsigned int size_PADMAN_irx;
 
 static char g_padBuf[256] __attribute__((aligned(64)));
+static uint8_t g_padStack[0x800] __attribute__((aligned(16)));
 static int g_padOpen;
+static int g_padWatchStarted;
+static int g_mainTid;
+
+extern void *_gp;
+
+/* 低于 tcpip(0x58) 和 server(0x3f)，避免抢网络 */
+#define PAD_WATCH_PRIO 0x70
+#define PAD_POLL_US 250000
 
 static int loadModuleBuffer(void *buffer, unsigned int size, int argc, char *arg)
 {
@@ -118,32 +128,79 @@ static int padStartHeld(void)
     return ((0xFFFF ^ buttons.btns) & PAD_START) != 0;
 }
 
+/* 停栈对齐 uLE（umount + HDIOC_DEV9OFF + IOP UDNL 复位），否则脏 DEV9/SMAP/HDD 会黑屏。
+ * 回菜单不能带 SkipMc/SkipHdd/BootBrowser：那是 uLE 从 MBR 出来时故意绕过 FMCB/FHDB、
+ * 进原版浏览器的参数。不带参数让 rom0:OSDSYS 自己找 MC/HDD，才能回到 FHDB 选单。 */
 static void safeExitElf(void)
 {
     scr_printf("Exiting...\n");
-    pfsnetStopServer();
     pfsnetFsForceUmount();
-    if (g_padOpen)
-        padPortClose(0, 0);
-    padEnd();
-    Exit(0);
+    fileXioDevctl("hdd0:", HDIOC_DEV9OFF, NULL, 0, NULL, 0);
+
+    SifInitRpc(0);
+    while (!SifIopReset("rom0:UDNL ", 0)) {
+    }
+    while (!SifIopSync()) {
+    }
+    SifInitRpc(0);
+    SifLoadFileInit();
+
+    _LoadExecPS2("rom0:OSDSYS", 0, NULL);
 }
 
-/* 忽略启动时仍按着的 START，松手后再按才退出 */
-static void waitStartToExit(void)
+/* 低优先级后台看 START；只唤醒主线程，真正退出走 main */
+static void padWatchThread(void *arg)
 {
     int armed = 0;
 
-    scr_printf("Press START to exit\n");
+    (void)arg;
     while (1) {
-        int held = padStartHeld();
+        if (!pfsnetPadPollAllowed()) {
+            /* 收发中或停传未满 2 秒：不碰手柄，松开 START 后才重新武装 */
+            armed = 0;
+            DelayThread(PAD_POLL_US);
+            continue;
+        }
 
-        if (!held)
-            armed = 1;
-        else if (armed)
-            safeExitElf();
-        DelayThread(50000);
+        {
+            int held = padStartHeld();
+
+            if (!held)
+                armed = 1;
+            else if (armed && g_mainTid > 0)
+                WakeupThread(g_mainTid);
+        }
+        DelayThread(PAD_POLL_US);
     }
+}
+
+static void startPadWatch(void)
+{
+    ee_thread_t th;
+    int tid;
+
+    if (g_padWatchStarted)
+        return;
+    memset(&th, 0, sizeof(th));
+    th.func = &padWatchThread;
+    th.stack = g_padStack;
+    th.stack_size = sizeof(g_padStack);
+    th.gp_reg = &_gp;
+    th.initial_priority = PAD_WATCH_PRIO;
+    tid = CreateThread(&th);
+    if (tid <= 0)
+        return;
+    StartThread(tid, NULL);
+    g_padWatchStarted = 1;
+}
+
+/* 出错停住：提示后睡主线程，按键交给后台线程，醒来后安全退出 */
+static void waitStartToExit(void)
+{
+    scr_printf("Press START to exit\n");
+    startPadWatch();
+    SleepThread();
+    safeExitElf();
 }
 
 /* 与 362053534 OPL bdmLoadModules 相同顺序：BDM → FATFS → USBD → usbmass_bd */
@@ -190,22 +247,19 @@ static int applyDhcp(PfsNetIpConfig *cfg)
 static void applyStatic(PfsNetIpConfig *cfg)
 {
     cfg->useDhcp = 0;
+    scr_printf("Applying static IP...\n");
+    /* 栈已在 DHCP 阶段初始化；ethInit(0) 只切静态，不再等 DHCP。
+     * 链路已在第一轮确认过，不再走 ethWaitLinkAndDhcp，避免无谓等待。 */
     if (ethInit(0, &cfg->ip, &cfg->nm, &cfg->gw) < 0)
         scr_printf("WARN: ethInit(static) failed\n");
-    ethWaitLinkAndDhcp(0);
     if (ethApplyIPConfig(0, &cfg->ip, &cfg->nm, &cfg->gw) < 0)
         scr_printf("WARN: setconfig(static) failed\n");
 }
 
-static void applyDefaultStatic(PfsNetIpConfig *cfg)
+static void failNoIp(void)
 {
-    cfg->source = PFSNET_IP_SRC_STATIC;
-    strncpy(cfg->sourcePath, "192.168.0.10/24", sizeof(cfg->sourcePath) - 1);
-    cfg->sourcePath[sizeof(cfg->sourcePath) - 1] = '\0';
-    IP4_ADDR(&cfg->ip, 192, 168, 0, 10);
-    IP4_ADDR(&cfg->nm, 255, 255, 255, 0);
-    IP4_ADDR(&cfg->gw, 192, 168, 0, 1);
-    applyStatic(cfg);
+    scr_printf("FATAL: failed to obtain an IP address\n");
+    waitStartToExit();
 }
 
 int main(int argc, char *argv[])
@@ -214,6 +268,7 @@ int main(int argc, char *argv[])
     PfsNetIpConfig cfg;
 
     /* 先 init_scr 再 SifIopReset（与 HDDTester 一致），复位前挂死时仍有屏显。 */
+    g_mainTid = GetThreadId();
     init_scr();
     scr_clear();
     scr_printf("PfsNetServer\n");
@@ -235,7 +290,6 @@ int main(int argc, char *argv[])
 
     loadMcStack();
     padSetup();
-    loadUsbStack();
     loadModuleBuffer(POWEROFF_irx, size_POWEROFF_irx, 0, NULL);
     loadModuleBuffer(DEV9_irx, size_DEV9_irx, 0, NULL);
     loadHddStack();
@@ -261,42 +315,33 @@ int main(int argc, char *argv[])
     }
 
     /*
-     * 1) 先 DHCP（applyDhcp）。
-     * 2) 失败再读网络配置：静态就 applyStatic；文件写 DHCP 则再调一次 applyDhcp（同一套函数），
-     *    不是跳回「第一阶段」。仍失败才用文件里的静态或默认地址。
+     * 1) DHCP
+     * 2) 失败：OPL conf_network.cfg 里的静态地址（不再跑 OPL DHCP）
+     * 3) 再失败：uLE IPCONFIG.DAT
+     * 4) 仍没有可用地址：报错，按 START 退出（不写兜底 IP）
      */
     pfsnetIpConfigInitDefault(&cfg);
     if (applyDhcp(&cfg) < 0) {
+        const char *bootPath = (argc > 0) ? argv[0] : NULL;
         PfsNetIpConfig fileCfg;
 
         scr_printf("DHCP failed, read network cfg\n");
-        pfsnetIpConfigInitDefault(&fileCfg);
-        pfsnetLoadIpConfig(&fileCfg, (argc > 0) ? argv[0] : NULL);
-        printIpConfig(&fileCfg);
+        loadUsbStack();
 
-        if (!fileCfg.useDhcp && !ip4_addr_isany_val(fileCfg.ip)) {
+        if (pfsnetLoadOplStatic(&fileCfg, bootPath) == 0) {
+            printIpConfig(&fileCfg);
             cfg = fileCfg;
             applyStatic(&cfg);
-        } else if (fileCfg.useDhcp && fileCfg.source == PFSNET_IP_SRC_OPL) {
-            cfg = fileCfg;
-            if (applyDhcp(&cfg) < 0) {
-                scr_printf("DHCP (from cfg) failed, static fallback\n");
-                if (ip4_addr_isany_val(fileCfg.ip))
-                    applyDefaultStatic(&cfg);
-                else {
-                    cfg = fileCfg;
-                    applyStatic(&cfg);
-                }
-            }
-        } else if (fileCfg.source == PFSNET_IP_SRC_IPCONFIG) {
+        } else if (pfsnetLoadUleStatic(&fileCfg, bootPath) == 0) {
+            printIpConfig(&fileCfg);
             cfg = fileCfg;
             applyStatic(&cfg);
         } else {
-            applyDefaultStatic(&cfg);
+            failNoIp();
         }
     }
 
-    /* 清屏后只保留最终状态；无链路则拒绝启服 */
+    /* 清屏后只保留最终状态；链路用 DHCP 阶段缓存，不再 NetManIoctl */
     ethGetIpDisplay(ipText, sizeof(ipText));
     scr_clear();
     scr_printf("PfsNetServer\n");
@@ -320,6 +365,9 @@ int main(int argc, char *argv[])
         waitStartToExit();
     }
 
-    waitStartToExit();
+    scr_printf("Press START to exit\n");
+    startPadWatch();
+    SleepThread();
+    safeExitElf();
     return 0;
 }

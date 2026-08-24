@@ -80,15 +80,11 @@ static void joinPrefix(char *out, int outMax, const char *prefix, const char *na
         snprintf(out, outMax, "%s/%s", prefix, name);
 }
 
-static int prefixHasNetworkFile(const char *prefix)
+static int prefixHasFile(const char *prefix, const char *name)
 {
     char path[96];
 
-    /* 只认网络文件，不读 conf_opl.cfg */
-    joinPrefix(path, sizeof(path), prefix, "conf_network.cfg");
-    if (fileExists(path))
-        return 1;
-    joinPrefix(path, sizeof(path), prefix, "IPCONFIG.DAT");
+    joinPrefix(path, sizeof(path), prefix, name);
     return fileExists(path);
 }
 
@@ -242,18 +238,25 @@ static int loadIpconfigFile(const char *path, PfsNetIpConfig *cfg)
     return parseIpconfigText(buf, cfg, path);
 }
 
-/* 从选定前缀读网络配置：先 conf_network.cfg，没有再 IPCONFIG.DAT */
-static int loadNetworkFromPrefix(const char *prefix, PfsNetIpConfig *cfg)
+static int loadOplFromPrefix(const char *prefix, PfsNetIpConfig *cfg)
 {
     char path[96];
 
     joinPrefix(path, sizeof(path), prefix, "conf_network.cfg");
-    if (loadOplNetworkFile(path, cfg) == 0)
-        return 0;
+    return loadOplNetworkFile(path, cfg);
+}
+
+static int loadIpconfigFromPrefix(const char *prefix, PfsNetIpConfig *cfg)
+{
+    char path[96];
+
     joinPrefix(path, sizeof(path), prefix, "IPCONFIG.DAT");
-    if (loadIpconfigFile(path, cfg) == 0)
-        return 0;
-    return -1;
+    return loadIpconfigFile(path, cfg);
+}
+
+static int staticIpUsable(const PfsNetIpConfig *cfg)
+{
+    return cfg && !ip4_addr_isany_val(cfg->ip) && !ip4_addr_isany_val(cfg->nm);
 }
 
 /* 记忆卡 uLE 遗留路径：OPL configInit(NULL) 时 legacy 固定为 mc?:SYS-CONF/IPCONFIG.DAT */
@@ -274,7 +277,7 @@ static int loadMcLegacyIpconfig(PfsNetIpConfig *cfg)
     return -1;
 }
 
-static int findMcOplPrefix(char *outPrefix, int outMax)
+static int findMcPrefix(char *outPrefix, int outMax, const char *filename)
 {
     static const char *prefixes[] = {
         "mc0:/OPL/",
@@ -285,7 +288,7 @@ static int findMcOplPrefix(char *outPrefix, int outMax)
     unsigned int i;
 
     for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        if (!prefixHasNetworkFile(prefixes[i]))
+        if (!prefixHasFile(prefixes[i], filename))
             continue;
         strncpy(outPrefix, prefixes[i], outMax - 1);
         outPrefix[outMax - 1] = '\0';
@@ -294,21 +297,20 @@ static int findMcOplPrefix(char *outPrefix, int outMax)
     return -1;
 }
 
-static int findBdmOplPrefixOnce(char *outPrefix, int outMax)
+static int findBdmPrefixOnce(char *outPrefix, int outMax, const char *filename)
 {
     char prefix[40];
     int i;
 
-    /* 362053534 设备顺序：mass0–4 根目录，再 massN:OPL/（只找网络文件） */
     for (i = 0; i < PFSNET_MAX_BDM_DEVICES; i++) {
         snprintf(prefix, sizeof(prefix), "mass%d:", i);
-        if (prefixHasNetworkFile(prefix)) {
+        if (prefixHasFile(prefix, filename)) {
             strncpy(outPrefix, prefix, outMax - 1);
             outPrefix[outMax - 1] = '\0';
             return 0;
         }
         snprintf(prefix, sizeof(prefix), "mass%d:OPL/", i);
-        if (prefixHasNetworkFile(prefix)) {
+        if (prefixHasFile(prefix, filename)) {
             strncpy(outPrefix, prefix, outMax - 1);
             outPrefix[outMax - 1] = '\0';
             return 0;
@@ -317,16 +319,15 @@ static int findBdmOplPrefixOnce(char *outPrefix, int outMax)
     return -1;
 }
 
-/* 扫 mass0–mass4 的 conf_network.cfg / IPCONFIG.DAT；U 盘枚举需要等一会儿 */
-static int findBdmOplPrefix(char *outPrefix, int outMax)
+static int findBdmPrefix(char *outPrefix, int outMax, const char *filename)
 {
     int retry;
 
-    if (findBdmOplPrefixOnce(outPrefix, outMax) == 0)
+    if (findBdmPrefixOnce(outPrefix, outMax, filename) == 0)
         return 0;
     for (retry = 0; retry < PFSNET_USB_RETRY; retry++) {
         DelayThread(PFSNET_USB_RETRY_US);
-        if (findBdmOplPrefixOnce(outPrefix, outMax) == 0)
+        if (findBdmPrefixOnce(outPrefix, outMax, filename) == 0)
             return 0;
     }
     return -1;
@@ -380,7 +381,7 @@ static int readHddPartitionName(char *outName, int outMax)
  * 读 __common/OPL/conf_hdd.cfg 得到分区（默认 +OPL），挂到 pfs0:。
  * 分区名以 + 开头时配置在根目录；否则在 pfs0:OPL/。
  */
-static int findHddOplPrefix(char *outPrefix, int outMax)
+static int findHddPrefix(char *outPrefix, int outMax, const char *filename)
 {
     char partName[40];
     char device[48];
@@ -430,10 +431,11 @@ static int findHddOplPrefix(char *outPrefix, int outMax)
     else
         prefix = "pfs0:OPL/";
 
-    if (!prefixHasNetworkFile(prefix) && strcmp(prefix, "pfs0:") == 0 && prefixHasNetworkFile("pfs0:OPL/"))
+    if (!prefixHasFile(prefix, filename) && strcmp(prefix, "pfs0:") == 0
+        && prefixHasFile("pfs0:OPL/", filename))
         prefix = "pfs0:OPL/";
 
-    if (!prefixHasNetworkFile(prefix)) {
+    if (!prefixHasFile(prefix, filename)) {
         fileXioUmount(PFSNET_MOUNT_POINT);
         return -1;
     }
@@ -466,11 +468,30 @@ static int bootIsHdd(const char *bootPath)
     return 0;
 }
 
-static int loadFromDevicePrefix(const char *prefix, PfsNetIpConfig *cfg)
+static int findPrefixForFile(char *outPrefix, int outMax, const char *bootPath, const char *filename)
 {
-    int r = loadNetworkFromPrefix(prefix, cfg);
-    umountHddConfig(prefix);
-    return r;
+    int found = 0;
+    int usbTried = 0;
+    int hddTried = 0;
+
+    if (findMcPrefix(outPrefix, outMax, filename) == 0)
+        return 0;
+
+    if (bootIsMass(bootPath)) {
+        usbTried = 1;
+        if (findBdmPrefix(outPrefix, outMax, filename) == 0)
+            found = 1;
+    } else if (bootIsHdd(bootPath)) {
+        hddTried = 1;
+        if (findHddPrefix(outPrefix, outMax, filename) == 0)
+            found = 1;
+    }
+
+    if (!found && !usbTried && findBdmPrefix(outPrefix, outMax, filename) == 0)
+        found = 1;
+    if (!found && !hddTried && findHddPrefix(outPrefix, outMax, filename) == 0)
+        found = 1;
+    return found ? 0 : -1;
 }
 
 void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg)
@@ -480,70 +501,53 @@ void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->useDhcp = 1;
     cfg->source = PFSNET_IP_SRC_DHCP;
-    IP4_ADDR(&cfg->ip, 192, 168, 0, 10);
-    IP4_ADDR(&cfg->nm, 255, 255, 255, 0);
-    IP4_ADDR(&cfg->gw, 192, 168, 0, 1);
     strncpy(cfg->sourcePath, "DHCP", sizeof(cfg->sourcePath) - 1);
 }
 
-int pfsnetLoadIpConfig(PfsNetIpConfig *cfg, const char *bootPath)
+int pfsnetLoadOplStatic(PfsNetIpConfig *cfg, const char *bootPath)
 {
     PfsNetIpConfig fileCfg;
-    PfsNetIpConfig fallback;
     char prefix[40];
-    int mcHasOpl;
-    int haveFallback = 0;
 
     if (!cfg)
         return -1;
-
-    /*
-     * 只搜网络文件（conf_network.cfg / IPCONFIG.DAT），不读 conf_opl.cfg。
-     * 按原样返回文件：静态则 useDhcp=0；ps2_ip_use_dhcp=1 则 useDhcp=1（由调用方 applyDhcp）。
-     */
-    pfsnetIpConfigInitDefault(cfg);
-    memset(&fallback, 0, sizeof(fallback));
-
-    mcHasOpl = (findMcOplPrefix(prefix, sizeof(prefix)) == 0);
-    if (mcHasOpl) {
-        if (loadNetworkFromPrefix(prefix, &fileCfg) == 0)
-            fallback = fileCfg, haveFallback = 1;
+    memset(&fileCfg, 0, sizeof(fileCfg));
+    if (findPrefixForFile(prefix, sizeof(prefix), bootPath, "conf_network.cfg") < 0)
+        return -1;
+    if (loadOplFromPrefix(prefix, &fileCfg) < 0) {
+        umountHddConfig(prefix);
+        return -1;
     }
-    if (!haveFallback && loadMcLegacyIpconfig(&fileCfg) == 0)
-        fallback = fileCfg, haveFallback = 1;
+    umountHddConfig(prefix);
+    if (!staticIpUsable(&fileCfg))
+        return -1;
+    fileCfg.useDhcp = 0;
+    *cfg = fileCfg;
+    return 0;
+}
 
-    if (!haveFallback) {
-        int foundAlt = 0;
-        int usbTried = 0;
-        int hddTried = 0;
+int pfsnetLoadUleStatic(PfsNetIpConfig *cfg, const char *bootPath)
+{
+    PfsNetIpConfig fileCfg;
+    char prefix[40];
 
-        if (bootIsMass(bootPath)) {
-            usbTried = 1;
-            if (findBdmOplPrefix(prefix, sizeof(prefix)) == 0)
-                foundAlt = 1;
-        } else if (bootIsHdd(bootPath)) {
-            hddTried = 1;
-            if (findHddOplPrefix(prefix, sizeof(prefix)) == 0)
-                foundAlt = 1;
-        }
-
-        if (!foundAlt && !usbTried && findBdmOplPrefix(prefix, sizeof(prefix)) == 0)
-            foundAlt = 1;
-        if (!foundAlt && !hddTried && findHddOplPrefix(prefix, sizeof(prefix)) == 0)
-            foundAlt = 1;
-
-        if (foundAlt && loadFromDevicePrefix(prefix, &fileCfg) == 0) {
-            fallback = fileCfg;
-            haveFallback = 1;
-        } else if (foundAlt) {
-            umountHddConfig(prefix);
-        }
-    }
-
-    if (!haveFallback)
+    if (!cfg)
+        return -1;
+    memset(&fileCfg, 0, sizeof(fileCfg));
+    if (loadMcLegacyIpconfig(&fileCfg) == 0 && staticIpUsable(&fileCfg)) {
+        *cfg = fileCfg;
         return 0;
-
-    *cfg = fallback;
+    }
+    if (findPrefixForFile(prefix, sizeof(prefix), bootPath, "IPCONFIG.DAT") < 0)
+        return -1;
+    if (loadIpconfigFromPrefix(prefix, &fileCfg) < 0) {
+        umountHddConfig(prefix);
+        return -1;
+    }
+    umountHddConfig(prefix);
+    if (!staticIpUsable(&fileCfg))
+        return -1;
+    *cfg = fileCfg;
     return 0;
 }
 

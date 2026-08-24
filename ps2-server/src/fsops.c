@@ -546,30 +546,39 @@ static int xferSendAll(int sock, const void *buf, int len)
 {
     const char *ptr = (const char *)buf;
     int sent = 0;
+    int ok = 1;
 
+    pfsnetTrafficBegin();
     while (sent < len) {
         int n = send(sock, ptr + sent, len - sent, 0);
         if (n > 0) {
             sent += n;
             continue;
         }
-        /* 阻塞 socket：成功路径不应休眠；n<=0 视为硬错误 */
-        return -1;
+        ok = 0;
+        break;
     }
-    return sent;
+    pfsnetTrafficEnd();
+    return ok ? sent : -1;
 }
 
 static int xferRecvAll(int sock, void *buf, int len)
 {
     char *ptr = (char *)buf;
     int got = 0;
+    int ok = 1;
+
+    pfsnetTrafficBegin();
     while (got < len) {
         int n = recv(sock, ptr + got, len - got, 0);
-        if (n <= 0)
-            return -1;
+        if (n <= 0) {
+            ok = 0;
+            break;
+        }
         got += n;
     }
-    return got;
+    pfsnetTrafficEnd();
+    return ok ? got : -1;
 }
 
 static void ioWorker(void *arg)

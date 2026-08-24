@@ -69,14 +69,21 @@ static int WaitValidNetState(int (*checkingFunction)(void))
     return 0;
 }
 
+static int g_lastLinkUp;
+
 static int ethGetLinkStatus(void)
 {
-    return NetManIoctl(NETMAN_NETIF_IOCTL_GET_LINK_STATUS, NULL, 0, NULL, 0) == NETMAN_NETIF_ETH_LINK_STATE_UP;
+    int up = NetManIoctl(NETMAN_NETIF_IOCTL_GET_LINK_STATUS, NULL, 0, NULL, 0)
+             == NETMAN_NETIF_ETH_LINK_STATE_UP;
+
+    g_lastLinkUp = up;
+    return up;
 }
 
 int ethLinkIsUp(void)
 {
-    return ethGetLinkStatus();
+    /* DHCP 失败后停客户端再 ioctl 会卡死 IOP RPC；显示/判定用缓存 */
+    return g_lastLinkUp;
 }
 
 static int ethGetDhcpStatus(void)
@@ -112,6 +119,17 @@ static int ethApplyNetIFConfig(int mode)
     return result;
 }
 
+/* 362053534 libps2ip 导出；DHCP 超时后 dhcp_release() 会在主线程等发包，容易卡死 */
+void dhcp_stop(struct netif *netif);
+
+static void ethStopDhcpNoRelease(void)
+{
+    struct netif *nif = netif_find("sm0");
+
+    if (nif)
+        dhcp_stop(nif);
+}
+
 int ethApplyIPConfig(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw)
 {
     t_ip_info ip_info;
@@ -134,6 +152,9 @@ int ethApplyIPConfig(int use_dhcp, const struct ip4_addr *ip, const struct ip4_a
             ip4_addr_set_zero((struct ip4_addr *)&ip_info.gw);
             ip_info.dhcp_enabled = 1;
         } else {
+            /* 先停 DHCP 客户端，避免 setconfig 走 dhcp_release() 卡死 */
+            if (ip_info.dhcp_enabled)
+                ethStopDhcpNoRelease();
             ip4_addr_set((struct ip4_addr *)&ip_info.ipaddr, ip);
             ip4_addr_set((struct ip4_addr *)&ip_info.netmask, nm);
             ip4_addr_set((struct ip4_addr *)&ip_info.gw, gw);

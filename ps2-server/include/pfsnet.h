@@ -34,8 +34,9 @@ typedef struct PfsNetIpConfig {
 } PfsNetIpConfig;
 
 void pfsnetIpConfigInitDefault(PfsNetIpConfig *cfg);
-/* bootPath 为 argv[0]，用于 OPL 式「先搜启动设备」；可为 NULL */
-int pfsnetLoadIpConfig(PfsNetIpConfig *cfg, const char *bootPath);
+/* bootPath 为 argv[0]，用于先搜启动设备；可为 NULL。成功返回 0 且为可用静态地址。 */
+int pfsnetLoadOplStatic(PfsNetIpConfig *cfg, const char *bootPath);
+int pfsnetLoadUleStatic(PfsNetIpConfig *cfg, const char *bootPath);
 const char *pfsnetIpSourceName(int source);
 
 int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw);
@@ -54,6 +55,11 @@ int pfsnetHandleCommand(struct PfsNetClient *client, uint32_t command, const uin
 
 int pfsnetStartServer(void);
 void pfsnetStopServer(void);
+
+/* 有收发时禁止手柄轮询；停传后满 2 秒才允许再轮询 */
+void pfsnetTrafficBegin(void);
+void pfsnetTrafficEnd(void);
+int pfsnetPadPollAllowed(void);
 
 /* 从载荷读取 length-prefixed UTF-8 字符串；成功返回消耗字节数，失败 <0 */
 int pfsnetReadString(const uint8_t *payload, uint32_t payloadLen, uint32_t offset, char *out, int outMax, uint32_t *consumed);
