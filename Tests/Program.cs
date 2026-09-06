@@ -1,5 +1,6 @@
 using System.Text;
 using PfsExplorerLite.Services;
+using PfsExplorerLite.Services.PfsNet;
 
 var utf8 = new UTF8Encoding(false);
 var latin1 = Encoding.Latin1;
@@ -45,5 +46,11 @@ Expect(open.Contains("仍打开", StringComparison.Ordinal), "VetoType 5 mention
 var ready = DiskSafeEject.NonHotPlugReadyMessage(0);
 Expect(ready.Contains("已可安全移除", StringComparison.Ordinal), "non-hotplug disks get a short safe-to-remove hint");
 Expect(!ready.Contains("断电", StringComparison.Ordinal), "safe-to-remove hint does not mention power cables");
+
+var popsErr = PfsNetProtocol.FormatCommandError(PfsNetProtocol.CmdApaRemove, PfsNetProtocol.ErrIo, "__.POPS");
+Expect(popsErr.Contains("__.POPS", StringComparison.Ordinal), "PfsNet delete error names the partition");
+Expect(popsErr.Contains("禁止删除以 __ 开头", StringComparison.Ordinal), "PfsNet delete error explains APA __ protection");
+var genericErr = PfsNetProtocol.FormatCommandError(PfsNetProtocol.CmdPing, PfsNetProtocol.ErrBusy);
+Expect(genericErr.Contains("result=-9", StringComparison.Ordinal), "generic PfsNet errors still include result code");
 
 Environment.Exit(failed);

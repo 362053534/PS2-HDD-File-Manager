@@ -158,6 +158,9 @@ static int mapErrno(int err)
         return PFSNET_ERR_BUSY;
     if (err == -22 || err == -EINVAL)
         return PFSNET_ERR_INVAL;
+    /* APA 拒绝删除 __ 前缀分区时返回 -EACCES(13)；勿落到笼统 ERR_IO(-2) */
+    if (err == -13 || err == -EACCES)
+        return PFSNET_ERR_INVAL;
     return PFSNET_ERR_IO;
 }
 
@@ -1219,8 +1222,13 @@ static int handleApaRemove(struct PfsNetClient *client, const uint8_t *payload, 
     uint32_t consumed = 0;
     int rc, rv;
 
-    if (g_mounted || g_xfer.kind != PFSNET_XFER_NONE)
+    if (g_xfer.kind != PFSNET_XFER_NONE)
         return pfsnetSendResponse(client, PFSNET_ERR_BUSY, NULL, 0);
+    if (g_mounted) {
+        rc = doUmount();
+        if (rc != PFSNET_OK)
+            return pfsnetSendResponse(client, rc, NULL, 0);
+    }
 
     rc = pfsnetReadString(payload, payloadLen, 0, name, sizeof(name), &consumed);
     if (rc != PFSNET_OK)
@@ -1228,6 +1236,9 @@ static int handleApaRemove(struct PfsNetClient *client, const uint8_t *payload, 
     if (name[0] == '\0' || isSystemPartitionName(name))
         return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
 
+    /* 标准 IOP ps2hdd 会拒绝删除任意 __ 前缀分区（-EACCES）。
+     * __.POPS 等不是 __mbr/__common，PC 允许删，但未定义
+     * APA_ALLOW_REMOVE_PARTITION_WITH_LEADING_UNDERSCORE 的 IRX 仍会失败。 */
     snprintf(path, sizeof(path), "hdd0:%s", name);
     rv = fileXioRemove(path);
     return pfsnetSendResponse(client, mapErrno(rv), NULL, 0);

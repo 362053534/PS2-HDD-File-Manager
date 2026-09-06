@@ -70,6 +70,39 @@ internal static class PfsNetProtocol
             return null;
         return devicePath[DevicePrefix.Length..].Trim();
     }
+
+    public static string DescribeResult(int result) => result switch
+    {
+        Ok => "成功",
+        ErrGeneric => "通用错误",
+        ErrIo => "I/O 错误",
+        ErrNoEnt => "不存在",
+        ErrExist => "已存在",
+        ErrNotEmpty => "目录非空",
+        ErrNoSpc => "空间不足",
+        ErrInval => "参数无效或被拒绝",
+        ErrNotMounted => "未挂载",
+        ErrBusy => "设备忙（请先卸载分区）",
+        ErrUnsupported => "命令不受支持",
+        ErrVersion => "协议版本不匹配",
+        ErrMagic => "握手魔数不匹配",
+        ErrDataConn => "数据通道失败",
+        _ => $"错误 {result}"
+    };
+
+    public static string FormatCommandError(uint command, int result, string? partitionName = null)
+    {
+        if (command == CmdApaRemove
+            && partitionName is { Length: >= 2 }
+            && partitionName.StartsWith("__", StringComparison.Ordinal)
+            && (result == ErrIo || result == ErrInval))
+        {
+            return $"无法删除分区“{partitionName}”：PS2 端 APA 驱动禁止删除以 __ 开头的分区（返回 {DescribeResult(result)}）。" +
+                   "这与本地 pfsshell 不同；__.POPS 等需使用允许删除 __ 前缀的 ps2hdd.irx（APA_ALLOW_REMOVE_PARTITION_WITH_LEADING_UNDERSCORE）。";
+        }
+
+        return $"PfsNet 命令 0x{command:X4} 失败（{DescribeResult(result)}，result={result}）。";
+    }
 }
 
 internal readonly record struct PfsNetPartitionInfo(string Name, bool IsSystem, bool IsPfs, ulong TotalBytes);

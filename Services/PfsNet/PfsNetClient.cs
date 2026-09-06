@@ -228,10 +228,24 @@ internal sealed class PfsNetClient : IDisposable
         {
             EnsureConnected();
             EnsureApaMutate();
+            if (_mountedPartition is not null)
+            {
+                await SendSimpleAsync(PfsNetProtocol.CmdUmount, ReadOnlyMemory<byte>.Empty, ct);
+                _mountedPartition = null;
+            }
             using var ms = new MemoryStream();
             using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
                 PfsNetCodec.WriteString(writer, name);
-            await SendSimpleAsync(PfsNetProtocol.CmdApaRemove, ms.ToArray(), ct);
+            try
+            {
+                await SendSimpleAsync(PfsNetProtocol.CmdApaRemove, ms.ToArray(), ct);
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw new InvalidOperationException(
+                    PfsNetProtocol.FormatCommandError(PfsNetProtocol.CmdApaRemove, TryParseResult(ex.Message) ?? PfsNetProtocol.ErrIo, name),
+                    ex);
+            }
         }, cancellationToken);
 
     public Task ApaRenameAsync(string oldName, string newName, CancellationToken cancellationToken) =>
@@ -594,8 +608,23 @@ internal sealed class PfsNetClient : IDisposable
             await PfsNetCodec.ReadExactAsync(_stream!, body, cancellationToken);
 
         if (result != PfsNetProtocol.Ok)
-            throw new InvalidOperationException($"PfsNet 命令 0x{command:X4} 失败（result={result}）。");
+            throw new InvalidOperationException(PfsNetProtocol.FormatCommandError(command, result));
         return body;
+    }
+
+    private static int? TryParseResult(string message)
+    {
+        const string marker = "result=";
+        var start = message.LastIndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+            return null;
+        start += marker.Length;
+        var end = start;
+        if (end < message.Length && message[end] == '-')
+            end++;
+        while (end < message.Length && char.IsDigit(message[end]))
+            end++;
+        return int.TryParse(message[start..end], out var value) ? value : null;
     }
 
     private async Task<T> WithLockAsync<T>(Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken)
