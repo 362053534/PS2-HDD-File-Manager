@@ -1264,20 +1264,20 @@ internal sealed class MainForm : Form
 
     private async Task PasteImportAsync()
     {
-        if (!Clipboard.ContainsFileDropList())
+        if (!WindowsClipboardFiles.ContainsImportableItems())
         {
             ShowWarning("Windows 剪贴板中没有可导入的文件。请先在资源管理器中复制文件。");
             return;
         }
 
-        var paths = Clipboard.GetFileDropList().Cast<string>().ToArray();
-        var items = paths.Where(path => File.Exists(path) || Directory.Exists(path)).ToArray();
+        var items = WindowsClipboardFiles.GetPaths();
         if (items.Length == 0)
         {
             ShowWarning("剪贴板中没有可导入的文件或目录。");
             return;
         }
 
+        AppendLog($"从 Windows 剪贴板解析到 {items.Length} 个项目。");
         await ImportLocalItemsAsync(items);
     }
 
@@ -2529,11 +2529,7 @@ internal sealed class MainForm : Form
         return PfsNetProtocol.IsNetworkDevice(device) ? pfsName : PfsNameEncoding.ToShell(pfsName);
     }
 
-    private static bool ClipboardHasImportableItems()
-    {
-        if (!Clipboard.ContainsFileDropList()) return false;
-        return Clipboard.GetFileDropList().Cast<string>().Any(path => File.Exists(path) || Directory.Exists(path));
-    }
+    private static bool ClipboardHasImportableItems() => WindowsClipboardFiles.ContainsImportableItems();
 
     private static int CountImportFiles(IEnumerable<string> items)
     {
