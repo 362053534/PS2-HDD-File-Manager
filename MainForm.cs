@@ -1189,7 +1189,7 @@ internal sealed class MainForm : Form
     private async Task GoUpAsync()
     {
         if (_activePartition is null) return;
-        var parts = _currentPath.Split('/', StringSplitOptions.RemoveEmptyEntries).ToList();
+        var parts = PfsNameEncoding.SplitRemotePath(_currentPath).ToList();
         if (parts.Count == 0)
         {
             if (TryGetDevice(out var device) && PfsNetProtocol.IsNetworkDevice(device))
@@ -2478,7 +2478,7 @@ internal sealed class MainForm : Form
                 if (!File.Exists(localPath))
                 {
                     if (!string.IsNullOrWhiteSpace(result.CombinedOutput))
-                        AppendLog(result.CombinedOutput);
+                        AppendResult(result);
                     throw new InvalidOperationException($"无法读取 PFS 文件“{file.RelativePath}”。连接可能已断开。");
                 }
             }
@@ -2751,8 +2751,8 @@ internal sealed class MainForm : Form
     private PfsEntry? SelectedEntry() => _entries.SelectedItems.Count == 1 ? _entries.SelectedItems[0].Tag as PfsEntry : null;
     private IReadOnlyList<PfsEntry> SelectedEntries() => _entries.SelectedItems.Cast<ListViewItem>().Select(item => item.Tag as PfsEntry).OfType<PfsEntry>().ToList();
     private static string CombineRemotePath(string parent, string child) => (parent.TrimEnd('/') + "/" + child).Replace("//", "/");
-    private void AppendResult(ProcessResult result) => AppendLog(result.CombinedOutput);
-    private void AppendLog(string message) => _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {message.Trim()}{Environment.NewLine}");
+    private void AppendResult(ProcessResult result) => AppendLog(PfsNameEncoding.ToDisplay(result.CombinedOutput));
+    private void AppendLog(string message) => _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {PfsNameEncoding.TrimAscii(message)}{Environment.NewLine}");
     private void ShowWarning(string message) => MessageBox.Show(this, message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
     private void UpdateVirtualExportProgress(

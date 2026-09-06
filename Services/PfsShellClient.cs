@@ -291,8 +291,8 @@ internal sealed class PfsShellClient
         var entries = new List<PfsEntry>();
         foreach (var line in UsefulLines(output))
         {
-            var trimmed = line.Trim();
-            var listing = Regex.Match(trimmed, @"^(?<mode>[d-][rwx-]{9})\s+(?<size>\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(?<name>.+?)/*$");
+            var trimmed = PfsNameEncoding.TrimAscii(line);
+            var listing = Regex.Match(trimmed, @"^(?<mode>[d-][rwx-]{9})[ \t]+(?<size>\d+)[ \t]+\d{4}-\d{2}-\d{2}[ \t]+\d{2}:\d{2}[ \t]+(?<name>.+?)/*$");
             if (!listing.Success)
                 continue;
 
@@ -328,7 +328,7 @@ internal sealed class PfsShellClient
             .Where(line => !line.Equals("umount", StringComparison.OrdinalIgnoreCase));
 
     private static IReadOnlyList<string> PathParts(string path) =>
-        path.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        PfsNameEncoding.SplitRemotePath(path);
 
     // 只生成必要的 cd/cd ..，确保一批文件可以在同一挂载会话中写入不同目录。
     private static void AppendPathTransition(StringBuilder command, IReadOnlyList<string> currentPath, IReadOnlyList<string> targetPath)

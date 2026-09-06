@@ -20,7 +20,7 @@ internal static class ProcessRunner
         string? workingDirectory = null,
         Func<long, Task>? progress = null)
     {
-        // 默认 UTF-8 无 BOM，供 hdl_dump / wnbd 等工具；pfsshell 需传入系统 ANSI 编码。
+        // 默认 UTF-8 无 BOM，供 hdl_dump / wnbd 等工具；pfsshell 会话传入 Latin-1 以保真 UTF-8 字节。
         var textEncoding = encoding ?? new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
         var startInfo = new ProcessStartInfo(fileName, arguments)
         {

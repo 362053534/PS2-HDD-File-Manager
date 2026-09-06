@@ -86,9 +86,40 @@ internal static class PfsNameEncoding
         if (string.IsNullOrEmpty(remotePath) || remotePath == "/")
             return remotePath;
 
-        var parts = remotePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        return "/" + string.Join('/', parts.Select(ToDisplay));
+        return "/" + string.Join('/', SplitRemotePath(remotePath).Select(ToDisplay));
     }
+
+    /// <summary>
+    /// 按 '/' 拆 PFS 路径。不可使用 <see cref="StringSplitOptions.TrimEntries"/>：
+    /// UTF-8 经 Latin-1 保真后，末字节 0xA0（如「传」）会被当成 NBSP 剥掉，导致 cd 找不到目录。
+    /// </summary>
+    public static IReadOnlyList<string> SplitRemotePath(string path)
+    {
+        if (string.IsNullOrEmpty(path) || path == "/")
+            return Array.Empty<string>();
+
+        return path.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(TrimAscii)
+            .Where(static part => part.Length > 0)
+            .ToArray();
+    }
+
+    /// <summary>只去掉 ASCII 空白，保留 Latin-1 中的 0xA0 等 UTF-8 续字节。</summary>
+    public static string TrimAscii(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+
+        var start = 0;
+        var end = value.Length - 1;
+        while (start <= end && IsAsciiSpace(value[start]))
+            start++;
+        while (end >= start && IsAsciiSpace(value[end]))
+            end--;
+        return start == 0 && end == value.Length - 1 ? value : value[start..(end + 1)];
+    }
+
+    private static bool IsAsciiSpace(char c) => c is ' ' or '\t' or '\r' or '\n';
 
     private static string TruncateUtf8(string text, int maxBytes)
     {

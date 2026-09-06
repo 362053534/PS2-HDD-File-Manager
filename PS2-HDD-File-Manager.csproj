@@ -8,6 +8,7 @@
     <AssemblyName>PS2-HDD-File-Manager</AssemblyName>
     <RootNamespace>PfsExplorerLite</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
