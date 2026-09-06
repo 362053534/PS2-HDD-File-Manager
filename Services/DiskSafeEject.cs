@@ -19,8 +19,12 @@ internal static class DiskSafeEject
     private const uint FileShareWrite = 0x00000002;
     private const uint OpenExisting = 3;
     private const uint IoctlStorageGetDeviceNumber = 0x002D1080;
+    private const uint IoctlDiskFlushCache = 0x00074054;
     private const uint DnRemovable = 0x00004000;
     private const int CrSuccess = 0;
+    private const int CrRemoveVetoed = 0x17;
+    private const int PnpVetoOutstandingOpen = 5;
+    private const int PnpVetoIllegalDeviceRequest = 8;
 
     public static bool TryParsePhysicalDriveNumber(string devicePath, out int driveNumber)
     {
@@ -35,7 +39,7 @@ internal static class DiskSafeEject
         return int.TryParse(match.Groups["n"].Value, out driveNumber) && driveNumber >= 0;
     }
 
-    public static void EjectPhysicalDrive(int driveNumber)
+    public static DiskEjectOutcome EjectPhysicalDrive(int driveNumber)
     {
         if (driveNumber < 0)
             throw new ArgumentOutOfRangeException(nameof(driveNumber));
@@ -43,20 +47,67 @@ internal static class DiskSafeEject
         var instanceId = FindDiskInstanceId(driveNumber)
             ?? throw new InvalidOperationException($"未找到 PhysicalDrive{driveNumber} 对应的系统磁盘设备。");
 
-        var vetoName = new StringBuilder(260);
-        var lastError = $"无法弹出 PhysicalDrive{driveNumber}。";
-
-        foreach (var node in EnumerateEjectCandidates(instanceId))
+        var candidates = EnumerateEjectCandidates(instanceId).ToList();
+        if (candidates.Count == 0)
         {
-            vetoName.Clear();
-            var status = CM_Request_Device_Eject(node, out var vetoType, vetoName, vetoName.Capacity, 0);
-            if (status == CrSuccess)
-                return;
-
-            lastError = $"弹出 PhysicalDrive{driveNumber} 被拒绝（CfgMgr=0x{status:X8}, VetoType={vetoType}, Veto={vetoName}）。请确认没有其它程序占用该硬盘。";
+            FlushPhysicalDrive(driveNumber);
+            return DiskEjectOutcome.FlushedNonHotPlug;
         }
 
-        throw new InvalidOperationException(lastError);
+        string? firstError = null;
+        var vetoChars = new char[260];
+        foreach (var node in candidates)
+        {
+            Array.Clear(vetoChars);
+            var status = CM_Request_Device_Eject(node, out var vetoType, vetoChars, vetoChars.Length, 0);
+            if (status == CrSuccess)
+                return DiskEjectOutcome.Ejected;
+
+            var vetoName = new string(vetoChars).TrimEnd('\0');
+            firstError ??= FormatEjectFailure(driveNumber, status, vetoType, vetoName);
+        }
+
+        throw new InvalidOperationException(firstError ?? $"无法弹出 PhysicalDrive{driveNumber}。");
+    }
+
+    internal static string NonHotPlugReadyMessage(int driveNumber) =>
+        $"PhysicalDrive{driveNumber} 写入缓存已刷新，已可安全移除。";
+
+    private static void FlushPhysicalDrive(int driveNumber)
+    {
+        var path = $@"\\.\PhysicalDrive{driveNumber}";
+        var handle = CreateFile(path, GenericRead | GenericWrite, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            handle = CreateFile(path, GenericWrite, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            throw new InvalidOperationException($"无法打开 PhysicalDrive{driveNumber} 刷新写入缓存（Win32={Marshal.GetLastWin32Error()}）。请确认没有其它程序占用后再断电拔线。");
+
+        try
+        {
+            if (!FlushFileBuffers(handle))
+                throw new InvalidOperationException($"刷新 PhysicalDrive{driveNumber} 写入缓存失败（Win32={Marshal.GetLastWin32Error()}）。请勿立即断电拔线。");
+            DeviceIoControl(handle, IoctlDiskFlushCache, IntPtr.Zero, 0, IntPtr.Zero, 0, out _, IntPtr.Zero);
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
+    }
+
+    internal static string FormatEjectFailure(int driveNumber, int status, int vetoType, string vetoName)
+    {
+        var hint = vetoType switch
+        {
+            PnpVetoOutstandingOpen => "有程序仍打开着该硬盘上的文件或句柄。",
+            PnpVetoIllegalDeviceRequest => "该设备不支持弹出（常见于内置 SATA 硬盘，或 USB 桥只把磁盘节点标成 SCSI）。",
+            3 => "有 Windows 应用阻止弹出。",
+            4 => "有 Windows 服务阻止弹出。",
+            10 => "设备标记为不可禁用。",
+            12 => "权限不足。",
+            _ => status == CrRemoveVetoed ? "设备拒绝了弹出请求。" : "弹出失败。"
+        };
+        var veto = string.IsNullOrWhiteSpace(vetoName) ? "" : $"，Veto={vetoName}";
+        return $"弹出 PhysicalDrive{driveNumber} 被拒绝（CfgMgr=0x{status:X8}，VetoType={vetoType}{veto}）。{hint}";
     }
 
     private static string? FindDiskInstanceId(int driveNumber)
@@ -97,26 +148,38 @@ internal static class DiskSafeEject
         if (CM_Locate_DevNode(out var node, instanceId, 0) != CrSuccess)
             yield break;
 
-        // 优先弹出带 DN_REMOVABLE 的父设备（典型 USB 硬盘盒），再回退到磁盘节点本身。
-        var removableParents = new List<uint>();
+        // 只弹出热插拔节点（USB 盒 / DN_REMOVABLE）。不要把内部 SCSI 磁盘当候选：
+        // 那会得到 VetoType=8 PNP_VetoIllegalDeviceRequest，并盖住真正的失败原因。
+        var diskRemovable = CM_Get_DevNode_Status(out var diskStatus, out _, node, 0) == CrSuccess
+            && (diskStatus & DnRemovable) != 0;
         var current = node;
         for (var depth = 0; depth < 12; depth++)
         {
-            if (CM_Get_DevNode_Status(out var status, out _, current, 0) == CrSuccess
-                && (status & DnRemovable) != 0
-                && current != node)
-            {
-                removableParents.Add(current);
-            }
+            if (current != node && IsEjectableNode(current))
+                yield return current;
 
             if (CM_Get_Parent(out var parent, current, 0) != CrSuccess)
                 break;
             current = parent;
         }
 
-        foreach (var parent in removableParents)
-            yield return parent;
-        yield return node;
+        if (diskRemovable)
+            yield return node;
+    }
+
+    private static bool IsEjectableNode(uint node)
+    {
+        if (CM_Get_DevNode_Status(out var status, out _, node, 0) == CrSuccess
+            && (status & DnRemovable) != 0)
+            return true;
+
+        var id = new StringBuilder(512);
+        if (CM_Get_Device_ID(node, id, id.Capacity, 0) != CrSuccess)
+            return false;
+
+        var instanceId = id.ToString();
+        return instanceId.StartsWith(@"USBSTOR\", StringComparison.OrdinalIgnoreCase)
+            || instanceId.StartsWith(@"USB\", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryGetInterfaceDetail(
@@ -257,10 +320,13 @@ internal static class DiskSafeEject
     private static extern int CM_Get_DevNode_Status(out uint pulStatus, out uint pulProblemNumber, uint dnDevInst, int ulFlags);
 
     [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_ID(uint dnDevInst, StringBuilder buffer, int bufferLen, int ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
     private static extern int CM_Request_Device_Eject(
         uint dnDevInst,
         out int pVetoType,
-        StringBuilder pszVetoName,
+        char[] pszVetoName,
         int ulNameLength,
         int ulFlags);
 
@@ -286,5 +352,14 @@ internal static class DiskSafeEject
         IntPtr lpOverlapped);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FlushFileBuffers(IntPtr hFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
+}
+
+internal enum DiskEjectOutcome
+{
+    Ejected,
+    FlushedNonHotPlug
 }

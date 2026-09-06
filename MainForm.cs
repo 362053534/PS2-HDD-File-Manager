@@ -994,14 +994,27 @@ internal sealed class MainForm : Form
             return;
         }
 
+        var ejected = false;
+        var outcome = DiskEjectOutcome.Ejected;
         await RunBusyAsync($"正在安全弹出 PhysicalDrive{driveNumber}…", async () =>
         {
-            await Task.Run(() => DiskSafeEject.EjectPhysicalDrive(driveNumber));
-            AppendLog($"已请求安全弹出 PhysicalDrive{driveNumber}。");
+            outcome = await Task.Run(() => DiskSafeEject.EjectPhysicalDrive(driveNumber));
+            ejected = true;
+            AppendLog(outcome == DiskEjectOutcome.FlushedNonHotPlug
+                ? DiskSafeEject.NonHotPlugReadyMessage(driveNumber)
+                : $"已请求安全弹出 PhysicalDrive{driveNumber}。");
         });
+        if (!ejected)
+            return;
 
         RemoveSelectedSourceDevice();
         ResetPfsExplorer();
+        if (outcome == DiskEjectOutcome.FlushedNonHotPlug)
+        {
+            ShowInfo(DiskSafeEject.NonHotPlugReadyMessage(driveNumber) + "\n\n硬盘已从列表移除。");
+            return;
+        }
+
         AppendLog("硬盘已从列表移除。若托盘仍提示可安全移除，请再确认硬件指示灯熄灭后拔出。");
     }
 
@@ -2754,6 +2767,7 @@ internal sealed class MainForm : Form
     private void AppendResult(ProcessResult result) => AppendLog(PfsNameEncoding.ToDisplay(result.CombinedOutput));
     private void AppendLog(string message) => _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {PfsNameEncoding.TrimAscii(message)}{Environment.NewLine}");
     private void ShowWarning(string message) => MessageBox.Show(this, message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    private void ShowInfo(string message) => MessageBox.Show(this, message, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
 
     private void UpdateVirtualExportProgress(
         VirtualExportProgressState progress,

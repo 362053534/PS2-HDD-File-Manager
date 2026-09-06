@@ -37,4 +37,13 @@ Expect(PfsNameEncoding.ToDisplay(PfsNameEncoding.ToShell(unicode)) == unicode, "
 var ascii = PfsNameEncoding.SplitRemotePath("/POPS/ /FTG-TQ3/");
 Expect(ascii.SequenceEqual(["POPS", "FTG-TQ3"]), "ASCII spaces around parts still trimmed");
 
+var illegal = DiskSafeEject.FormatEjectFailure(0, 0x17, 8, @"SCSI\Disk&Ven_WDC&Prod_WD5000AZLX-60K2T\4&2ce709f8&0&060000");
+Expect(illegal.Contains("不支持弹出", StringComparison.Ordinal), "VetoType 8 is illegal eject, not 'file in use'");
+Expect(!illegal.Contains("其它程序占用", StringComparison.Ordinal), "do not blame other programs for VetoType 8");
+var open = DiskSafeEject.FormatEjectFailure(0, 0x17, 5, "explorer.exe");
+Expect(open.Contains("仍打开", StringComparison.Ordinal), "VetoType 5 mentions open handles");
+var ready = DiskSafeEject.NonHotPlugReadyMessage(0);
+Expect(ready.Contains("已可安全移除", StringComparison.Ordinal), "non-hotplug disks get a short safe-to-remove hint");
+Expect(!ready.Contains("断电", StringComparison.Ordinal), "safe-to-remove hint does not mention power cables");
+
 Environment.Exit(failed);
