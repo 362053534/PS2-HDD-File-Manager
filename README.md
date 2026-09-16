@@ -116,6 +116,35 @@ dotnet build .\PS2-HDD-File-Manager.csproj -c Release   # 仅编译
 dotnet run --project Tests\PS2-HDD-File-Manager.Tests.csproj
 ```
 
+## 持续集成（GitHub Actions）
+
+`.github/workflows/build.yml`，在 `push` / `pull_request` / 手动触发时跑两个 job，产物在 run 页面底部的 **Artifacts** 下载。
+
+| Job | Runner | 产物 |
+|-----|--------|------|
+| `PC Release (net8.0-windows)` | `windows-latest` | `PS2-HDD-File-Manager-Release-windows`（`bin\Release\PS2-HDD-File-Manager.zip`）、`pfsshell-win32` |
+| `PS2 ELF (PfsNetServer)` | `ubuntu-latest` + `ghcr.io/362053534/ps2homebrew:main` | `PfsNetServer-elf` |
+
+PC job 会在 runner 上按 `csproj` 写死的相对路径还原依赖布局，因此本仓库被检出到 `<workspace>/PFS-BatchKit-Manager/PS2-HDD-File-Manager`：
+
+```
+<workspace>/
+├── pfsshell/build-local-win32/pfsshell.exe        ← csproj 的 ..\..\pfsshell\...
+└── PFS-BatchKit-Manager/
+    ├── PFS-BatchKit-Manager/BAT/{hdl_dump,wnbd-client}.exe + libwnbd.dll   ← ..\PFS-BatchKit-Manager\BAT\...
+    └── PS2-HDD-File-Manager/                      ← 本仓库
+```
+
+上游依赖全部取自 362053534：
+
+| 依赖 | 来源 | 用法 |
+|------|------|------|
+| `pfsshell.exe` | `362053534/pfsshell`（`master`） | MSYS2 MINGW32 下 `meson setup/compile`，产物即 `build-local-win32/pfsshell.exe`。`meson.build` 的 archive 目标 `build_by_default` 且 `find_program('7z')`，故 MSYS2 需装 `p7zip` |
+| `hdl_dump.exe` / `wnbd-client.exe` / `libwnbd.dll` | `362053534/PFS-BatchKit-Manager`（`main`） | sparse-checkout 只取 `PFS-BatchKit-Manager/BAT/` 下的这 3 个文件，避免拉整个仓库 |
+| PS2 工具链 + SDK | `ghcr.io/362053534/ps2homebrew:main` | 镜像内 `PS2SDK=/usr/local/ps2dev/ps2sdk` 是**已编译**的 SDK（由 `362053534/ps2toolchain` + `ps2sdk` + `ps2sdk-ports` 构建），含 `iop/irx/*.irx`。注意别用 `/usr/local/ps2sdk`，那只是源码 clone |
+
+PC job 还会跑 `Tests/`（退出码 = 失败断言数），失败即 job 失败。
+
 ## 开发测试数据
 
 - `TestData/*.img` 被 Git 忽略（`TestData/.gitignore`），也不会随发行包复制。开发目录可自备一个 `test-ps2-hdd.img`（**该镜像不在仓库内**）：1 GiB 的独立 APA/PFS 测试盘，含 `__test` PFS 分区与 `TEST` 目录，用「加载硬盘镜像」打开即可验证导入、导出、重命名、删除和目录操作，不影响真实 PS2 HDD 或 U 盘。
