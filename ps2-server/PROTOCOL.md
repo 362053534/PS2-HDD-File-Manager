@@ -1,8 +1,12 @@
 # PFS 网络协议草案（PfsNet）
 
-状态：**草案 / 已冻结产品决策基线**  
+状态：**V1 实现基线**（P1–P3 已双端落地；P4 未实现）  
 适用：PS2 端 `ps2-server` ELF ↔ PC 端 PS2-HDD-File-Manager  
 样板：HDLGameInstaller 的双 TCP 通道与包头风格；**命令语义与版本独立，不得与 HDLGMan 混连**
+
+本文与代码的对齐关系：常量见 `include/protocol.h` ↔ `../Services/PfsNet/PfsNetProtocol.cs`；
+命令分派见 `src/fsops.c:pfsnetHandleCommand` 与 `src/server.c:handleHello` ↔ `PfsNetClient`。
+文中标注「**未实现**」的命令表示常量已定义但没有实现，发送后会收到 `ERR_UNSUPPORTED`。
 
 ---
 
@@ -84,6 +88,8 @@ struct PfsNetPacketHdr {
 - 请求：先发包头，再发 `payload_length` 字节载荷（若 >0）。
 - 响应：同样先包头后载荷；业务结果以响应头 `result` 为准（`0` = 成功）。
 - 单帧控制载荷上限：**131072**（128 KiB）。更大内容走数据通道或拆分命令。
+- 实现说明：PS2 端响应包头的 `command` 字段是占位值（`src/server.c:pfsnetSendResponse` 填 `PFSNET_CMD_HELLO`），**不要**用它匹配请求；PC 端 `PfsNetClient` 按「一问一答」顺序读响应。
+- PC 端每次读响应有 **30 秒**超时（`PfsNetCodec.ReadExactAsync`），超时抛 `TimeoutException("等待 PfsNet 响应超时。")`。
 
 ### 3.2 字符串
 
@@ -150,21 +156,26 @@ V1：`FEAT_FILE_OPS | FEAT_DATA_CHANNEL | FEAT_APA_SECTOR | FEAT_APA_MUTATE`（P
 | ID | 名称 | 说明 |
 |----|------|------|
 | 0x0001 | `CMD_HELLO` | 握手 |
-| 0x0002 | `CMD_PING` | 心跳；载荷可空；响应 `result=0` |
+| 0x0002 | `CMD_PING` | 心跳；载荷可空；响应 `result=0`。**已实现但当前无调用方**（见 §6.3） |
 | 0x0003 | `CMD_MOUNT` | 挂载指定 PFS 分区为当前会话挂载 |
 | 0x0004 | `CMD_UMOUNT` | 卸载当前挂载 |
-| 0x0005 | `CMD_GET_SESSION` | 查询：是否已挂载、分区名、当前工作目录（可选） |
+| 0x0005 | `CMD_GET_SESSION` | **未实现**（返回 `ERR_UNSUPPORTED`）；挂载状态 PC 端自行记录在 `PfsNetClient.MountedPartition` |
 
-`CMD_MOUNT` 载荷：分区名字符串。  
-成功后该连接进入「已挂载」状态；再 `CMD_MOUNT` 其它分区前必须先 `CMD_UMOUNT`（或由实现自动 umount 再 mount，但须在文档中固定一种——**草案规定：PC 必须先 UMOUNT**）。
+`CMD_MOUNT` 载荷：分区名字符串。
+
+**挂载切换语义（已按实现固定）**：两端都允许自动切换，PC **不需要**先发 `UMOUNT`。
+
+- PS2 端 `fsops.c:doMount`：同名分区重复 mount 直接返回 `OK`；挂载了别的分区则先 `fileXioUmount` 再挂新的；传输进行中（`g_xfer.kind != NONE`）返回 `ERR_BUSY`。
+- PC 端 `PfsNetClient.MountAsync`：换分区前自己先发一次 `CMD_UMOUNT` 以保持本地状态一致。
+- 每个文件/目录命令在 PS2 端都要求已挂载，否则 `ERR_NOT_MOUNTED`。PC 端在每次操作前调用 `MountAsync` 兜底。
 
 ### 5.2 枚举与空间（B，可无 mount）
 
 | ID | 名称 | 说明 |
 |----|------|------|
-| 0x0010 | `CMD_LIST_PARTITIONS` | 列出 APA 上可浏览分区（实现可过滤非 PFS；是否含系统分区由请求标志决定） |
-| 0x0011 | `CMD_GET_APA_FREE` | 返回 APA 未分配空间等摘要（**不可替代 A1 校验**；仅 UI 提示用） |
-| 0x0012 | `CMD_GET_PFS_FREE` | 当前已挂载分区的 PFS 剩余/总量/zone（文件导入预检用，策略 B） |
+| 0x0010 | `CMD_LIST_PARTITIONS` | 列出可浏览分区。**实现只返回 PFS 类型分区**（`mode == APA_TYPE_PFS`），子分区（`APA_FLAG_SUB`）跳过；flags bit0 只决定系统分区是否包含 |
+| 0x0011 | `CMD_GET_APA_FREE` | APA 总量 / 未分配（`HDIOC_TOTALSECTOR` / `HDIOC_FREESECTOR`）。**不可替代 A1 校验**，仅 UI 提示用 |
+| 0x0012 | `CMD_GET_PFS_FREE` | 当前已挂载分区的 PFS 总量 / 剩余 / zone（`PDIOC_ZONESZ` × `PDIOC_ZONEFREE`，文件导入预检用，策略 B）。未挂载返回 `ERR_NOT_MOUNTED` |
 
 `CMD_LIST_PARTITIONS` 请求标志：
 
@@ -172,20 +183,49 @@ V1：`FEAT_FILE_OPS | FEAT_DATA_CHANNEL | FEAT_APA_SECTOR | FEAT_APA_MUTATE`（P
 uint32_t flags; /* bit0 = include_system_partitions */
 ```
 
-响应：条目数组。每条至少含：`name`、`is_directory_mountable`（PFS）、`is_system`、`total_bytes`（若可得）。
+响应载荷（小端，已与 `fsops.c:handleListPartitions` / `PfsNetClient.ListPartitionsAsync` 对齐）：
+
+```c
+uint32_t count;
+struct {
+    string   name;        /* APA 分区名，UTF-8 */
+    uint8_t  flags;       /* bit0 = is_system，bit1 = is_pfs（当前恒为 1） */
+    uint64_t total_bytes; /* 主分区长度 × 512；含子分区的精确总量在 GET_PFS_FREE 计算 */
+} entries[count];
+```
+
+`CMD_GET_APA_FREE` 响应：`uint64_t total_bytes; uint64_t free_bytes;`（16 字节，**不含 zone**）。
+`CMD_GET_PFS_FREE` 响应：`uint64_t total_bytes; uint64_t free_bytes; uint32_t zone_size;`（20 字节）。
 
 ### 5.3 目录与元数据（B，需已挂载）
 
 | ID | 名称 | 说明 |
 |----|------|------|
-| 0x0020 | `CMD_LIST_DIR` | `ls`；请求：相对当前挂载的绝对路径 |
-| 0x0021 | `CMD_MKDIR` | 新建目录 |
-| 0x0022 | `CMD_RMDIR` | 删除空目录（非空返回错误；递归删除由 PC 展开） |
+| 0x0020 | `CMD_LIST_DIR` | `ls`；请求：相对当前挂载的绝对路径。未挂载返回 `ERR_NOT_MOUNTED` |
+| 0x0021 | `CMD_MKDIR` | 新建目录（`fileXioMkdir(full, 0777)`） |
+| 0x0022 | `CMD_RMDIR` | 删除空目录（非空返回 `ERR_NOT_EMPTY`；递归删除由 PC 展开，见 `MainForm.DeleteRemoteDirectoryAsync`） |
 | 0x0023 | `CMD_REMOVE` | 删除文件 |
-| 0x0024 | `CMD_RENAME` | 同目录或带路径的重命名/移动（V1：限同一挂载内） |
-| 0x0025 | `CMD_STAT` | 可选；单文件/目录信息 |
+| 0x0024 | `CMD_RENAME` | 载荷为 `(parent, old_name, new_name)`，PS2 端把 `parent` 分别与两个名字拼接。UI 只用同一父目录内改名；跨目录移动未在 UI 中出现 |
+| 0x0025 | `CMD_STAT` | **未实现**（返回 `ERR_UNSUPPORTED`）。PC 需要的元数据全部来自 `LIST_DIR` |
 
-`CMD_LIST_DIR` 响应条目：`name`（UTF-8）、`is_dir`、`size`（文件字节；目录可为 0 或目录项大小）、可选时间戳。
+MKDIR / RMDIR / REMOVE 载荷：`string parent_path; string name;`
+RENAME 载荷：`string parent_path; string old_name; string new_name;`
+
+`CMD_LIST_DIR` 请求载荷：`string path;`（`/` 开头，PC 端 `NormalizePath` 会规整斜杠）
+
+响应载荷（`fsops.c:handleListDir`）：
+
+```c
+uint32_t count;
+struct {
+    string   name;     /* UTF-8；`.` 与 `..` 已过滤 */
+    uint8_t  is_dir;   /* FIO_S_IFDIR */
+    uint64_t size;     /* hisize<<32 | size */
+    string   details;  /* 当前恒为 "dir" 或 "file" */
+} entries[count];
+```
+
+**不含时间戳**：PS2 端没有填 `iox_dirent` 的时间字段，PC 的「pfsshell 详情」列在网络模式下只显示 `dir`/`file`。
 
 ### 5.4 文件传输（B + D1 + T1）
 
@@ -238,7 +278,16 @@ uint64_t total_bytes; /* 随后数据通道将发送的字节数 */
 4. PS2 在数据通道按序发送 `total_bytes` 原始字节。
 5. 收完后 PC 发 `CMD_GET_END`；失败则 `CMD_GET_ABORT`。
 
-V1 可不支持断点续传；`offset` 字段预留为 0。
+V1 可不支持断点续传；`offset` 字段预留为 0（PC 端 `PfsNetClient` 固定发 `offset=0, length=0`）。
+
+#### 实现现状（P2 已落地，两端一致）
+
+- **顺序**：PC 每次传输都新建一个 `TcpListener(IPAddress.Any, 45062)`（开 `ReuseAddress`），**先挂起 `accept` 再发 `*_BEGIN`**，缩小 PS2 回连与 PC accept 之间的空窗；传完即 `listener.Stop()`。45062 被占用会导致传输失败。
+- **accept 超时**：30 秒（`AcceptDataAsync`）。
+- **数据通道**：纯原始字节流，长度以 `PUT_BEGIN.total_bytes` / `GET_BEGIN` 响应的 `total_bytes` 为准。两端 socket 都设 512 KiB 收发缓冲 + `NoDelay`；PC 侧本地文件流按 512 KiB 读写，PS2 侧用两块 512 KiB `memalign` 缓冲 + `ioWorker` 线程双缓冲。
+- **临时文件（T1）**：`.pfsnet_<8 hex>`，`PUT_END` 时 rename 为最终名（overwrite 时先删旧文件）；`PUT_ABORT` 或控制连接断开时由 `abortXferCleanup()` 删除。
+- **取消 / 失败**：PC 先关数据口打断读写，再尝试发 `*_ABORT`（2 秒超时；若对端卡在 `*_BEGIN` 未应答则直接断开本地连接，不同步空等）。`GET` 失败时 PC 会删除写到一半的本地文件。
+- **状态**：传输进行中（`g_xfer.kind != NONE`）执行 MOUNT / UMOUNT / APA 变更会返回 `ERR_BUSY`。
 
 ### 5.5 APA 扇区只读（A1，分区校验）
 
@@ -262,6 +311,12 @@ PC 侧：
 - 将读到的数据喂入现有（或抽离后的）`ApaPartitionTableReader` 同等逻辑。
 - **仅在分区创建/删除/重命名的写前与写后**使用；文件操作不走此路径。
 
+实现现状：
+
+- PS2 端（`fsops.c:handleReadSectors`）硬性校验 `count` 在 **1–256**、`lba ≤ 0xFFFFFFFF`（底层 `HDIOC_READSECTOR` 用 32 位 LBA），否则 `ERR_INVAL`。载荷不足 12 字节同样 `ERR_INVAL`。
+- PC 端（`PfsNetClient.ReadSectorsAsync`）同样限制 256 扇区，并校验返回长度 == `count * 512`。超过 256 扇区的请求由 `PfsNetApaSectorSource` 自动切块串行拉取。
+- PC 端在调用前检查 `FEAT_APA_SECTOR`，未声明则提示「请更新 PfsNetServer.elf」。
+
 ### 5.6 分区变更（A + FEAT_APA_MUTATE）
 
 | ID | 名称 | 说明 |
@@ -278,13 +333,33 @@ PC 侧：
 4. 再次 A1 拉表复核（目标存在性、空闲空间变化等，对齐现有 MainForm 逻辑）。
 5. 失败则向用户报告，禁止继续写入。
 
-V1 若未实现 0x0050–0x0052：feature 位置 0；PC 菜单 **P1b** 提示未启用。
+V1 已实现 0x0050–0x0052，`FEAT_APA_MUTATE` 置位。PC 菜单的 **P1b** 提示（`MainForm.RejectNetworkPartitionMutationIfNeeded`）只在连到未声明该 feature 的旧 ELF 时才会出现。
+
+#### 实现现状
+
+PS2 端（`src/fsops.c`）：
+
+- `APA_CREATE_PFS` 载荷：`string name; string size;`，`size` 为「整数 + `M`/`G`」，换算成 MB 后**必须是 128 的整数倍**，否则 `ERR_INVAL`。系统保留名（`__mbr`/`__net`/`__system`/`__sysconf`/`__common`/`__boot`）→ `ERR_INVAL`；同名已存在 → `ERR_EXIST`。
+  分配方式：按 APA 尺寸表从大到小开主分区，再用 `HIOCADDSUB` 追加子分区凑容量，最后 `fileXioFormat("pfs:", "hdd0:名字", {8192, 0x00002d66, 0})`（对齐 pfsshell `mkpfs`）。
+  **注意**：空间碎片/不足时可能凑不满请求容量（内部 `left > 0`）却仍返回 `OK`，格式化也可能失败后自动 `fileXioRemove` 回滚。因此 PC **必须**做写后校验。
+- `APA_REMOVE` 载荷：`string name;`。系统保留名 → `ERR_INVAL`；执行前若已挂载会**自动 umount**。
+  标准 IOP `ps2hdd` 拒绝删除**任意 `__` 前缀**分区并返回 `-EACCES`（映射为 `ERR_INVAL`）。要删 `__.POPS` 这类分区，需要以 `APA_ALLOW_REMOVE_PARTITION_WITH_LEADING_UNDERSCORE` 编译的 `ps2hdd.irx`。PC 端对这种情况有专门文案（`PfsNetProtocol.FormatCommandError`，含回归测试）。
+- `APA_RENAME` 载荷：`string old_name; string new_name;`。已挂载或传输中 → `ERR_BUSY`（不自动 umount）；任一名字是系统保留名 → `ERR_INVAL`。
+- 三者都要求 `g_xfer.kind == NONE`，否则 `ERR_BUSY`。
+
+PC 端（`MainForm`）写前/写后校验：
+
+1. `ReadApaLayoutAsync` 拉表校验（网络走 `READ_SECTORS` + `PfsNetApaSectorSource`，与本地同一套 `ApaPartitionTableReader`）。校验失败直接拒绝操作。
+2. 变更前 `EnsureNetworkUnmountedForApaAsync` 先 umount。
+3. 发变更命令。
+4. **创建**：再次拉表要求分区存在、类型为 PFS 且**容量与请求值完全相等**；不等则自动删除半成品分区并报错。随后再挂载 + `LIST_DIR /` 验证 PFS 可用，失败同样自动删除。
+5. **删除**：删除后要求目标消失**且未分配空间增加**，否则报「立即停止写入、保留硬盘现状」。（本地模式下 pfsshell 的 `rmpart` 成功后仍可能打印 `No such file` / exit -2，因此结论只以 APA 表复核为准。）
 
 ### 5.7 关机（可选）
 
 | ID | 名称 | 说明 |
 |----|------|------|
-| 0x00FF | `CMD_SHUTDOWN` | 可选；先 umount 再断电（对齐 HDL 的谨慎行为） |
+| 0x00FF | `CMD_SHUTDOWN` | **未实现**（返回 `ERR_UNSUPPORTED`）。当前退出方式是在 PS2 上按 START：`main.c:safeExitElf()` 会 force umount → `HDIOC_DEV9OFF` → IOP `rom0:UDNL` 复位 → `_LoadExecPS2("rom0:OSDSYS")` |
 
 ---
 
@@ -298,20 +373,29 @@ V1 若未实现 0x0050–0x0052：feature 位置 0；PC 菜单 **P1b** 提示未
 - `Mounted(partition)`：已挂载该 PFS 分区  
 - `Transfer`：数据通道进行中（Put/Get）；此时禁止换挂载  
 
-### 6.2 PC 必须主动 UMOUNT 的时机
+### 6.2 PC 主动 UMOUNT 的时机（实现现状）
 
-- 返回分区列表 / 打开另一分区前  
-- 用户断开 PfsNet  
-- 开始分区变更（0x005x）前  
-- 应用程序正常退出路径（尽力而为）  
+| 场景 | 行为 |
+|------|------|
+| 返回分区列表 | `LoadPartitionsAsync` 先 `UmountAsync`（异常忽略） |
+| 打开另一分区 | `MountAsync` 换分区前自动发一次 `UMOUNT` |
+| 开始分区变更（0x005x）前 | `EnsureNetworkUnmountedForApaAsync` 显式 umount |
+| 用户点「断开 PFS 网络」 | **不发 umount**，只关本地套接字并清理 UI。原因：对端已掉线时远程 umount 会卡死；PS2 端检测到断线会自行 force umount |
+| 应用程序退出（`FormClosed`） | 同上，只 `Disconnect()`，不发 umount |
+
+因此「PC 断开前必须 UMOUNT」这条**不再成立**：正确性依赖 §6.3 的 PS2 端强制清理。
 
 ### 6.3 PS2 强制清理（硬性）
 
-以下情况必须：中止数据线程 → 关闭打开文件 → 删除未提交临时 Put 文件 → `umount` → 回到可监听/可接受新握手状态：
+目标：中止数据线程 → 关闭打开文件 → 删除未提交临时 Put 文件 → `umount` → 回到可监听/可接受新握手状态。
 
-- 控制连接断开或协议级致命错误  
-- `CMD_PING` 超时（建议：PC 每 **10s** ping；PS2 **30s** 无任何控制帧且无进行中传输 → 视同死连接）  
-- `CMD_PUT_ABORT` / 传输异常  
+| 触发条件 | 现状 |
+|----------|------|
+| 控制连接断开或协议级致命错误 | **已实现**：`server.c:closeClient()` → `pfsnetFsForceUmount()`；`fsops.c:abortXferCleanup()` 关闭文件并删除未提交的 `.pfsnet_*` |
+| `CMD_PING` 超时 / 空闲死连接 | **未实现（P4）**。PC 端 `PfsNetClient.PingAsync` 存在但**没有任何调用点**，没有 10 s 心跳定时器；PS2 端也没有「30 s 无控制帧视同死连接」的判定。`server.c` 里唯一的 idle 判定是 `pfsnetPadPollAllowed()`（收发中或停传未满 2 秒不轮询手柄），与连接存活无关 |
+| `CMD_PUT_ABORT` / 传输异常 | **已实现** |
+
+当前的实际兜底是 PC 侧超时：控制响应读取与数据通道 accept 各 30 秒（`PfsNetCodec.ReadExactAsync` / `AcceptDataAsync`）。半开连接（如 PS2 掉电）要等这个超时才会被发现，期间 PS2 上的挂载会一直保持。补齐 P4 之前不要在不可信网络上使用。
 
 ---
 
@@ -319,9 +403,9 @@ V1 若未实现 0x0050–0x0052：feature 位置 0；PC 菜单 **P1b** 提示未
 
 | 系统 | 关系 |
 |------|------|
-| HDLGameInstaller | 同端口；靠 `PFSNET_MAGIC` 拒连；用户勿同时运行两 ELF |
-| NBD | PC UI **N1 互斥**；协议不定义 NBD |
-| 本地 pfsshell | 文件 UTF-8 语义一致；网络后端实现同一套 UI 能力 |
+| HDLGameInstaller | 同端口；靠 `PFSNET_MAGIC` 拒连（`ERR_MAGIC`）；用户勿同时运行两 ELF。PS2 端单客户端：已有连接在跑时新连接立即被 close |
+| NBD | **N1 互斥**：PC 端在 NBD 映射进程运行时拒绝连接 PfsNet（`MainForm.ConnectPfsNetAsync`）。协议不定义 NBD。注：NBD 的 UI 目前已在 `MainForm` 中隐藏，代码保留 |
+| 本地 pfsshell | 文件 UTF-8 语义一致；网络后端实现同一套 UI 能力。差异：网络模式的「pfsshell 详情」列只有 `dir`/`file`（无时间戳），且不支持拖拽到 PC |
 
 ---
 
@@ -358,23 +442,26 @@ V1 若未实现 0x0050–0x0052：feature 位置 0；PC 菜单 **P1b** 提示未
 
 ## 10. 实现分期（与协议能力对应）
 
-| 阶段 | 协议子集 | PC / PS2 |
-|------|----------|----------|
-| P0 | 本文定稿 | 双方对照实现 |
-| P1 | HELLO / PING / LIST_PARTITIONS / MOUNT / UMOUNT / LIST_DIR | 只读浏览像本地 |
-| P2 | MKDIR/REMOVE/RENAME/RMDIR + PUT/GET（T1+D1） | 文件管理完整（B） |
-| P3 | READ_SECTORS + APA_* + FEAT 位 | 分区管理（A1+A） |
-| P4 | 心跳/断线清理打磨、关机可选 | 「极少操作」体验 |
+| 阶段 | 协议子集 | PC / PS2 | 状态 |
+|------|----------|----------|------|
+| P0 | 本文定稿 | 双方对照实现 | 完成 |
+| P1 | HELLO / PING / LIST_PARTITIONS / MOUNT / UMOUNT / LIST_DIR | 只读浏览像本地 | 完成 |
+| P2 | MKDIR/REMOVE/RENAME/RMDIR + PUT/GET（T1+D1） | 文件管理完整（B） | 完成 |
+| P3 | READ_SECTORS + APA_* + FEAT 位 | 分区管理（A1+A） | 完成 |
+| P4 | 心跳/断线清理打磨、关机可选 | 「极少操作」体验 | **未开始**（见 §6.3；`CMD_SHUTDOWN` 也未实现） |
 
 ---
 
-## 11. 待实现时再钉死的细节（不阻塞草案）
+## 11. 细节钉死情况
 
-- 临时文件名精确格式与崩溃残留清理策略（进入目录时扫 `.pfsnet_*`）。  
-- `CMD_LIST_PARTITIONS` 与本地「可浏览 PFS」过滤规则逐条对齐。  
-- `CMD_APA_CREATE_PFS` 尺寸单位与本地 `mkpart` 字符串完全一致。  
-- 读扇区是否在 P3 对超大请求改走数据通道。  
-- 协议文档版本号与 `PFSNET_PROTOCOL_VERSION` 同步规则。  
+| 项 | 现状 |
+|----|------|
+| 临时文件名精确格式 | **已钉死**：`.pfsnet_%08x`（`fsops.c` 用递增 `g_tempSeq`） |
+| 崩溃残留清理策略 | **部分**。控制连接断开 / `PUT_ABORT` 时 `abortXferCleanup()` 会删掉本次未提交的临时文件；但「进入目录时扫 `.pfsnet_*`」的兜底清理**未实现** —— PS2 掉电残留的临时文件不会被自动回收 |
+| `CMD_LIST_PARTITIONS` 与本地过滤规则对齐 | **未完全对齐**。网络端只按 APA `mode == APA_TYPE_PFS` 过滤；本地是 `pfsshell ls` 解析名字后逐个探测挂载（`PfsShellClient.FilterBrowsablePfsPartitionsAsync`）。因此「类型是 PFS 但已格式化损坏」的分区在网络模式会列出、在本地模式会被过滤掉。系统保留名的隐藏都在 PC 端做（`IsProtectedPartitionName`），两端一致 |
+| `CMD_APA_CREATE_PFS` 尺寸单位 | **已对齐**：PC 端把同一个规范化字符串（`512G` / `128M`）同时发给 pfsshell `mkpart` 与 `APA_CREATE_PFS`（`MainForm.TryParsePartitionSize` → `normalizedSize`）。PS2 端额外强制 128 MB 整数倍 |
+| 超大读扇区是否改走数据通道 | **未改**。协议仍限单次 ≤256 扇区，PC 端 `PfsNetApaSectorSource` 负责切块串行拉取 |
+| 文档版本号与 `PFSNET_PROTOCOL_VERSION` 同步规则 | **未定**。两端常量都是 `0x0001`，本文没有独立版本号；§12 修订记录只按日期 |
 
 ---
 
@@ -385,3 +472,5 @@ V1 若未实现 0x0050–0x0052：feature 位置 0；PC 菜单 **P1b** 提示未
 | 2026-07-30 | 初稿：按冻结决策 F1 编写 |
 | 2026-07-31 | P1 ELF 源码落地（main/net/server/fsops）；features 仅 FEAT_FILE_OPS |
 | 2026-08-01 | P2：钉死 Put/Get 载荷布局；FEAT_DATA_CHANNEL；T1 临时名 + 数据回连 |
+| 2026-09-06 | P3 落地：READ_SECTORS + APA_CREATE_PFS/REMOVE/RENAME，四个 feature 全开；修复网络模式删除 `__` 前缀分区的错误映射（`-EACCES` → `ERR_INVAL`）与 PC 端专用提示 |
+| 2026-09-16 | 文档与代码对齐：状态改为「V1 实现基线」；补全 LIST_PARTITIONS / LIST_DIR / GET_*_FREE 的实际载荷布局；标注 `CMD_GET_SESSION` / `CMD_STAT` / `CMD_SHUTDOWN` 未实现；按实现改写挂载切换语义（两端均自动 umount，PC 无需先发 UMOUNT）与断开路径（PC 不再远程 umount）；P4 标注未开始并写明当前只有 30 s 超时兜底 |
