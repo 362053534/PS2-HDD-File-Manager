@@ -55,9 +55,11 @@ jobs:
         with:
           msystem: MINGW32
           update: true
+          # p7zip 必需：meson.build 的 archive 目标 build_by_default，会 find_program('7z')
           install: >-
             base-devel
             git
+            p7zip
             mingw-w64-i686-gcc
             mingw-w64-i686-meson
             mingw-w64-i686-ninja
@@ -151,6 +153,13 @@ jobs:
           name: PS2-HDD-File-Manager-Release-windows
           path: PFS-BatchKit-Manager/PS2-HDD-File-Manager/bin/Release/PS2-HDD-File-Manager.zip
           if-no-files-found: error
+
+      # 顺带产出 pfsshell 自己的 win32 打包（meson archive 目标）
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pfsshell-win32
+          path: pfsshell/build-local-win32/*.7z
+          if-no-files-found: warn
 
   # -------------------------------------------------------------- PS2 端
   ps2-elf:
