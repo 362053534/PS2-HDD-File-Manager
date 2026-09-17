@@ -5,6 +5,17 @@ name: Build
 #   2) PS2 端 PfsNetServer.elf（ubuntu-latest + 362053534 的 Docker 编译镜像）
 # 产物统一用 upload-artifact 提供下载。
 #
+# 关于压缩层数：csproj 的 ZipReleaseOutput 已经产出可分发 zip（第 1 层，PowerShell
+# Compress-Archive，与 7-Zip 无关）。upload-artifact 默认还会把上传内容再打成
+# 一个 zip（第 2 层，纯浪费：已 deflate 的内容体积几乎不变，还得解压两次）。
+# 所以 PC 端那个 zip 用 @v7 + `archive: false`「直传」，下载即得可用的 zip。
+#   注意：archive: false 只允许单个文件，且 `name` 输入被忽略，
+#         artifact 名 = 文件名（所以先把 zip 复制成带 -windows 后缀的名字）。
+#   ELF 仍走默认打包：它没被压过，外层 zip 是有效压缩，不算重复。
+#
+# pfsshell 不需要单独出 artifact：meson 编出的 pfsshell.exe 由 csproj 的
+# None Include + Link="tools\pfsshell.exe" 直接复制进 tools\，随发行 zip 一起分发。
+#
 # 上游依赖（全部来自 362053534，见 AGENTS.md）：
 #   - 362053534/pfsshell            → tools\pfsshell.exe（meson 源码编译）
 #   - 362053534/PFS-BatchKit-Manager→ tools\{hdl_dump.exe,wnbd-client.exe,libwnbd.dll}
@@ -55,7 +66,11 @@ jobs:
         with:
           msystem: MINGW32
           update: true
-          # p7zip 必需：meson.build 的 archive 目标 build_by_default，会 find_program('7z')
+          # p7zip 仅仅是 meson 的 configure 硬依赖：meson.build 里那个 Windows 分支的
+          # archive custom_target 用了 find_program('7z')（默认 required: true），缺 7z
+          # 连 `meson setup` 都过不去。它产出的 pfsshell-*-win32.7z 我们不需要，也不上传。
+          # 想彻底不装 p7zip，只能改上游 362053534/pfsshell 的 meson.build（required:false
+          # + build_by_default:false 或加个 option）。
           install: >-
             base-devel
             git
@@ -143,23 +158,41 @@ jobs:
         working-directory: PFS-BatchKit-Manager/PS2-HDD-File-Manager
         run: |
           set -e
+          zip=bin/Release/PS2-HDD-File-Manager.zip
           test -s bin/Release/net8.0-windows/PS2-HDD-File-Manager.exe
-          test -s bin/Release/PS2-HDD-File-Manager.zip
+          test -s "$zip"
           ls -l bin/Release/net8.0-windows/tools/
-          unzip -l bin/Release/PS2-HDD-File-Manager.zip | tail -5
+          # 这是 tools 四件套唯一的把关点：pfsshell.exe 由 meson 编出后经 csproj 的
+          # Link="tools\pfsshell.exe" 复制进输出目录，再被 ZipReleaseOutput 打进 zip，
+          # 不再额外上传 pfsshell-win32 artifact。
+          # Windows PowerShell 的 Compress-Archive 条目名用反斜杠，先统一成斜杠再比。
+          names="$(unzip -Z1 "$zip" | tr '\\' '/')"
+          for f in PS2-HDD-File-Manager.exe \
+                   tools/pfsshell.exe tools/hdl_dump.exe tools/wnbd-client.exe tools/libwnbd.dll
+          do
+            printf '%s\n' "$names" | grep -qxF "$f" \
+              || { echo "::error::发行 zip 缺少 $f（tools 复制或 ZipReleaseOutput 出问题）"; exit 1; }
+          done
+          # pdb 必须已剔除
+          if printf '%s\n' "$names" | grep -q '\.pdb$'; then
+            echo "::error::发行 zip 里混进了 *.pdb（ZipReleaseOutput 的剔除逻辑失效）"
+            exit 1
+          fi
+          printf '%d 个条目\n' "$(printf '%s\n' "$names" | wc -l)"
 
-      - uses: actions/upload-artifact@v4
+      # archive: false 时 artifact 名取自文件名，所以复制成期望的名字再直传
+      - name: 准备上传文件
+        working-directory: PFS-BatchKit-Manager/PS2-HDD-File-Manager
+        run: |
+          set -e
+          cp bin/Release/PS2-HDD-File-Manager.zip "$GITHUB_WORKSPACE/PS2-HDD-File-Manager-Release-windows.zip"
+          ls -l "$GITHUB_WORKSPACE/PS2-HDD-File-Manager-Release-windows.zip"
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: PS2-HDD-File-Manager-Release-windows
-          path: PFS-BatchKit-Manager/PS2-HDD-File-Manager/bin/Release/PS2-HDD-File-Manager.zip
+          path: PS2-HDD-File-Manager-Release-windows.zip
+          archive: false # 不再套一层 artifact zip，下载即得可用 zip
           if-no-files-found: error
-
-      # 顺带产出 pfsshell 自己的 win32 打包（meson archive 目标）
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pfsshell-win32
-          path: pfsshell/build-local-win32/*.7z
-          if-no-files-found: warn
 
   # -------------------------------------------------------------- PS2 端
   ps2-elf:
@@ -203,7 +236,9 @@ jobs:
           printf 'magic: '; head -c 4 ps2-server/PfsNetServer.elf | od -An -c | tr -s ' '
           strings ps2-server/PfsNetServer.elf | grep -m1 '^PfsNetServer$'
 
-      - uses: actions/upload-artifact@v4
+      # 这里刻意不用 archive: false：ELF 未被压缩过，artifact 的那层 zip 是有效的
+      # （约 2.7 MB → 1.0 MB），不存在「zip 套 zip」的重复压缩问题。
+      - uses: actions/upload-artifact@v7
         with:
           name: PfsNetServer-elf
           path: ps2-server/PfsNetServer.elf
