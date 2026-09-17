@@ -129,6 +129,18 @@ PC 端 zip 用 `actions/upload-artifact@v7` + `archive: false` **直传**（不�
 
 pfsshell 不再单独出 artifact：meson 编出的 `pfsshell.exe` 经 csproj 的 `Link="tools\pfsshell.exe"` 直接进输出的 `tools\`，随发行 zip 一起走。作为替换，CI 的「校验产物」步骤会断言 zip 内确实有 `PS2-HDD-File-Manager.exe` + `tools\{pfsshell.exe,hdl_dump.exe,wnbd-client.exe,libwnbd.dll}` 且不含 `*.pdb`。
 
+### 耗时与缓存
+
+PC job 稳态约 **1m10s**（首次、或 pfsshell 有更新时约 3m20s）。时间几乎都花在依赖侧而不是本仓库代码：一次实测 200 s 的分布是「装 MSYS2 工具链 102 s」+「`setup-dotnet` 32 s」+「编 pfsshell 10 s」+「编 Release 21 s」+ 其余 35 s。
+
+| 手段 | 效果 |
+|------|------|
+| `pfsshell.exe` 按上游 commit SHA 用 `actions/cache` 预热（key `pfsshell-exe-<os>-<arch>-<sha>`，只缓存那一个 exe） | 命中即整段跳过「clone 源码 + 装 MSYS2 + meson 编译」，省 ~118 s。只有 `362053534/pfsshell` 的 `master` 变了才真重编；SHA 解析失败时自动退回全量编译，不会静默用错缓存 |
+| 主工程与 Tests 合成一次 `dotnet build Tests -c Release`（`ProjectReference` 会把主工程一起带成 Release），回归测试改 `dotnet run --no-build` | 少编一遍 145 KB 的 `MainForm.cs`，并且测试跑的就是要发布的 Release 二进制（以前跑的是 Debug） |
+| PC 端 zip 用 `upload-artifact@v7` + `archive: false` 直传 | 少一层零收益的重复压缩 |
+
+还能再省但**没做**的两项，按需自取：`windows-latest` 自带 .NET 8 SDK，删掉 `actions/setup-dotnet` 那步可再省 ~32 s（代价是不再锁定 SDK 补丁版本）；纯文档提交可用 `on.push.paths-ignore: ['**/*.md']` 让 PC job 根本不触发。
+
 PC job 会在 runner 上按 `csproj` 写死的相对路径还原依赖布局，因此本仓库被检出到 `<workspace>/PFS-BatchKit-Manager/PS2-HDD-File-Manager`：
 
 ```
