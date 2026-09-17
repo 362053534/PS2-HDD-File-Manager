@@ -5,6 +5,13 @@ name: Build
 #   2) PS2 端 PfsNetServer.elf（ubuntu-latest + 362053534 的 Docker 编译镜像）
 # 产物统一用 upload-artifact 提供下载。
 #
+# 提速（PC job 实测 3m20s → 缓存命中时约 1m10s）：
+#   - pfsshell.exe 按上游 HEAD SHA 用 actions/cache 预热：命中就整段跳过
+#     「装 MSYS2 工具链(102s) + meson 编译(10s) + clone 源码(6s)」，它占 PC job 的 59%；
+#   - 主工程与 Tests 合并成一次 Release 编译（原来 145 KB 的 MainForm.cs 被编两遍）；
+#   - 没动的：setup-dotnet 那 32s —— windows-latest 自带 .NET 8 SDK，删掉该步即可再省
+#     32s，代价是不再锁定 SDK 补丁版本，自行取舍。
+#
 # 关于压缩层数：csproj 的 ZipReleaseOutput 已经产出可分发 zip（第 1 层，PowerShell
 # Compress-Archive，与 7-Zip 无关）。upload-artifact 默认还会把上传内容再打成
 # 一个 zip（第 2 层，纯浪费：已 deflate 的内容体积几乎不变，还得解压两次）。
@@ -54,7 +61,40 @@ jobs:
       #   ..\..\pfsshell\build-local-win32\pfsshell.exe
       #   ..\PFS-BatchKit-Manager\BAT\{hdl_dump,wnbd-client}.exe + libwnbd.dll
       # 因此本仓库必须落在 <workspace>/PFS-BatchKit-Manager/PS2-HDD-File-Manager
+      # ---- pfsshell 预热：上游 master 很少变，但每次 push 都要重装 MSYS2 + 重编，
+      # 实测白烧 118 s（装工具链 102 s + 编译 10 s + checkout 6 s），占整个 job 的 59%。
+      # 这里按「上游 HEAD SHA」缓存编好的 pfsshell.exe：命中就跳过 clone / msys2 / 编译，
+      # 只有 pfsshell 自己更新了才会走一遍完整链路。
+      - name: 取 pfsshell 上游 HEAD SHA
+        id: pfsshell-sha
+        run: |
+          # 分支 / 标签 / 裸 SHA 都能解析（^{} 是标签指向的对象，跳过）
+          sha="$(git ls-remote "https://github.com/${PFS_SHELL_REPO}.git" \
+                   "refs/heads/${PFS_SHELL_REF}" "refs/tags/${PFS_SHELL_REF}" "${PFS_SHELL_REF}" 2>/dev/null \
+                 | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            # 解析失败（网络抖动 / 上游改成私有）就整体退回全量编译：
+            # sha=skip 时不查缓存，cache-hit 为空 → 后面的编译步骤照常跑
+            echo "::warning::取不到 ${PFS_SHELL_REPO}@${PFS_SHELL_REF} 的 SHA（得到：'$sha'），本次跳过缓存、全量编译 pfsshell"
+            echo "sha=skip" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "pfsshell ${PFS_SHELL_REF} = $sha"
+          fi
+
+      - name: 还原 pfsshell.exe 缓存
+        id: pfsshell-cache
+        if: steps.pfsshell-sha.outputs.sha != 'skip'
+        uses: actions/cache@v4
+        with:
+          # 只缓存 csproj 真正要的那个文件，别把整个 build 目录（含 meson 中间产物）拖进来
+          path: pfsshell/build-local-win32/pfsshell.exe
+          # 上游 SHA 变了自动失效。缓存的是 -static 链接的独立 exe，
+          # 换 runner 镜像也不会失配，所以 key 里只放 os/arch。
+          key: pfsshell-exe-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
+
       - name: Checkout pfsshell 源码
+        if: steps.pfsshell-cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PFS_SHELL_REPO }}
@@ -62,6 +102,7 @@ jobs:
           path: pfsshell
 
       - name: 准备 MSYS2 MINGW32 工具链
+        if: steps.pfsshell-cache.outputs.cache-hit != 'true'
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32
@@ -82,6 +123,7 @@ jobs:
       # 不启用 pfsfuse，因此不需要 external/dokany 等子模块
       # 失败时把日志尾部塞进 ::error:: annotation（Actions 日志在 blob 存储里，annotation 走 API 可读）
       - name: 编译 pfsshell.exe
+        if: steps.pfsshell-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
         run: |
           W="$(cygpath -u "${{ github.workspace }}")"
@@ -99,6 +141,8 @@ jobs:
             echo "::error::meson compile 失败::$(tail -n 25 compile.log | tr -d '\r' | tr '\n' '|')"
             exit 1
           fi
+          # 空文件绝不能进缓存（actions/cache 的 post 步骤不看构建结果）
+          test -s build-local-win32/pfsshell.exe || { echo "::error::pfsshell.exe 没生成或为 0 字节"; exit 1; }
           ls -l build-local-win32/pfsshell.exe
 
       - name: 取 PFS-BatchKit-Manager 的工具（sparse，仅 3 个文件）
@@ -136,25 +180,31 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: 编译 Release（含 tools 复制 + zip 打包）
+      # 只调一次 MSBuild：编 Tests 工程会经 ProjectReference 顺带把主工程也编成 Release，
+      # 主工程的 ZipReleaseOutput 目标照常产出发行 zip。
+      # （以前这里是 build 主工程(Release) + dotnet run 测试(默认 Debug)，
+      #   MainForm.cs 那种 145 KB 的文件被完整编了两遍，而且跑的是 Debug 二进制、
+      #   发的却是 Release 二进制。）
+      - name: 编译 Release（主工程 + Tests，含 tools 复制与 zip 打包）
         working-directory: PFS-BatchKit-Manager/PS2-HDD-File-Manager
         run: |
-          if ! dotnet build PS2-HDD-File-Manager.csproj -c Release --nologo > build.log 2>&1; then
+          if ! dotnet build Tests/PS2-HDD-File-Manager.Tests.csproj -c Release --nologo > build.log 2>&1; then
             echo "::error::dotnet build 失败::$(tail -n 30 build.log | tr -d '\r' | tr '\n' '|')"
             exit 1
           fi
           tail -n 5 build.log
 
+      # --no-build：直接跑上一步编好的 Release 产物，不再触发第二次编译
       - name: 运行回归测试
         working-directory: PFS-BatchKit-Manager/PS2-HDD-File-Manager
         run: |
-          if ! dotnet run --project Tests/PS2-HDD-File-Manager.Tests.csproj > tests.log 2>&1; then
+          if ! dotnet run --project Tests/PS2-HDD-File-Manager.Tests.csproj -c Release --no-build > tests.log 2>&1; then
             echo "::error::回归测试失败::$(tail -n 30 tests.log | tr -d '\r' | tr '\n' '|')"
             exit 1
           fi
           cat tests.log
 
-      - name: 校验产物
+      - name: 校验产物并准备上传
         working-directory: PFS-BatchKit-Manager/PS2-HDD-File-Manager
         run: |
           set -e
@@ -179,13 +229,8 @@ jobs:
             exit 1
           fi
           printf '%d 个条目\n' "$(printf '%s\n' "$names" | wc -l)"
-
-      # archive: false 时 artifact 名取自文件名，所以复制成期望的名字再直传
-      - name: 准备上传文件
-        working-directory: PFS-BatchKit-Manager/PS2-HDD-File-Manager
-        run: |
-          set -e
-          cp bin/Release/PS2-HDD-File-Manager.zip "$GITHUB_WORKSPACE/PS2-HDD-File-Manager-Release-windows.zip"
+          # archive: false 时 artifact 名取自文件名，所以复制成期望的名字再直传
+          cp "$zip" "$GITHUB_WORKSPACE/PS2-HDD-File-Manager-Release-windows.zip"
           ls -l "$GITHUB_WORKSPACE/PS2-HDD-File-Manager-Release-windows.zip"
 
       - uses: actions/upload-artifact@v7
