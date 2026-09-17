@@ -131,15 +131,18 @@ pfsshell 不再单独出 artifact：meson 编出的 `pfsshell.exe` 经 csproj �
 
 ### 耗时与缓存
 
-PC job 稳态约 **1m10s**（首次、或 pfsshell 有更新时约 3m20s）。时间几乎都花在依赖侧而不是本仓库代码：一次实测 200 s 的分布是「装 MSYS2 工具链 102 s」+「`setup-dotnet` 32 s」+「编 pfsshell 10 s」+「编 Release 21 s」+ 其余 35 s。
+PC job 稳态实测 **93 s**（缓存命中）/ 231 s（冷缓存或 pfsshell 有更新）。时间几乎都花在依赖侧而不是本仓库代码：命中缓存后剩下的分布是「`setup-dotnet` 31 s」+「编 Release 主工程+Tests 33 s」+「两次 checkout 11 s」+「上传 5 s」+ 前后处理 ~13 s。
 
 | 手段 | 效果 |
 |------|------|
 | `pfsshell.exe` 按上游 commit SHA 用 `actions/cache` 预热（key `pfsshell-exe-<os>-<arch>-<sha>`，只缓存那一个 exe） | 命中即整段跳过「clone 源码 + 装 MSYS2 + meson 编译」，省 ~118 s。只有 `362053534/pfsshell` 的 `master` 变了才真重编；SHA 解析失败时自动退回全量编译，不会静默用错缓存 |
-| 主工程与 Tests 合成一次 `dotnet build Tests -c Release`（`ProjectReference` 会把主工程一起带成 Release），回归测试改 `dotnet run --no-build` | 少编一遍 145 KB 的 `MainForm.cs`，并且测试跑的就是要发布的 Release 二进制（以前跑的是 Debug） |
+| 主工程与 Tests 合成一次 `dotnet build Tests -c Release`（`ProjectReference` 会把主工程一起带成 Release），回归测试改 `dotnet run --no-build` | 时间上基本持平（省掉的重复编译 ≈ 合并带来的额外调度），真正的收益是**回归测试跑的就是要发布的 Release 二进制**——以前它跑 Debug、发的却是 Release |
 | PC 端 zip 用 `upload-artifact@v7` + `archive: false` 直传 | 少一层零收益的重复压缩 |
 
-还能再省但**没做**的两项，按需自取：`windows-latest` 自带 .NET 8 SDK，删掉 `actions/setup-dotnet` 那步可再省 ~32 s（代价是不再锁定 SDK 补丁版本）；纯文档提交可用 `on.push.paths-ignore: ['**/*.md']` 让 PC job 根本不触发。
+还能再省但**没做**的两项，按需自取：
+
+- `setup-dotnet` 的 31 s：`dotnet-version: 8.0.x` 是个**区间**，动作会去解析"最新 8.0.x"再把镜像里没带的那个补丁版本下载下来。`windows-latest` 自带 SDK `8.0.130 / 8.0.206 / 8.0.319 / 8.0.424`（另有 9.x、10.x），把版本**钉成镜像已有的**（如 `8.0.424`）就只剩"命中 tool cache + 改 PATH"，几秒完事；代价是镜像轮换后要记得跟一次版本号——不跟也不会失败，只是退回"再下载一次"。整步删掉也能跑，但那是拿 SDK 10 去编 `net8.0-windows`（编译器版本跟着镜像漂、还要从 nuget.org 拉引用包），发布链路不建议。
+- 纯文档提交可用 `on.push.paths-ignore: ['**/*.md']`，让 PC job 根本不触发。
 
 PC job 会在 runner 上按 `csproj` 写死的相对路径还原依赖布局，因此本仓库被检出到 `<workspace>/PFS-BatchKit-Manager/PS2-HDD-File-Manager`：
 

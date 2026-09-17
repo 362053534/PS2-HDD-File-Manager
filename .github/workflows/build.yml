@@ -5,12 +5,13 @@ name: Build
 #   2) PS2 端 PfsNetServer.elf（ubuntu-latest + 362053534 的 Docker 编译镜像）
 # 产物统一用 upload-artifact 提供下载。
 #
-# 提速（PC job 实测 3m20s → 缓存命中时约 1m10s）：
+# 提速（PC job 实测 200s → 缓存命中 93s）：
 #   - pfsshell.exe 按上游 HEAD SHA 用 actions/cache 预热：命中就整段跳过
 #     「装 MSYS2 工具链(102s) + meson 编译(10s) + clone 源码(6s)」，它占 PC job 的 59%；
-#   - 主工程与 Tests 合并成一次 Release 编译（原来 145 KB 的 MainForm.cs 被编两遍）；
-#   - 没动的：setup-dotnet 那 32s —— windows-latest 自带 .NET 8 SDK，删掉该步即可再省
-#     32s，代价是不再锁定 SDK 补丁版本，自行取舍。
+#   - 主工程与 Tests 合成一次 Release 编译（原来 145 KB 的 MainForm.cs 被编两遍，
+#     且回归测试跑的是 Debug 二进制、发的是 Release）；
+#   - 没动的：setup-dotnet 那 31s。`dotnet-version: 8.0.x` 是区间，动作会下载镜像里
+#     没有的最新补丁；钉成镜像自带的 8.0.424 即可降到几秒，只是以后要跟着镜像换版本号。
 #
 # 关于压缩层数：csproj 的 ZipReleaseOutput 已经产出可分发 zip（第 1 层，PowerShell
 # Compress-Archive，与 7-Zip 无关）。upload-artifact 默认还会把上传内容再打成
