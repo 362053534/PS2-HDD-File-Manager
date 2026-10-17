@@ -27,7 +27,7 @@ internal sealed class ApaSpaceReader
             HeaderBytes,
             FileOptions.RandomAccess);
 
-        var totalBytes = stream.Length;
+        var totalBytes = ApaPartitionTableReader.ResolveStreamTotalBytes(stream, devicePath);
         if (totalBytes < HeaderBytes)
             throw new InvalidDataException("磁盘容量不足，无法读取 APA 分区表。");
         var totalSectors = (ulong)totalBytes / SectorSize;

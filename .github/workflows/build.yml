@@ -1,31 +1,30 @@
 name: Build
 
-# push 时自动编译两条链：
+# push 时自动编译三条链：
 #   1) PC 端 Release（windows-latest，含 pfsshell 源码编译 + tools 打包 + 测试）
-#   2) PS2 端 PfsNetServer.elf（ubuntu-latest + 362053534 的 Docker 编译镜像）
+#   2) Mac 端 Release（macos-latest，Avalonia UI + macOS pfsshell 源码编译 + .app 打包 + 测试）
+#   3) PS2 端 PfsNetServer.elf（ubuntu-latest + 362053534 的 Docker 编译镜像）
 # 产物统一用 upload-artifact 提供下载。
 #
 # 提速（PC job 实测 200s → 缓存命中 93s）：
-#   - pfsshell.exe 按上游 HEAD SHA 用 actions/cache 预热：命中就整段跳过
-#     「装 MSYS2 工具链(102s) + meson 编译(10s) + clone 源码(6s)」，它占 PC job 的 59%；
+#   - pfsshell（win32 / macos）按上游 HEAD SHA 用 actions/cache 预热：命中就整段跳过
+#     工具链安装、clone 源码与 meson 编译；
 #   - 主工程与 Tests 合成一次 Release 编译（原来 145 KB 的 MainForm.cs 被编两遍，
 #     且回归测试跑的是 Debug 二进制、发的是 Release）；
 #   - 没动的：setup-dotnet 那 31s。`dotnet-version: 8.0.x` 是区间，动作会下载镜像里
 #     没有的最新补丁；钉成镜像自带的 8.0.424 即可降到几秒，只是以后要跟着镜像换版本号。
 #
-# 关于压缩层数：csproj 的 ZipReleaseOutput 已经产出可分发 zip（第 1 层，PowerShell
-# Compress-Archive，与 7-Zip 无关）。upload-artifact 默认还会把上传内容再打成
-# 一个 zip（第 2 层，纯浪费：已 deflate 的内容体积几乎不变，还得解压两次）。
-# 所以 PC 端那个 zip 用 @v7 + `archive: false`「直传」，下载即得可用的 zip。
+# 关于压缩层数：csproj 的 ZipReleaseOutput / build-release-mac.sh 已经产出可分发 zip（第 1 层）。
+# upload-artifact 默认还会把上传内容再打成一个 zip（第 2 层，纯浪费：已 deflate 的内容体积几乎不变，还得解压两次）。
+# 所以 PC 端与 Mac 端的 zip 均用 @v7 + `archive: false`「直传」，下载即得可用的 zip。
 #   注意：archive: false 只允许单个文件，且 `name` 输入被忽略，
-#         artifact 名 = 文件名（所以先把 zip 复制成带 -windows 后缀的名字）。
+#         artifact 名 = 文件名（所以先把 zip 复制成带 -windows / -macos 后缀的名字）。
 #   ELF 仍走默认打包：它没被压过，外层 zip 是有效压缩，不算重复。
 #
-# pfsshell 不需要单独出 artifact：meson 编出的 pfsshell.exe 由 csproj 的
-# None Include + Link="tools\pfsshell.exe" 直接复制进 tools\，随发行 zip 一起分发。
+# pfsshell 不需要单独出 artifact：meson 编出的 pfsshell 二进制直接打进各自平台的 tools/，随发行 zip 一起分发。
 #
 # 上游依赖（全部来自 362053534，见 AGENTS.md）：
-#   - 362053534/pfsshell            → tools\pfsshell.exe（meson 源码编译）
+#   - 362053534/pfsshell            → tools\pfsshell.exe (Windows) / tools/pfsshell (macOS)
 #   - 362053534/PFS-BatchKit-Manager→ tools\{hdl_dump.exe,wnbd-client.exe,libwnbd.dll}
 #   - ghcr.io/362053534/ps2homebrew:main → 内含 362053534/ps2toolchain + ps2sdk + ps2sdk-ports
 #     的编译产物（PS2SDK=/usr/local/ps2dev/ps2sdk，含 iop/irx/*.irx）
@@ -238,6 +237,141 @@ jobs:
         with:
           path: PS2-HDD-File-Manager-Release-windows.zip
           archive: false # 不再套一层 artifact zip，下载即得可用 zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Mac 端
+  mac-release:
+    name: Mac Release (net8.0 osx-arm64)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 取 pfsshell 上游 HEAD SHA
+        id: pfsshell-sha
+        run: |
+          sha="$(git ls-remote "https://github.com/${PFS_SHELL_REPO}.git" \
+                   "refs/heads/${PFS_SHELL_REF}" "refs/tags/${PFS_SHELL_REF}" "${PFS_SHELL_REF}" 2>/dev/null \
+                 | awk '$2 !~ /\^\{\}$/ {print $1; exit}')"
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::取不到 ${PFS_SHELL_REPO}@${PFS_SHELL_REF} 的 SHA（得到：'$sha'），本次跳过缓存、全量编译 pfsshell"
+            echo "sha=skip" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "pfsshell ${PFS_SHELL_REF} = $sha"
+          fi
+
+      - name: 还原 pfsshell (macOS) 缓存
+        id: pfsshell-cache
+        if: steps.pfsshell-sha.outputs.sha != 'skip'
+        uses: actions/cache@v4
+        with:
+          path: pfsshell/build-local-macos/pfsshell
+          key: pfsshell-macos-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
+
+      - name: Checkout pfsshell 源码
+        if: steps.pfsshell-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PFS_SHELL_REPO }}
+          ref: ${{ env.PFS_SHELL_REF }}
+          path: pfsshell
+
+      - name: 编译 macOS pfsshell
+        if: steps.pfsshell-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          python3 -m pip install --user --break-system-packages meson ninja 2>/dev/null \
+            || python3 -m pip install --user meson ninja
+          export PATH="$(python3 -m site --user-base)/bin:$PATH"
+          # 修正 POSIX 下 do_put 的双参数（put <local_path> <remote_name>），使其与 Windows 分支一致
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("pfsshell/src/shell.c")
+          s = p.read_text(encoding="utf-8")
+          old = "    const char *remote_name = argv[1];\n#ifdef _WIN32"
+          new = "    const char *remote_name = (argc >= 3) ? argv[2] : argv[1];\n#ifdef _WIN32"
+          assert old in s, "do_put pattern not found in shell.c"
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          cd pfsshell
+          if ! meson setup build-local-macos -Denable_pfs2tar=false > setup.log 2>&1; then
+            echo "::error::macOS meson setup 失败::$(tail -n 25 setup.log | tr '\n' '|')"
+            exit 1
+          fi
+          if ! meson compile -C build-local-macos pfsshell > compile.log 2>&1; then
+            echo "::error::macOS meson compile 失败::$(tail -n 25 compile.log | tr '\n' '|')"
+            exit 1
+          fi
+          chmod +x build-local-macos/pfsshell
+          test -s build-local-macos/pfsshell || { echo "::error::macOS pfsshell 未生成或为 0 字节"; exit 1; }
+          file build-local-macos/pfsshell
+          ls -l build-local-macos/pfsshell
+
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+        with:
+          path: PS2-HDD-File-Manager
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 编译并打包 macOS Release (.app)
+        working-directory: PS2-HDD-File-Manager
+        run: |
+          chmod +x ./build-release-mac.sh ./ ../pfsshell/build-local-macos/pfsshell || true
+          if ! PFSSHELL_BIN="$GITHUB_WORKSPACE/pfsshell/build-local-macos/pfsshell" RID=osx-arm64 ./build-release-mac.sh > build-mac.log 2>&1; then
+            echo "::error::macOS Release 编译失败::$(tail -n 30 build-mac.log | tr '\n' '|')"
+            cat build-mac.log
+            exit 1
+          fi
+          tail -n 10 build-mac.log
+
+      - name: 运行 macOS 回归测试与 pfsshell 冒烟测试
+        working-directory: PS2-HDD-File-Manager
+        run: |
+          set -e
+          app_bin="bin/Release/PS2-HDD-File-Manager.app/Contents/MacOS/PS2-HDD-File-Manager"
+          pfs_bin="bin/Release/PS2-HDD-File-Manager.app/Contents/MacOS/tools/pfsshell"
+          if ! "$app_bin" --run-tests > tests-mac.log 2>&1; then
+            echo "::error::macOS 回归测试失败::$(tail -n 30 tests-mac.log | tr '\n' '|')"
+            cat tests-mac.log
+            exit 1
+          fi
+          cat tests-mac.log
+          help_out="$(printf 'help\nexit\n' | "$pfs_bin" 2>&1 || true)"
+          printf '%s\n' "$help_out" | grep -q '~Command List~' \
+            || { echo "::error::macOS pfsshell 冒烟测试失败"; printf '%s\n' "$help_out"; exit 1; }
+
+      - name: 校验 macOS 产物并准备上传
+        working-directory: PS2-HDD-File-Manager
+        run: |
+          set -e
+          zip="bin/Release/PS2-HDD-File-Manager-Release-macos.zip"
+          test -s "$zip"
+          names="$(unzip -Z1 "$zip")"
+          for f in \
+            "PS2-HDD-File-Manager.app/Contents/Info.plist" \
+            "PS2-HDD-File-Manager.app/Contents/MacOS/PS2-HDD-File-Manager" \
+            "PS2-HDD-File-Manager.app/Contents/MacOS/tools/pfsshell"
+          do
+            printf '%s\n' "$names" | grep -qxF "$f" \
+              || { echo "::error::macOS 发行 zip 缺少 $f"; exit 1; }
+          done
+          if printf '%s\n' "$names" | grep -q '\.pdb$'; then
+            echo "::error::macOS 发行 zip 里混进了 *.pdb"
+            exit 1
+          fi
+          printf '%d 个条目\n' "$(printf '%s\n' "$names" | wc -l)"
+          cp "$zip" "$GITHUB_WORKSPACE/PS2-HDD-File-Manager-Release-macos.zip"
+          ls -lh "$GITHUB_WORKSPACE/PS2-HDD-File-Manager-Release-macos.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: PS2-HDD-File-Manager-Release-macos.zip
+          archive: false
           if-no-files-found: error
 
   # -------------------------------------------------------------- PS2 端

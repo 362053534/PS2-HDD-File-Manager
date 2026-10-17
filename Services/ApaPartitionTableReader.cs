@@ -47,8 +47,52 @@ internal sealed class ApaPartitionTableReader
                 FileShare.ReadWrite,
                 HeaderBytes,
                 FileOptions.RandomAccess);
-            return Read(new StreamApaSectorSource(stream), cancellationToken);
+            return Read(new StreamApaSectorSource(stream, ResolveStreamTotalBytes(stream, devicePath)), cancellationToken);
         }, cancellationToken);
+
+    internal static long ResolveStreamTotalBytes(FileStream stream, string devicePath)
+    {
+        try
+        {
+            var len = stream.Length;
+            if (len > 0)
+                return len;
+        }
+        catch
+        {
+            // 块设备在某些系统上不支持 fstat 长度
+        }
+
+        try
+        {
+            var saved = stream.Position;
+            var end = stream.Seek(0, SeekOrigin.End);
+            stream.Seek(saved, SeekOrigin.Begin);
+            if (end > 0)
+                return end;
+        }
+        catch
+        {
+            // 忽略并走平台工具兜底
+        }
+
+        if (OperatingSystem.IsMacOS() && devicePath.StartsWith("/dev/", StringComparison.Ordinal) && File.Exists("/usr/sbin/diskutil"))
+        {
+            try
+            {
+                var info = ProcessRunner.RunAsync("/usr/sbin/diskutil", $"info \"{devicePath}\"").GetAwaiter().GetResult();
+                var match = System.Text.RegularExpressions.Regex.Match(info.StandardOutput, @"\((\d+)\s+Bytes\)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (match.Success && long.TryParse(match.Groups[1].Value, out var bytes) && bytes > 0)
+                    return bytes;
+            }
+            catch
+            {
+                // 忽略
+            }
+        }
+
+        return 0;
+    }
 
     public Task<ApaPartitionTable> ReadAsync(IApaSectorSource source, CancellationToken cancellationToken) =>
         Task.Run(() => Read(source, cancellationToken), cancellationToken);
@@ -153,9 +197,9 @@ internal sealed class ApaPartitionTableReader
         return sum == BinaryPrimitives.ReadUInt32LittleEndian(header);
     }
 
-    private sealed class StreamApaSectorSource(FileStream stream) : IApaSectorSource
+    private sealed class StreamApaSectorSource(FileStream stream, long totalBytes) : IApaSectorSource
     {
-        public long TotalBytes => stream.Length;
+        public long TotalBytes => totalBytes;
 
         public Task ReadSectorsAsync(ulong lba, int count, Memory<byte> destination, CancellationToken cancellationToken)
         {

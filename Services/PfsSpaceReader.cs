@@ -31,7 +31,8 @@ internal sealed class PfsSpaceReader
             1024,
             FileOptions.RandomAccess);
 
-        var super = ReadAt(stream, ToByteOffset(partition.StartSector + SuperSector), 512);
+        var diskTotalBytes = ApaPartitionTableReader.ResolveStreamTotalBytes(stream, devicePath);
+        var super = ReadAt(stream, diskTotalBytes, ToByteOffset(partition.StartSector + SuperSector), 512);
         if (BinaryPrimitives.ReadUInt32LittleEndian(super.AsSpan(0, 4)) != PfsSuperMagic)
             throw new InvalidDataException("未读取到有效的 PFS 超级块。");
 
@@ -68,7 +69,7 @@ internal sealed class PfsSpaceReader
 
                 var bitmapBlock = checked((1u << inodeScale) + chunk + (sub == 0 ? MainBitmapBlockOffset : 0));
                 var bitmapSector = checked(partitionStarts[sub] + bitmapBlock * MetadataBlockSectors);
-                var bitmap = ReadAt(stream, ToByteOffset(bitmapSector), 1024);
+                var bitmap = ReadAt(stream, diskTotalBytes, ToByteOffset(bitmapSector), 1024);
                 for (var index = 0; index < bytesInChunk; index++)
                     freeZones += 8 - BitOperations.PopCount((uint)bitmap[index]);
             }
@@ -78,9 +79,9 @@ internal sealed class PfsSpaceReader
         return new PfsSpace(partition.TotalBytes, Math.Min(freeBytes, partition.TotalBytes), zoneSize);
     }
 
-    private static byte[] ReadAt(FileStream stream, long offset, int length)
+    private static byte[] ReadAt(FileStream stream, long totalBytes, long offset, int length)
     {
-        if (offset < 0 || offset > stream.Length - length)
+        if (offset < 0 || offset > totalBytes - length)
             throw new InvalidDataException("PFS 位图位置超出磁盘范围。");
         var data = new byte[length];
         stream.Position = offset;

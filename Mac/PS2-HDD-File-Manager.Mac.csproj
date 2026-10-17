@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>PS2-HDD-File-Manager</AssemblyName>
+    <RootNamespace>PfsExplorerLite</RootNamespace>
+    <BuiltInComInteropSupport>false</BuiltInComInteropSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.2.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Models\PfsEntry.cs" Link="Models\PfsEntry.cs" />
+    <Compile Include="..\Services\ApaPartitionTableReader.cs" Link="Services\ApaPartitionTableReader.cs" />
+    <Compile Include="..\Services\ApaSpaceReader.cs" Link="Services\ApaSpaceReader.cs" />
+    <Compile Include="..\Services\DiskDiscovery.cs" Link="Services\DiskDiscovery.cs" />
+    <Compile Include="..\Services\DiskSafeEject.cs" Link="Services\DiskSafeEject.cs" />
+    <Compile Include="..\Services\NbdClient.cs" Link="Services\NbdClient.cs" />
+    <Compile Include="..\Services\PfsNameEncoding.cs" Link="Services\PfsNameEncoding.cs" />
+    <Compile Include="..\Services\PfsShellClient.cs" Link="Services\PfsShellClient.cs" />
+    <Compile Include="..\Services\PfsSpaceReader.cs" Link="Services\PfsSpaceReader.cs" />
+    <Compile Include="..\Services\ProcessRunner.cs" Link="Services\ProcessRunner.cs" />
+    <Compile Include="..\Services\PfsNet\PfsNetApaSectorSource.cs" Link="Services\PfsNet\PfsNetApaSectorSource.cs" />
+    <Compile Include="..\Services\PfsNet\PfsNetClient.cs" Link="Services\PfsNet\PfsNetClient.cs" />
+    <Compile Include="..\Services\PfsNet\PfsNetCodec.cs" Link="Services\PfsNet\PfsNetCodec.cs" />
+    <Compile Include="..\Services\PfsNet\PfsNetProtocol.cs" Link="Services\PfsNet\PfsNetProtocol.cs" />
+  </ItemGroup>
+</Project>

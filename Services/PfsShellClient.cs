@@ -19,10 +19,23 @@ internal sealed class PfsShellClient
 
     public PfsShellClient(string toolsDirectory)
     {
-        _executablePath = Path.Combine(toolsDirectory, "pfsshell.exe");
+        _executablePath = ResolveExecutablePath(toolsDirectory);
     }
 
     public bool IsAvailable => File.Exists(_executablePath);
+
+    private static string ResolveExecutablePath(string toolsDirectory)
+    {
+        if (OperatingSystem.IsWindows())
+            return Path.Combine(toolsDirectory, "pfsshell.exe");
+
+        var unixPath = Path.Combine(toolsDirectory, "pfsshell");
+        if (File.Exists(unixPath))
+            return unixPath;
+
+        var exePath = Path.Combine(toolsDirectory, "pfsshell.exe");
+        return File.Exists(exePath) ? exePath : unixPath;
+    }
 
     public Task<ProcessResult> ListPartitionsAsync(string device, CancellationToken cancellationToken) =>
         RunSessionAsync(device, [], "ls", cancellationToken);

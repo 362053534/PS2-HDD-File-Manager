@@ -118,16 +118,17 @@ dotnet run --project Tests\PS2-HDD-File-Manager.Tests.csproj
 
 ## 持续集成（GitHub Actions）
 
-`.github/workflows/build.yml`，在 `push` / `pull_request` / 手动触发时跑两个 job，产物在 run 页面底部的 **Artifacts** 下载。
+`.github/workflows/build.yml`，在 `push` / `pull_request` / 手动触发时跑三个 job，产物在 run 页面底部的 **Artifacts** 下载。
 
 | Job | Runner | 产物 |
 |-----|--------|------|
 | `PC Release (net8.0-windows)` | `windows-latest` | `PS2-HDD-File-Manager-Release-windows.zip`（即 `bin\Release\PS2-HDD-File-Manager.zip`，已含 `tools\`） |
+| `Mac Release (net8.0 osx-arm64)` | `macos-latest` | `PS2-HDD-File-Manager-Release-macos.zip`（内含 `PS2-HDD-File-Manager.app` 自包含应用包及 `Contents/MacOS/tools/pfsshell`） |
 | `PS2 ELF (PfsNetServer)` | `ubuntu-latest` + `ghcr.io/362053534/ps2homebrew:main` | `PfsNetServer-elf` |
 
-PC 端 zip 用 `actions/upload-artifact@v7` + `archive: false` **直传**（不再套一层 artifact zip），下载即得可分发 zip 本身，解压一次就能用；`archive: false` 只支持单个文件、且 artifact 名取文件名（`name` 被忽略）。`PfsNetServer-elf` 保留默认打包：ELF 没被压过，那层 artifact zip 是有效压缩（约 2.7 MB → 1.0 MB），不属于重复压缩。
+PC 端与 Mac 端 zip 均用 `actions/upload-artifact@v7` + `archive: false` **直传**（不再套一层 artifact zip），下载即得可分发 zip 本身，解压一次就能用；`archive: false` 只支持单个文件、且 artifact 名取文件名（`name` 被忽略）。`PfsNetServer-elf` 保留默认打包：ELF 没被压过，那层 artifact zip 是有效压缩（约 2.7 MB → 1.0 MB），不属于重复压缩。
 
-pfsshell 不再单独出 artifact：meson 编出的 `pfsshell.exe` 经 csproj 的 `Link="tools\pfsshell.exe"` 直接进输出的 `tools\`，随发行 zip 一起走。作为替换，CI 的「校验产物」步骤会断言 zip 内确实有 `PS2-HDD-File-Manager.exe` + `tools\{pfsshell.exe,hdl_dump.exe,wnbd-client.exe,libwnbd.dll}` 且不含 `*.pdb`。
+pfsshell 不再单独出 artifact：Windows 下 meson 编出的 `pfsshell.exe` 经 csproj 的 `Link="tools\pfsshell.exe"` 直接进输出的 `tools\`，macOS 下 meson 编出的 `pfsshell` 直接打入 `PS2-HDD-File-Manager.app/Contents/MacOS/tools/pfsshell`，均随各自平台的发行 zip 一起走。CI 的「校验产物」步骤会断言 zip 内确实有主程序与对应 `tools/` 依赖、且不含 `*.pdb`。
 
 ### 耗时与缓存
 
@@ -172,7 +173,8 @@ PC job 还会跑 `Tests/`（退出码 = 失败断言数），失败即 job 失�
 ## 目录结构
 
 ```
-MainForm.cs                  单窗口 UI + 全部交互流程（本地 / 网络两条路径）
+MainForm.cs                  Windows 单窗口 UI + 全部交互流程（WinForms）
+Mac/                         macOS 图形界面工程（Avalonia UI，复用 Models/ 与 Services/）
 Models/                      PfsEntry
 Services/                    pfsshell 会话、进程执行、盘符发现、安全弹出、
                              APA/PFS 空间与分区表解析、剪贴板与虚拟文件
@@ -180,6 +182,7 @@ Services/PfsNet/             PfsNet 协议常量、编解码、客户端、APA �
 Tests/                       断言式回归测试（见上）
 ps2-server/                  PS2 端 ELF 源码、协议文档与已构建的 PfsNetServer.elf
 build-release.ps1/.cmd       Windows 发布脚本
+build-release-mac.sh         macOS 发布脚本（生成 .app 与 zip）
 ```
 
 PS2 端的实现状态、协议细节与编译方式见 [`ps2-server/README.md`](ps2-server/README.md) 与 [`ps2-server/PROTOCOL.md`](ps2-server/PROTOCOL.md)。

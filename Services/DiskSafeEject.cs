@@ -39,6 +39,28 @@ internal static class DiskSafeEject
         return int.TryParse(match.Groups["n"].Value, out driveNumber) && driveNumber >= 0;
     }
 
+    public static bool TryParseMacDiskPath(string devicePath, out string diskDevice)
+    {
+        diskDevice = string.Empty;
+        if (string.IsNullOrWhiteSpace(devicePath))
+            return false;
+
+        var match = Regex.Match(devicePath.Trim(), @"^/dev/r?disk(?<n>\d+)(?:s\d+)?$", RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return false;
+
+        diskDevice = $"/dev/disk{match.Groups["n"].Value}";
+        return true;
+    }
+
+    public static async Task EjectMacDiskAsync(string diskDevice, CancellationToken cancellationToken)
+    {
+        var diskutil = File.Exists("/usr/sbin/diskutil") ? "/usr/sbin/diskutil" : "diskutil";
+        var result = await ProcessRunner.RunAsync(diskutil, $"eject \"{diskDevice}\"", cancellationToken: cancellationToken);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"弹出 {diskDevice} 失败：{result.CombinedOutput}");
+    }
+
     public static DiskEjectOutcome EjectPhysicalDrive(int driveNumber)
     {
         if (driveNumber < 0)
