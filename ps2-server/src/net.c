@@ -198,32 +198,11 @@ extern unsigned int __real_SifSendCmd(int cmd, void *packet, int packet_size,
 extern unsigned int __real_iSifSendCmd(int cmd, void *packet, int packet_size,
                                        void *src_extra, void *dest_extra, int size_extra);
 
-#define PFSNET_SIF_DMA_RING_DEPTH 12
-static volatile int g_sifDmaRing[PFSNET_SIF_DMA_RING_DEPTH];
-static volatile int g_sifDmaRingIdx;
-
 unsigned int __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
 {
     unsigned int id;
-    int slot;
-    int oldId;
-    int oldIntr = DIntr();
-
-    slot = g_sifDmaRingIdx;
-    g_sifDmaRingIdx = (slot + 1) % PFSNET_SIF_DMA_RING_DEPTH;
-    oldId = g_sifDmaRing[slot];
-    if (oldIntr)
-        EIntr();
-
-    if (oldId > 0) {
-        while (SifDmaStat(oldId) >= 0)
-            nopdelay();
-    }
-
     while ((id = __real_SifSetDma(sdd, len)) == 0)
         nopdelay();
-
-    g_sifDmaRing[slot] = (int)id;
     return id;
 }
 
@@ -315,38 +294,22 @@ static volatile unsigned short int g_nmRxBufferNextRdPtr;
 static SifRpcDataQueue_t g_nmCbQueue;
 static SifRpcServerData_t g_nmCbSrv;
 
-#define PFSNET_NM_CLEAR_RING_DEPTH 8
-static volatile int g_nmClearDmaRing[PFSNET_NM_CLEAR_RING_DEPTH];
-static volatile int g_nmClearDmaIdx;
-
 static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
 {
     struct NetManBD *bd;
     SifDmaTransfer_t dmat;
-    int slot;
-    int oldId;
-    unsigned int id;
 
     bd = UNCACHED_SEG(&g_nmFrameBufferStatus[index]);
     bd->length = 0;
     bd->packet = packet;
     bd->payload = payload;
 
-    slot = g_nmClearDmaIdx;
-    g_nmClearDmaIdx = (slot + 1) % PFSNET_NM_CLEAR_RING_DEPTH;
-    oldId = g_nmClearDmaRing[slot];
-    if (oldId > 0) {
-        while (SifDmaStat(oldId) >= 0)
-            nopdelay();
-    }
-
     dmat.src = (void *)&g_nmFrameBufferStatus[index];
     dmat.dest = &g_nmRxIOPFrameBufferStatus[index];
     dmat.size = sizeof(struct NetManBD);
     dmat.attr = 0;
-    while ((id = __wrap_SifSetDma(&dmat, 1)) == 0)
+    while (__wrap_SifSetDma(&dmat, 1) == 0)
         nopdelay();
-    g_nmClearDmaRing[slot] = (int)id;
 }
 
 static s32 pfsnetNetManHandleRxEvent(s32 channel)

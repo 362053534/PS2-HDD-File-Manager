@@ -1615,10 +1615,11 @@ internal sealed class MainWindow : Window
             .Select(entry => new PfsClipboardSelection(entry.Name, entry.IsDirectory, entry.Size))
             .ToArray();
         var exportProgress = new VirtualExportProgressState();
+        var clipboardRoot = Path.Combine(AppDataDirectory, "Clipboard");
         var stagingDirectory = Path.Combine(
-            AppDataDirectory,
-            "Clipboard",
+            clipboardRoot,
             Guid.NewGuid().ToString("N"));
+        var succeeded = false;
 
         BeginFileTransfer();
         var ct = BeginTransferCancellation();
@@ -1627,6 +1628,17 @@ internal sealed class MainWindow : Window
             await RunBusyAsync($"正在复制 {sourceItems.Length} 个项目到剪贴板…", async () =>
             {
                 var files = await BuildVirtualClipboardFilesAsync(device, partition, sourcePath, sourceItems, exportProgress);
+                try
+                {
+                    if (Directory.Exists(clipboardRoot))
+                    {
+                        foreach (var oldDir in Directory.GetDirectories(clipboardRoot))
+                        {
+                            try { Directory.Delete(oldDir, recursive: true); } catch { }
+                        }
+                    }
+                }
+                catch { }
                 Directory.CreateDirectory(stagingDirectory);
 
                 foreach (var file in files)
@@ -1647,11 +1659,21 @@ internal sealed class MainWindow : Window
                     .ToArray();
 
                 await SetClipboardFilesAsync(topLevelPaths);
+                succeeded = true;
                 AppendLog($"已将 {topLevelPaths.Length} 个项目复制到剪贴板（可在 Finder 中直接粘贴，暂存目录：{stagingDirectory}）。");
             });
         }
         finally
         {
+            if (!succeeded)
+            {
+                try
+                {
+                    if (Directory.Exists(stagingDirectory))
+                        Directory.Delete(stagingDirectory, recursive: true);
+                }
+                catch { }
+            }
             HideVirtualExportProgress();
             EndTransferCancellation();
             EndFileTransfer();
@@ -1740,10 +1762,10 @@ internal sealed class MainWindow : Window
             {
                 await RunBusyAsync($"正在导入 {items.Length} 个项目…", async () =>
                 {
-                    var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
                     var pendingImports = new List<PfsImportRequest>();
                     foreach (var item in items)
-                        await ImportLocalItemAsync(item, device, partition, _currentPath, cache, hasConflicts, progress, spaceBudget, pendingImports);
+                        await ImportLocalItemAsync(item, device, partition, _currentPath, entryCache, hasConflicts, progress, spaceBudget, pendingImports);
+                    progress.Timer.Restart();
                     await ImportPendingFilesAsync(device, partition, pendingImports, progress, ct);
                     await RefreshDirectoryAsync();
                 });

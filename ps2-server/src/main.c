@@ -298,14 +298,13 @@ int main(int argc, char *argv[])
         waitStartToExit();
     }
 
-    {
-        /* FILEXIO.IRX 的 RPC 线程优先级为 40(0x28)，而 SMAP.IRX 默认线程优先级也是 40(0x28)。
-         * 将 SMAP 线程优先级设为 36(0x24)，使其在写盘期间收到以太网中断时可立即抢占排空 16KB 硬件 RX FIFO。 */
-        static char smapArg[] = "thpri=36";
-        loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
-        loadModuleBuffer(SMAP_irx, size_SMAP_irx, sizeof(smapArg), smapArg);
-        NetManInit();
-    }
+    loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
+    /* SMAP.IRX 保持默认优先级 40(0x28)，与 FILEXIO.IRX(40) 同级：
+     * ATAD 每 DMA 传输 8KiB(16 扇区, ~250us) 即在 WaitEventFlag(ata_evflg) 上睡眠等待硬盘排空 SPEED FIFO，
+     * 期间主动让出 IOP CPU 与 dev9 dma_lock_sem 供 SMAP 排空 16KB RX FIFO；
+     * 若把 SMAP 提至高于 40（如 36），SignalSema(dma_lock_sem) 会被 SMAP 持续抢占，饿死 FILEXIO 导致收写退化为串行半速。 */
+    loadModuleBuffer(SMAP_irx, size_SMAP_irx, 0, NULL);
+    NetManInit();
 
     /*
      * 1) DHCP
@@ -334,9 +333,19 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* 在网络栈与 USB 分配完 IOP 堆之后再设置 64KiB RWBufferSize：
-     * 既大幅减少 SIF 往返次数，又避免单次 128KiB+ SIF1 DMA 长时间阻塞 NETMAN_TxThread 发送 TCP ACK。 */
-    fileXioSetRWBufferSize(64 * 1024);
+    /* 大 RW 缓冲放到所有 IOP 模块加载完成后再申请（512KiB -> 256KiB -> 128KiB）：
+     * 单次 512KiB fileXioWrite 仅需 1 次 SifRpcGetOtherData、1 次 PFS 连续块扩展与 1 次 LBA48 WRITE_DMA_EXT，
+     * 消除 64KiB 分块带来的 8 倍 SIF RPC 往返与 ATA 命令拆分开销。 */
+    {
+        int rw = 512 * 1024;
+        if (fileXioSetRWBufferSize(rw) < 0) {
+            rw = 256 * 1024;
+            if (fileXioSetRWBufferSize(rw) < 0) {
+                rw = 128 * 1024;
+                fileXioSetRWBufferSize(rw);
+            }
+        }
+    }
 
     /* 清屏后只保留最终状态；链路用 DHCP 阶段缓存，不再 NetManIoctl */
     ethGetIpDisplay(ipText, sizeof(ipText));

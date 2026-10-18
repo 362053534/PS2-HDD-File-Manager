@@ -21,14 +21,10 @@
 #define PFSNET_XFER_NONE 0
 #define PFSNET_XFER_PUT 1
 #define PFSNET_XFER_GET 2
-/* 512KiB：对齐 HDL 大批次，显著减少 fileXio SIF 往返；环形缓冲默认 16 槽（8MiB） */
+/* 512KiB：对齐 HDL 大批次，显著减少 fileXio SIF 往返；双缓冲另占一份 */
 #define PFSNET_XFER_BUF (512 * 1024)
-#define PFSNET_RING_MAX_BANKS 16
 #define PFSNET_IO_STACK 0x2000
 #define PFSNET_PUT_OVERWRITE 1u
-
-#define PFSNET_IO_MODE_SINGLE 0
-#define PFSNET_IO_MODE_PUT_RING 1
 
 extern void *_gp;
 
@@ -48,12 +44,7 @@ static struct {
     char finalPath[768];
 } g_xfer;
 
-/* 连续分配多槽环形缓冲（对齐 HDLGameInstaller）：
- * Put 期间 ioWorker 持续将 TCP 数据排空进空闲槽，clientThread 从就绪槽合并连续块写盘，
- * 彻底消除 2 槽乒乓在 PFS 元数据/跨区写盘停顿时的 TCP ZeroWindow 锁步等待。 */
-static uint8_t *g_ringBase;
-static int g_ringBanks;
-static volatile int g_ringBankLen[PFSNET_RING_MAX_BANKS];
+/* [0]/[1] 乒乓：堆上分配，避免 ~1MiB BSS 拖慢 crt0 清零 / 撑大 ELF MemSiz */
 static uint8_t *g_xferBuf[2];
 static uint32_t g_tempSeq;
 
@@ -61,18 +52,13 @@ static uint32_t g_tempSeq;
 static uint8_t g_ioStack[PFSNET_IO_STACK] __attribute__((aligned(16)));
 static int g_ioSemStart = -1;
 static int g_ioSemDone = -1;
-static int g_putFreeSem = -1;
-static int g_putFillSem = -1;
 static int g_ioTid = -1;
 static int g_ioAsync;
-static int g_ioMode;
 static int g_ioSock;
 static void *g_ioBuf;
 static int g_ioLen;
 static int g_ioResult;
 static int g_ioIsSend;
-static uint64_t g_putTotalBytes;
-static volatile int g_putStop;
 static int32_t g_lastPutErr;
 
 static void clearXferState(void)
@@ -88,7 +74,6 @@ static void clearXferState(void)
 
 static void abortXferCleanup(void)
 {
-    g_putStop = 1;
     if (g_xfer.dataSock >= 0) {
         close(g_xfer.dataSock);
         g_xfer.dataSock = -1;
@@ -116,24 +101,14 @@ int pfsnetFsInit(void)
     g_mountedTotalBytes = 0;
     clearXferState();
 
-    if (!g_ringBase) {
-        static const int bankTry[] = { PFSNET_RING_MAX_BANKS, 8, 4, 2 };
-        unsigned int i;
-        for (i = 0; i < sizeof(bankTry) / sizeof(bankTry[0]); i++) {
-            size_t total = (size_t)bankTry[i] * (size_t)PFSNET_XFER_BUF;
-            g_ringBase = (uint8_t *)memalign(64, total);
-            if (g_ringBase != NULL) {
-                g_ringBanks = bankTry[i];
-                break;
-            }
-        }
-    }
-    if (!g_ringBase || g_ringBanks < 2) {
+    if (!g_xferBuf[0])
+        g_xferBuf[0] = (uint8_t *)memalign(64, PFSNET_XFER_BUF);
+    if (!g_xferBuf[1])
+        g_xferBuf[1] = (uint8_t *)memalign(64, PFSNET_XFER_BUF);
+    if (!g_xferBuf[0] || !g_xferBuf[1]) {
         scr_printf("FATAL: xfer buf alloc failed\n");
         return -1;
     }
-    g_xferBuf[0] = g_ringBase;
-    g_xferBuf[1] = g_ringBase + PFSNET_XFER_BUF;
 
     initIoWorker();
     return 0;
@@ -142,7 +117,6 @@ int pfsnetFsInit(void)
 void pfsnetFsAbortActiveSocket(void)
 {
     int sock = g_xfer.dataSock;
-    g_putStop = 1;
     if (sock >= 0)
         shutdown(sock, SHUT_RDWR);
 }
@@ -626,37 +600,6 @@ static void ioWorker(void *arg)
     (void)arg;
     for (;;) {
         WaitSema(g_ioSemStart);
-        if (g_ioMode == PFSNET_IO_MODE_PUT_RING) {
-            uint64_t netRem = g_putTotalBytes;
-            int wrIdx = 0;
-
-            while (netRem > 0 && !g_putStop) {
-                int chunk = netRem > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)netRem;
-                uint8_t *dst = g_ringBase + ((size_t)wrIdx * (size_t)PFSNET_XFER_BUF);
-                int r;
-
-                WaitSema(g_putFreeSem);
-                if (g_putStop) {
-                    g_ringBankLen[wrIdx] = -1;
-                    SignalSema(g_putFillSem);
-                    break;
-                }
-                r = xferRecvAll(g_ioSock, dst, chunk);
-                if (r != chunk) {
-                    g_ringBankLen[wrIdx] = -1;
-                    SignalSema(g_putFillSem);
-                    break;
-                }
-                g_ringBankLen[wrIdx] = r;
-                SignalSema(g_putFillSem);
-                netRem -= (uint64_t)r;
-                wrIdx++;
-                if (wrIdx >= g_ringBanks)
-                    wrIdx = 0;
-            }
-            SignalSema(g_ioSemDone);
-            continue;
-        }
         if (g_ioIsSend)
             g_ioResult = xferSendAll(g_ioSock, g_ioBuf, g_ioLen);
         else
@@ -684,27 +627,13 @@ static int initIoWorker(void)
         return -1;
     }
 
-    memset(&sem, 0, sizeof(sem));
-    sem.init_count = 0;
-    sem.max_count = PFSNET_RING_MAX_BANKS;
-    g_putFreeSem = CreateSema(&sem);
-    g_putFillSem = CreateSema(&sem);
-    if (g_putFreeSem < 0 || g_putFillSem < 0) {
-        g_ioAsync = 0;
-        return -1;
-    }
-
     memset(&th, 0, sizeof(th));
     th.func = &ioWorker;
     th.stack = g_ioStack;
     th.stack_size = sizeof(g_ioStack);
     th.gp_reg = &_gp;
-    /* 必须高于 NETMAN_RxThread(0x59) 且略低于 clientThread(0x40)：
-     * lwIP 的 pcb->rcv_wnd 在 tcp_input(NETMAN_RxThread) 中扣减，仅在应用线程调用
-     * netconn_recv_tcp_pbuf -> tcp_recved 时恢复。ioWorker(0x42) 高于 NETMAN_RxThread(0x59)
-     * 可在每收到一个分片释放 lock_tcpip_core 后立即调用 tcp_recved 推进窗口右沿并拷入 8MiB 环形缓冲，
-     * 避免 NETMAN_RxThread 连续收包把 rcv_wnd 扣到 0 触发 ZeroWindow 锯齿停顿。 */
-    th.initial_priority = 0x42;
+    /* 必须低于客户端(0x40)：若 I/O 线程更高优，recv/send 有数据时会饿死 fileXio，双缓冲退化成串行≈半速 */
+    th.initial_priority = 0x41;
     th.attr = 0;
     th.option = 0;
 
@@ -720,7 +649,6 @@ static int initIoWorker(void)
 
 static void ioBegin(int isSend, int sock, void *buf, int len)
 {
-    g_ioMode = PFSNET_IO_MODE_SINGLE;
     g_ioIsSend = isSend;
     g_ioSock = sock;
     g_ioBuf = buf;
@@ -846,73 +774,11 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     }
     g_xfer.dataSock = dataSock;
 
-    /* 多槽环形缓冲（16x512KiB = 8MiB）：ioWorker 连续排空 TCP 窗口，clientThread 合并连续就绪块写盘 */
+    /* 双缓冲（2x512KiB 乒乓）：收下一包 512KiB 的同时把上一包 512KiB 写入 HDD。
+     * 每轮严格限制在途网络接收不超过 1 个 512KiB 槽位，避免 ioWorker 以 100Mbps 线速无节制连续灌包
+     * 争抢 IOP DEV9 dma_lock_sem 与 SIF 总线导致写盘降速。 */
     g_lastPutErr = 0;
-    if (g_ioAsync && g_putFreeSem >= 0 && g_putFillSem >= 0) {
-        int i;
-        int rdIdx = 0;
-        int failed = 0;
-
-        while (PollSema(g_putFreeSem) == g_putFreeSem) {
-        }
-        while (PollSema(g_putFillSem) == g_putFillSem) {
-        }
-        for (i = 0; i < g_ringBanks; i++) {
-            g_ringBankLen[i] = 0;
-            SignalSema(g_putFreeSem);
-        }
-
-        g_putStop = 0;
-        g_putTotalBytes = totalBytes;
-        g_ioSock = dataSock;
-        g_ioMode = PFSNET_IO_MODE_PUT_RING;
-        SignalSema(g_ioSemStart);
-
-        while (got < totalBytes && !failed) {
-            int bankLen;
-            uint8_t *src;
-            int written = 0;
-
-            WaitSema(g_putFillSem);
-            bankLen = g_ringBankLen[rdIdx];
-            if (bankLen <= 0) {
-                if (g_lastPutErr == 0)
-                    g_lastPutErr = PFSNET_ERR_DATA_CONN;
-                failed = 1;
-                break;
-            }
-
-            src = g_ringBase + ((size_t)rdIdx * (size_t)PFSNET_XFER_BUF);
-
-            while (written < bankLen) {
-                int wr = fileXioWrite(fd, src + written, bankLen - written);
-                if (wr <= 0) {
-                    g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
-                    failed = 1;
-                    g_putStop = 1;
-                    shutdown(dataSock, SHUT_RDWR);
-                    break;
-                }
-                written += wr;
-            }
-
-            SignalSema(g_putFreeSem);
-
-            if (!failed)
-                got += (uint64_t)bankLen;
-
-            rdIdx++;
-            if (rdIdx >= g_ringBanks)
-                rdIdx = 0;
-        }
-
-        if (failed) {
-            g_putStop = 1;
-            shutdown(dataSock, SHUT_RDWR);
-            SignalSema(g_putFreeSem);
-        }
-        WaitSema(g_ioSemDone);
-    } else {
+    {
         int idx = 0;
         int havePending = 0;
         int pendingIdx = 0;

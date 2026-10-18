@@ -1347,10 +1347,10 @@ internal sealed class MainForm : Form
             {
                 await RunBusyAsync($"正在导入 {items.Length} 个项目…", async () =>
                 {
-                    var cache = new Dictionary<string, Dictionary<string, PfsEntry>>(StringComparer.OrdinalIgnoreCase);
                     var pendingImports = new List<PfsImportRequest>();
                     foreach (var item in items)
-                        await ImportLocalItemAsync(item, device, partition, _currentPath, cache, hasConflicts, progress, spaceBudget, pendingImports);
+                        await ImportLocalItemAsync(item, device, partition, _currentPath, entryCache, hasConflicts, progress, spaceBudget, pendingImports);
+                    progress.Timer.Restart();
                     await ImportPendingFilesAsync(device, partition, pendingImports, progress, ct);
                     await RefreshDirectoryAsync();
                 });
