@@ -358,8 +358,8 @@ internal sealed class PfsNetClient : IDisposable
                 catch (Exception ex) when (!ct.IsCancellationRequested && IsTransientTransferException(ex))
                 {
                     lastException = ex;
-                    var reconnected = await TryReconnectAndRemountUnlockedAsync(ct).ConfigureAwait(false);
-                    if (!reconnected || !IsConnected || _mountedPartition is null)
+                    await TryReconnectAndRemountUnlockedAsync(ct).ConfigureAwait(false);
+                    if (!IsConnected || _mountedPartition is null)
                     {
                         throw new IOException(
                             $"PfsNet 传输文件“{remoteFileName}”中断后无法重新连接 PS2（{_lastHost}）：{lastException.Message}",
