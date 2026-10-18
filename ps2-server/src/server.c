@@ -227,10 +227,22 @@ static void serverThread(void *arg)
             continue;
         }
 
-        /* 单客户端：若旧连接仍在，先踢掉 */
+        /* 单客户端：若旧连接仍在，主动关闭旧控制口与数据口，等旧线程清理退出后再接管新连接 */
         if (g_client.running) {
-            close(clientSock);
-            continue;
+            int oldFd = g_client.socket;
+            int waitTicks;
+            g_client.socket = -1;
+            if (oldFd >= 0) {
+                shutdown(oldFd, SHUT_RDWR);
+                close(oldFd);
+            }
+            pfsnetFsAbortActiveSocket();
+            for (waitTicks = 0; waitTicks < 300 && g_client.running; waitTicks++)
+                DelayThread(50000);
+            if (g_client.running) {
+                close(clientSock);
+                continue;
+            }
         }
 
         memset(&g_client, 0, sizeof(g_client));
@@ -315,6 +327,7 @@ void pfsnetStopServer(void)
         shutdown(clientFd, SHUT_RDWR);
         close(clientFd);
     }
+    pfsnetFsAbortActiveSocket();
 
     listenFd = g_listenSocket;
     g_listenSocket = -1;

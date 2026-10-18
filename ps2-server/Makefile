@@ -10,7 +10,19 @@ EE_INCS := -I./include -I$(PS2SDK)/ports/include -I$(PS2SDK)/ee/include -I$(PS2S
 # 对齐 HDDTester：DUMMY_* / KERNEL_NOPATCH + gc-sections；勿链 -lcdvd / ps2time
 EE_CFLAGS += -Os -fdata-sections -ffunction-sections -DNEWLIB_PORT_AWARE \
 	-DDUMMY_TIMEZONE -DDUMMY_LIBC_INIT -DKERNEL_NOPATCH -D_EE
-EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections -Wl,--wrap=sys_now -T$(PS2SDK)/ee/startup/linkfile
+EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
+	-Wl,--wrap=sys_now \
+	-Wl,--wrap=memp_init \
+	-Wl,--wrap=pbuf_alloc \
+	-Wl,--wrap=sys_init \
+	-Wl,--wrap=sys_mbox_new \
+	-Wl,--wrap=sys_mbox_free \
+	-Wl,--wrap=sys_mbox_post \
+	-Wl,--wrap=sys_mbox_trypost \
+	-Wl,--wrap=sys_arch_mbox_fetch \
+	-Wl,--wrap=sys_arch_mbox_tryfetch \
+	-Wl,--wrap=sys_arch_sem_wait \
+	-T$(PS2SDK)/ee/startup/linkfile
 EE_LIBS = -lpatches -lkernel -ldebug -lfileXio -lps2ip -lnetman -lpad
 
 EE_TEMP_FILES = IOMANX_irx.c FILEXIO_irx.c POWEROFF_irx.c DEV9_irx.c ATAD_irx.c HDD_irx.c PFS_irx.c \

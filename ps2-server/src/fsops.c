@@ -111,6 +111,13 @@ int pfsnetFsInit(void)
     return 0;
 }
 
+void pfsnetFsAbortActiveSocket(void)
+{
+    int sock = g_xfer.dataSock;
+    if (sock >= 0)
+        shutdown(sock, SHUT_RDWR);
+}
+
 void pfsnetFsForceUmount(void)
 {
     abortXferCleanup();
@@ -661,10 +668,16 @@ static void tuneDataSocket(int sock)
 {
     int yes = 1;
     int buf = PFSNET_XFER_BUF;
+    struct timeval tv;
 
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 /* 向控制连接对端（PC）的 45062 回连数据通道 */
@@ -756,6 +769,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         clearXferState();
         return 0;
     }
+    g_xfer.dataSock = dataSock;
 
     /* 双缓冲：收下一包同时把上一包写入 HDD */
     g_lastPutErr = 0;
@@ -782,6 +796,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
                     if (wr <= 0) {
                         g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                         failed = 1;
+                        shutdown(dataSock, SHUT_RDWR);
                         break;
                     }
                     written += wr;
@@ -821,6 +836,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         }
     }
 
+    g_xfer.dataSock = -1;
     close(dataSock);
     fileXioClose(fd);
 
@@ -925,12 +941,7 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         return pfsnetSendResponse(client, mapErrno(fd), NULL, 0);
 
     if (offset > 0) {
-        /* fileXioLseek 偏移为 32 位；V1 大文件 offset 预留为 0 */
-        if (offset > 0x7FFFFFFFu) {
-            fileXioClose(fd);
-            return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
-        }
-        if (fileXioLseek(fd, (int)offset, SEEK_SET) < 0) {
+        if (fileXioLseek64(fd, (s64)offset, FIO_SEEK_SET) < 0) {
             fileXioClose(fd);
             return pfsnetSendResponse(client, PFSNET_ERR_IO, NULL, 0);
         }
@@ -948,6 +959,7 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         fileXioClose(fd);
         return 0;
     }
+    g_xfer.dataSock = dataSock;
 
     /* 双缓冲：与 Put 对称——先启动上一块 send，再读下一块（重叠）。
      * 旧顺序「先读满再等 send」在读快于 TCP 时会让磁盘空等。 */
@@ -975,6 +987,8 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
                     int n = fileXioRead(fd, g_xferBuf[idx] + rd, chunk - rd);
                     if (n < 0) {
                         failed = 1;
+                        if (ioStarted)
+                            shutdown(dataSock, SHUT_RDWR);
                         break;
                     }
                     if (n == 0)
@@ -1020,6 +1034,7 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
     fileXioClose(fd);
 
     if (sent != toSend) {
+        g_xfer.dataSock = -1;
         close(dataSock);
         return 0;
     }

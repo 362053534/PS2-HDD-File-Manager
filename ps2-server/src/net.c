@@ -1,6 +1,10 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
+#include <limits.h>
 #include <kernel.h>
+#include <kernel_util.h>
 #include <timer.h>
 #include <delaythread.h>
 #include <debug.h>
@@ -20,6 +24,370 @@ extern void __ps2ipeeOpsInitializeImpl(void);
 uint32_t __wrap_sys_now(void)
 {
     return (uint32_t)(GetTimerSystemTime() / ((u64)kBUSCLK / 1000ULL));
+}
+
+/*
+ * 解决大文件顺序传输（如 2GB+ PFS 分段/子分区切换写盘停顿）时 PS2 端死锁断线：
+ *
+ * 1) PS2SDK libps2ip.a 默认 PBUF_POOL_SIZE = 128，其中 NETMAN 固定占走 64 个 RX 环缓冲，
+ *    仅剩 64 个 PBUF_POOL 供整个 lwIP 使用。当大文件写到约 2GB 触发 PFS 元数据/日志刷盘或
+ *    跨 APA 子分区找空闲块时，fileXioWrite 耗时变长，ioWorker 收完当前 512KiB 后暂停 recv，
+ *    主机端发来的 TCP 窗口帧 + 尾包/重传帧一旦塞满剩余 64 个 PBUF_POOL，EE 侧 NETMAN_RxThread
+ *    会在 while (AllocRxPacket() == NULL) {} 死循环，进而导致 IOP 侧 SMAP (优先级 0x28)
+ *    在 while (bd->length != 0) {} 忙等，饿死低优先级的 fileXio/pfs/atad 写盘线程，形成
+ *    EE <-> IOP 四方永久死锁。
+ * 2) 通过 wrap memp_init 与 pbuf_alloc，在启动时利用 EE 充裕内存向 PBUF_POOL 等池追加
+ *    512 个 64 字节对齐缓冲（可用 RX 缓冲从 64 扩至 576+），并在 pbuf_alloc 兜底动态扩容，
+ *    确保 AllocRxPacket 永不返回 NULL。
+ * 3) 同时替换 sys_arch 消息池（从 100 扩至 1024），并将 sys_arch_mbox_fetch / sys_arch_sem_wait
+ *    内部的 32 位 clock() 微秒计时替换为 64 位单调毫秒计时，消除 35.79 / 71.58 分钟溢出。
+ */
+struct lwip_memp_desc_min {
+    u16 size;
+};
+
+extern const struct lwip_memp_desc_min memp_PBUF_POOL;
+extern const struct lwip_memp_desc_min memp_PBUF;
+extern const struct lwip_memp_desc_min memp_TCP_SEG;
+extern const struct lwip_memp_desc_min memp_TCPIP_MSG_API;
+extern const struct lwip_memp_desc_min memp_NETBUF;
+extern const struct lwip_memp_desc_min memp_SYS_TIMEOUT;
+
+extern void __real_memp_init(void);
+extern void memp_free_pool(const void *desc, void *mem);
+extern struct pbuf *__real_pbuf_alloc(pbuf_layer l, u16 size, pbuf_type type);
+
+#define PFSNET_PBUF_POOL_STRIDE 1664u
+#define PFSNET_SMALL_POOL_STRIDE 64u
+
+static int g_extraMempInitialized;
+static volatile int g_dynamicPbufCount;
+
+static void expandLwipPool(const struct lwip_memp_desc_min *desc, u32 count, u32 minStride)
+{
+    u32 stride;
+    u8 *block;
+    u32 i;
+
+    if (!desc || count == 0)
+        return;
+    stride = desc->size;
+    if (stride < minStride)
+        stride = minStride;
+    stride = (stride + 63u) & ~63u;
+
+    block = (u8 *)memalign(64, stride * count);
+    if (!block)
+        return;
+    memset(block, 0, stride * count);
+    for (i = 0; i < count; i++)
+        memp_free_pool(desc, block + i * stride);
+}
+
+void __wrap_memp_init(void)
+{
+    __real_memp_init();
+    if (!g_extraMempInitialized) {
+        g_extraMempInitialized = 1;
+        expandLwipPool(&memp_PBUF_POOL, 512, PFSNET_PBUF_POOL_STRIDE);
+        expandLwipPool(&memp_TCP_SEG, 256, PFSNET_SMALL_POOL_STRIDE);
+        expandLwipPool(&memp_PBUF, 256, PFSNET_SMALL_POOL_STRIDE);
+        expandLwipPool(&memp_TCPIP_MSG_API, 256, PFSNET_SMALL_POOL_STRIDE);
+        expandLwipPool(&memp_NETBUF, 128, PFSNET_SMALL_POOL_STRIDE);
+        expandLwipPool(&memp_SYS_TIMEOUT, 64, PFSNET_SMALL_POOL_STRIDE);
+    }
+}
+
+struct pbuf *__wrap_pbuf_alloc(pbuf_layer l, u16 size, pbuf_type type)
+{
+    struct pbuf *p = __real_pbuf_alloc(l, size, type);
+    if (p != NULL)
+        return p;
+
+    if (type == PBUF_POOL && g_dynamicPbufCount < 1024) {
+        u32 stride = memp_PBUF_POOL.size;
+        void *extra;
+        if (stride < PFSNET_PBUF_POOL_STRIDE)
+            stride = PFSNET_PBUF_POOL_STRIDE;
+        stride = (stride + 63u) & ~63u;
+        extra = memalign(64, stride);
+        if (extra != NULL) {
+            memset(extra, 0, stride);
+            g_dynamicPbufCount++;
+            memp_free_pool(&memp_PBUF_POOL, extra);
+            p = __real_pbuf_alloc(l, size, type);
+        }
+    }
+    return p;
+}
+
+#define PFSNET_SYS_MAX_MESSAGES 1024
+#define PFSNET_SYS_ARCH_TIMEOUT 0xffffffffUL
+
+typedef struct pfsnet_arch_message {
+    struct pfsnet_arch_message *next;
+    void *sys_msg;
+} pfsnet_arch_message_t;
+
+typedef struct pfsnet_mbox_data {
+    int MessageCountSema;
+    pfsnet_arch_message_t *FirstMessage;
+    pfsnet_arch_message_t *LastMessage;
+} pfsnet_mbox_data_t;
+
+typedef pfsnet_mbox_data_t *pfsnet_sys_mbox_t;
+typedef int pfsnet_sys_sem_t;
+
+static pfsnet_arch_message_t g_msgPool[PFSNET_SYS_MAX_MESSAGES];
+static pfsnet_arch_message_t *g_freeHead;
+static int g_msgCountSema = -1;
+
+static pfsnet_arch_message_t *tryAllocMsg(void)
+{
+    pfsnet_arch_message_t *message;
+
+    if (PollSema(g_msgCountSema) == g_msgCountSema) {
+        DI();
+        message = g_freeHead;
+        if (message != NULL)
+            g_freeHead = message->next;
+        EI();
+    } else {
+        message = NULL;
+    }
+    return message;
+}
+
+static pfsnet_arch_message_t *allocMsg(void)
+{
+    pfsnet_arch_message_t *message;
+
+    WaitSema(g_msgCountSema);
+    DI();
+    message = g_freeHead;
+    if (message != NULL)
+        g_freeHead = message->next;
+    EI();
+    return message;
+}
+
+static void freeMsg(pfsnet_arch_message_t *msg)
+{
+    if (msg == NULL)
+        return;
+    DI();
+    msg->next = g_freeHead;
+    g_freeHead = msg;
+    EI();
+    SignalSema(g_msgCountSema);
+}
+
+static int waitSemaTimeoutMs(int sema, unsigned int msec)
+{
+    int ret;
+    u64 timeoutUsec;
+    u64 *timeoutPtr;
+
+    if (msec == 0) {
+        if (PollSema(sema) < 0)
+            return -1;
+        return sema;
+    }
+
+    timeoutPtr = NULL;
+    if (msec != UINT32_MAX) {
+        timeoutUsec = (u64)msec * 1000ULL;
+        timeoutPtr = &timeoutUsec;
+    }
+
+    ret = WaitSemaEx(sema, 1, timeoutPtr);
+    if (ret < 0)
+        return -1;
+    return sema;
+}
+
+static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **message)
+{
+    pfsnet_arch_message_t *nextMessage;
+
+    DI();
+    *message = mBox->FirstMessage;
+    nextMessage = ((*message != NULL) && ((unsigned int)(*message)->next != 0xFFFFFFFFu))
+        ? (*message)->next
+        : NULL;
+    if (mBox->FirstMessage == mBox->LastMessage)
+        mBox->LastMessage = NULL;
+    mBox->FirstMessage = nextMessage;
+    EI();
+}
+
+static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t mBox, u32 timeout)
+{
+    int result;
+
+    if (timeout > 0)
+        result = waitSemaTimeoutMs(mBox->MessageCountSema, timeout);
+    else
+        result = WaitSema(mBox->MessageCountSema);
+
+    if (result == mBox->MessageCountSema) {
+        retrieveMbxInternal(mBox, message);
+        return 0;
+    }
+    return -1;
+}
+
+static int pollMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t mBox)
+{
+    if (PollSema(mBox->MessageCountSema) == mBox->MessageCountSema) {
+        retrieveMbxInternal(mBox, message);
+        return 0;
+    }
+    return -1;
+}
+
+static void sendMbx(pfsnet_sys_mbox_t *mbox, pfsnet_arch_message_t *msg, void *sys_msg)
+{
+    DI();
+    msg->sys_msg = sys_msg;
+    msg->next = NULL;
+    if ((*mbox)->FirstMessage == NULL)
+        (*mbox)->FirstMessage = msg;
+    if ((*mbox)->LastMessage != NULL)
+        (*mbox)->LastMessage->next = msg;
+    (*mbox)->LastMessage = msg;
+    EI();
+    SignalSema((*mbox)->MessageCountSema);
+}
+
+void __wrap_sys_init(void)
+{
+    unsigned int i;
+    ee_sema_t sema;
+
+    sema.attr = 0;
+    sema.option = (u32)"PS2IP";
+    sema.init_count = PFSNET_SYS_MAX_MESSAGES;
+    sema.max_count = PFSNET_SYS_MAX_MESSAGES;
+    g_msgCountSema = CreateSema(&sema);
+
+    g_freeHead = &g_msgPool[0];
+    for (i = 0; i + 1 < PFSNET_SYS_MAX_MESSAGES; i++)
+        g_msgPool[i].next = &g_msgPool[i + 1];
+    g_msgPool[PFSNET_SYS_MAX_MESSAGES - 1].next = NULL;
+}
+
+err_t __wrap_sys_mbox_new(pfsnet_sys_mbox_t *mbox, int size)
+{
+    pfsnet_mbox_data_t *mBox;
+    ee_sema_t sema;
+
+    (void)size;
+    *mbox = NULL;
+
+    mBox = (pfsnet_mbox_data_t *)malloc(sizeof(pfsnet_mbox_data_t));
+    if (mBox == NULL)
+        return -1;
+
+    mBox->LastMessage = NULL;
+    mBox->FirstMessage = NULL;
+
+    sema.attr = 0;
+    sema.option = (u32)"PS2IP-msgcount";
+    sema.init_count = 0;
+    sema.max_count = PFSNET_SYS_MAX_MESSAGES;
+    mBox->MessageCountSema = CreateSema(&sema);
+    if (mBox->MessageCountSema < 0) {
+        free(mBox);
+        return -1;
+    }
+
+    *mbox = mBox;
+    return 0;
+}
+
+void __wrap_sys_mbox_free(pfsnet_sys_mbox_t *pMBox)
+{
+    pfsnet_arch_message_t *message, *nextMessage;
+
+    if (pMBox == NULL || *pMBox == NULL)
+        return;
+
+    message = (*pMBox)->FirstMessage;
+    while (message != NULL) {
+        nextMessage = message->next;
+        freeMsg(message);
+        message = nextMessage;
+    }
+
+    DeleteSema((*pMBox)->MessageCountSema);
+    free(*pMBox);
+    *pMBox = NULL;
+}
+
+err_t __wrap_sys_mbox_trypost(pfsnet_sys_mbox_t *mbox, void *sys_msg)
+{
+    pfsnet_arch_message_t *msg = tryAllocMsg();
+    if (msg != NULL) {
+        sendMbx(mbox, msg, sys_msg);
+        return 0;
+    }
+    return -1;
+}
+
+void __wrap_sys_mbox_post(pfsnet_sys_mbox_t *mbox, void *sys_msg)
+{
+    pfsnet_arch_message_t *msg = allocMsg();
+    if (msg != NULL)
+        sendMbx(mbox, msg, sys_msg);
+}
+
+u32 __wrap_sys_arch_mbox_fetch(pfsnet_sys_mbox_t *pMBox, void **ppvMSG, u32 u32Timeout)
+{
+    pfsnet_arch_message_t *pmsg = NULL;
+    u32 start = __wrap_sys_now();
+
+    if (receiveMbx(&pmsg, *pMBox, u32Timeout) == 0) {
+        u32 elapsed = __wrap_sys_now() - start;
+        if (pmsg != NULL) {
+            if (ppvMSG != NULL)
+                *ppvMSG = pmsg->sys_msg;
+            freeMsg(pmsg);
+        }
+        return elapsed;
+    }
+    return PFSNET_SYS_ARCH_TIMEOUT;
+}
+
+u32 __wrap_sys_arch_mbox_tryfetch(pfsnet_sys_mbox_t *pMBox, void **ppvMSG)
+{
+    pfsnet_arch_message_t *pmsg = NULL;
+
+    if (pollMbx(&pmsg, *pMBox) == 0) {
+        if (pmsg != NULL) {
+            if (ppvMSG != NULL)
+                *ppvMSG = pmsg->sys_msg;
+            freeMsg(pmsg);
+        }
+        return 0;
+    }
+    return PFSNET_SYS_ARCH_TIMEOUT;
+}
+
+u32 __wrap_sys_arch_sem_wait(pfsnet_sys_sem_t *sema, u32 timeout)
+{
+    if (timeout == 0)
+        return (WaitSema(*sema) == *sema) ? 0 : PFSNET_SYS_ARCH_TIMEOUT;
+    if (timeout == 1)
+        return (PollSema(*sema) == *sema) ? 0 : PFSNET_SYS_ARCH_TIMEOUT;
+    {
+        u32 start = __wrap_sys_now();
+        if (waitSemaTimeoutMs(*sema, timeout) == *sema) {
+            u32 waitTime = __wrap_sys_now() - start;
+            return (waitTime <= timeout) ? waitTime : timeout;
+        }
+        return PFSNET_SYS_ARCH_TIMEOUT;
+    }
 }
 
 #define ETH_TCPIP_PRIO 0x58 /* lwIP tcpip 线程，见 PS2SDK lwipopts.h */

@@ -328,6 +328,12 @@ internal sealed class PfsNetClient : IDisposable
                 {
                     if (!IsConnected || _mountedPartition is null)
                         await TryReconnectAndRemountUnlockedAsync(ct).ConfigureAwait(false);
+                    if (!IsConnected || _mountedPartition is null)
+                    {
+                        throw new IOException(
+                            $"PfsNet 传输文件“{remoteFileName}”中断后无法重新连接 PS2（{_lastHost}）：{lastException?.Message}",
+                            lastException);
+                    }
                     EnsureMounted();
                     EnsureDataChannel();
 
@@ -414,19 +420,57 @@ internal sealed class PfsNetClient : IDisposable
                 FileShare.Read,
                 FileBufferSize,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
-            var buffer = new byte[FileBufferSize];
+            var bufA = new byte[FileBufferSize];
+            var bufB = new byte[FileBufferSize];
+            var initialToRead = (int)Math.Min(bufA.Length, (long)totalBytes);
+            var currentLen = initialToRead > 0
+                ? await file.ReadAsync(bufA.AsMemory(0, initialToRead), ct).ConfigureAwait(false)
+                : 0;
+            if (initialToRead > 0 && currentLen <= 0)
+                throw new IOException("本地文件读取提前结束。");
+
+            long scheduledRead = currentLen;
             while (sent < (long)totalBytes)
             {
                 ct.ThrowIfCancellationRequested();
-                var toRead = (int)Math.Min(buffer.Length, (long)totalBytes - sent);
-                var n = await file.ReadAsync(buffer.AsMemory(0, toRead), ct).ConfigureAwait(false);
-                if (n <= 0)
+                if (currentLen <= 0)
                     throw new IOException("本地文件读取提前结束。");
 
-                await dataStream.WriteAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false);
-                sent += n;
+                Task<int>? nextReadTask = null;
+                if (scheduledRead < (long)totalBytes)
+                {
+                    var nextToRead = (int)Math.Min(bufB.Length, (long)totalBytes - scheduledRead);
+                    nextReadTask = file.ReadAsync(bufB.AsMemory(0, nextToRead), ct).AsTask();
+                }
+
+                try
+                {
+                    using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    writeCts.CancelAfter(TimeSpan.FromSeconds(60));
+                    using var writeTimeoutClose = writeCts.Token.Register(() =>
+                    {
+                        if (!ct.IsCancellationRequested)
+                        {
+                            try { dataClient.Client.Close(); } catch { }
+                        }
+                    });
+                    await dataStream.WriteAsync(bufA.AsMemory(0, currentLen), writeCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+                {
+                    throw new IOException("PfsNet 数据通道写入超时。", ex);
+                }
+
+                sent += currentLen;
                 if (progress is not null)
                     await progress(sent).ConfigureAwait(false);
+
+                if (nextReadTask is not null)
+                {
+                    currentLen = await nextReadTask.ConfigureAwait(false);
+                    scheduledRead += currentLen;
+                    (bufA, bufB) = (bufB, bufA);
+                }
             }
 
             await dataStream.FlushAsync(ct).ConfigureAwait(false);
@@ -488,7 +532,7 @@ internal sealed class PfsNetClient : IDisposable
 
         var host = _lastHost;
         var part = _lastMountedPartition;
-        for (var attempt = 1; attempt <= 3; attempt++)
+        for (var attempt = 1; attempt <= 5; attempt++)
         {
             try
             {
@@ -502,9 +546,9 @@ internal sealed class PfsNetClient : IDisposable
             catch
             {
                 try { DisconnectUnlocked(); } catch { }
-                if (attempt < 3)
+                if (attempt < 5)
                 {
-                    try { await Task.Delay(TimeSpan.FromMilliseconds(1000 * attempt), ct).ConfigureAwait(false); }
+                    try { await Task.Delay(TimeSpan.FromMilliseconds(1500 * attempt), ct).ConfigureAwait(false); }
                     catch { return; }
                 }
             }
@@ -533,7 +577,9 @@ internal sealed class PfsNetClient : IDisposable
         {
             dataClient.SendBufferSize = DataSocketBufferSize;
             dataClient.ReceiveBufferSize = DataSocketBufferSize;
-            dataClient.NoDelay = true;
+            // 单向大块顺序流关闭 Nagle 反而会让 512KiB%1460=108B 尾包与 65535 窗尾碎片化为小包，
+            // 额外消耗 PS2 侧 PBUF_POOL；保持 NoDelay=false 让内核合并为完整 1460B MSS 帧。
+            dataClient.NoDelay = false;
         }
         catch { /* 平台可能不支持，忽略 */ }
 
