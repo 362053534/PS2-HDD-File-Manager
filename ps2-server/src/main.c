@@ -158,7 +158,7 @@ static void padWatchThread(void *arg)
         if (!pfsnetPadPollAllowed()) {
             /* 收发中或停传未满 2 秒：不碰手柄，松开 START 后才重新武装 */
             armed = 0;
-            DelayThread(250000);
+            DelayThread(PAD_POLL_US);
             continue;
         }
 
@@ -287,9 +287,6 @@ int main(int argc, char *argv[])
     loadModuleBuffer(IOMANX_irx, size_IOMANX_irx, 0, NULL);
     loadModuleBuffer(FILEXIO_irx, size_FILEXIO_irx, 0, NULL);
     fileXioInit();
-    /* 64KiB 分块写盘：避免单次 128KiB SIF1 DMA 与 ATA PIO/DMA 长时间独占 IOP/DEV9，
-     * 让 SMAP RX 中断和 NETMAN 能够及时穿插排空 16KB 硬件 FIFO，防止 macOS 突发流量下丢包停顿 */
-    fileXioSetRWBufferSize(64 * 1024);
 
     loadMcStack();
     padSetup();
@@ -301,15 +298,14 @@ int main(int argc, char *argv[])
         waitStartToExit();
     }
 
-    loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
-    /* SMAP.IRX 默认优先级 40(0x28)，与 FILEXIO.IRX 相同；但必须低于 NETMAN RxThread (29/0x1d)，
-     * 否则 SMAP 抢占尚未完成 FrameBufferStatus SIF0 DMA 握手的 NETMAN 线程会造成双方互锁。
-     * 设为 36：高于 FILEXIO(40) 以便及时排空 16KB 网卡 RX FIFO，同时严格低于 NETMAN(29)。 */
     {
-        static const char smapArg[] = "thpri=36";
+        /* FILEXIO.IRX 的 RPC 线程优先级为 40(0x28)，而 SMAP.IRX 默认线程优先级也是 40(0x28)。
+         * 将 SMAP 线程优先级设为 36(0x24)，使其在写盘期间收到以太网中断时可立即抢占排空 16KB 硬件 RX FIFO。 */
+        static char smapArg[] = "thpri=36";
+        loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
         loadModuleBuffer(SMAP_irx, size_SMAP_irx, sizeof(smapArg), smapArg);
+        NetManInit();
     }
-    NetManInit();
 
     /*
      * 1) DHCP
@@ -337,6 +333,10 @@ int main(int argc, char *argv[])
             failNoIp();
         }
     }
+
+    /* 在网络栈与 USB 分配完 IOP 堆之后再设置 64KiB RWBufferSize：
+     * 既大幅减少 SIF 往返次数，又避免单次 128KiB+ SIF1 DMA 长时间阻塞 NETMAN_TxThread 发送 TCP ACK。 */
+    fileXioSetRWBufferSize(64 * 1024);
 
     /* 清屏后只保留最终状态；链路用 DHCP 阶段缓存，不再 NetManIoctl */
     ethGetIpDisplay(ipText, sizeof(ipText));

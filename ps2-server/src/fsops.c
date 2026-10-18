@@ -56,7 +56,6 @@ static volatile int g_ringBankLen[PFSNET_RING_MAX_BANKS];
 static int g_putFreeSem = -1;
 static int g_putFillSem = -1;
 static volatile int g_putStop;
-static volatile int g_xferClientSock = -1;
 static uint64_t g_putTotalBytes;
 static volatile int g_ioMode;
 static uint32_t g_tempSeq;
@@ -581,22 +580,6 @@ static int handleRename(struct PfsNetClient *client, const uint8_t *payload, uin
     return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
 }
 
-static int controlSocketHasPendingAbortOrClose(void)
-{
-    int csock = g_xferClientSock;
-    char peekByte;
-    int r;
-
-    if (csock < 0)
-        return 0;
-    r = recv(csock, &peekByte, 1, MSG_PEEK | MSG_DONTWAIT);
-    if (r >= 0)
-        return 1; /* >0: 控制口已收到客户端发来的 ABORT 等指令；==0: 控制口已断开 */
-    if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return 0;
-    return 1;
-}
-
 static int xferSendAll(int sock, const void *buf, int len)
 {
     const char *ptr = (const char *)buf;
@@ -617,14 +600,8 @@ static int xferSendAll(int sock, const void *buf, int len)
             idleLoops = 0;
             continue;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 30) {
-            if (controlSocketHasPendingAbortOrClose()) {
-                g_putStop = 1;
-                ok = 0;
-                break;
-            }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 6)
             continue;
-        }
         ok = 0;
         break;
     }
@@ -652,14 +629,8 @@ static int xferRecvAll(int sock, void *buf, int len)
             idleLoops = 0;
             continue;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 30) {
-            if (controlSocketHasPendingAbortOrClose()) {
-                g_putStop = 1;
-                ok = 0;
-                break;
-            }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 6)
             continue;
-        }
         ok = 0;
         break;
     }
@@ -797,9 +768,9 @@ static void tuneDataSocket(int sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
-    /* 单次 recv/send 超时设为 1 秒（由 xferRecvAll/xferSendAll 最多重试 30 次实现 30 秒空闲总超时），
-     * 便于客户端取消传输或控制口收到 ABORT 时在 <=1 秒内响应退出。 */
-    tv.tv_sec = 1;
+    /* 单次 recv/send 超时设为 5 秒（由 xferRecvAll/xferSendAll 最多重试 6 次实现 30 秒空闲总超时）；
+     * 客户端取消传输时会主动关闭数据口触发 RST/FIN 立即唤醒 recv，无需短超时轮询。 */
+    tv.tv_sec = 5;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -895,7 +866,6 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         return 0;
     }
     g_xfer.dataSock = dataSock;
-    g_xferClientSock = client->socket;
     g_putStop = 0;
 
     /* 多槽环形缓冲（16x512KiB = 8MiB）：ioWorker 连续排空 TCP 窗口，clientThread 连续写盘 */
@@ -1036,7 +1006,6 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         }
     }
 
-    g_xferClientSock = -1;
     g_xfer.dataSock = -1;
     close(dataSock);
     fileXioClose(fd);
@@ -1166,7 +1135,6 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         return 0;
     }
     g_xfer.dataSock = dataSock;
-    g_xferClientSock = client->socket;
     g_putStop = 0;
 
     /* 双缓冲：与 Put 对称——先启动上一块 send，再读下一块（重叠）。
@@ -1243,7 +1211,6 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         (void)failed;
     }
 
-    g_xferClientSock = -1;
     fileXioClose(fd);
 
     if (sent != toSend) {

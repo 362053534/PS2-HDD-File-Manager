@@ -198,34 +198,32 @@ extern unsigned int __real_SifSendCmd(int cmd, void *packet, int packet_size,
 extern unsigned int __real_iSifSendCmd(int cmd, void *packet, int packet_size,
                                        void *src_extra, void *dest_extra, int size_extra);
 
-#define PFSNET_SIF_DMA_RING 12
-static unsigned int g_sifDmaRing[PFSNET_SIF_DMA_RING];
-static unsigned int g_sifDmaRingIdx;
+#define PFSNET_SIF_DMA_RING_DEPTH 12
+static volatile int g_sifDmaRing[PFSNET_SIF_DMA_RING_DEPTH];
+static volatile int g_sifDmaRingIdx;
 
 unsigned int __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
 {
     unsigned int id;
-    if (len == 1) {
-        int old = DIntr();
-        unsigned int slot = g_sifDmaRingIdx;
-        unsigned int prev = g_sifDmaRing[slot];
-        g_sifDmaRingIdx = (slot + 1u) % PFSNET_SIF_DMA_RING;
-        if (old)
-            EIntr();
-        if (prev != 0) {
-            while (SifDmaStat(prev) >= 0)
-                nopdelay();
-        }
-        while ((id = __real_SifSetDma(sdd, 1)) == 0)
+    int slot;
+    int oldId;
+    int oldIntr = DIntr();
+
+    slot = g_sifDmaRingIdx;
+    g_sifDmaRingIdx = (slot + 1) % PFSNET_SIF_DMA_RING_DEPTH;
+    oldId = g_sifDmaRing[slot];
+    if (oldIntr)
+        EIntr();
+
+    if (oldId > 0) {
+        while (SifDmaStat(oldId) >= 0)
             nopdelay();
-        old = DIntr();
-        g_sifDmaRing[slot] = id;
-        if (old)
-            EIntr();
-        return id;
     }
+
     while ((id = __real_SifSetDma(sdd, len)) == 0)
         nopdelay();
+
+    g_sifDmaRing[slot] = (int)id;
     return id;
 }
 
@@ -250,163 +248,22 @@ typedef struct pfsnet_isif_retry {
 
 static pfsnet_isif_retry_t g_isifRetryPool[8];
 
-struct pfsnet_sif_cmd_data {
-    void *pktbuf;
-    void *unused;
-    void *iopbuf;
-    SifCmdHandlerData_t *sys_cmd_handlers;
-    u32 nr_sys_handlers;
-    SifCmdHandlerData_t *usr_cmd_handlers;
-    u32 nr_usr_handlers;
-    int *sregs;
-};
-
-extern struct pfsnet_sif_cmd_data _sif_cmd_data;
-
-static int g_nmRpcSvrThreadID = -1;
-static int g_nmRxThreadID = -1;
-static unsigned char g_nmRpcSvrThreadStack[0x1000] __attribute__((aligned(16)));
-static unsigned char g_nmRxThreadStack[0x1000] __attribute__((aligned(16)));
-static volatile unsigned char g_nmIsInitialized;
-static volatile unsigned char g_nmIsProcessingRx;
-
-static struct NetManBD *g_nmFrameBufferStatus;
-static struct NetManBD *g_nmRxIOPFrameBufferStatus;
-static volatile unsigned short int g_nmRxBufferRdPtr;
-static volatile unsigned short int g_nmRxBufferNextRdPtr;
-static SifRpcDataQueue_t g_nmCbQueue;
-static SifRpcServerData_t g_nmCbSrv;
-
-/*
- * 统一在关中断 ISR 上下文中服务 DMAC_SIF0（同时处理 SIFCmd 与 NETMAN RX）：
- *
- * 根因修复：
- * 1) PS2SDK _SifCmdIntHandler (ee/kernel/src/sifcmd.c:132) 在进入 DMAC_SIF0 ISR 首行就执行 EI() 开中断，
- *    且双 handler 链中若 _SifCmdIntHandler 在前，当收到 NETMAN RX DMA (header->psize == 0) 时不会调用
- *    iSifSetDChain()；
- * 2) IOP sifman (iop/system/sifman/src/sifman.c:328-335) 会将同批的 NETMAN RX 帧与 64B SIFCmd
- *    (_request_rdata / _request_end) 串联进同一个 16-QW SIF0 硬件 FIFO；当在 ISR 末尾调用 iSifSetDChain()
- *    时，已在硬件 FIFO 中的 64B SIFCmd 会在 27ns 内瞬间传完并再次拉低 D5_CHCR.STR，随后被 EE ROM 内核
- *    在退出 DMAC 链时执行的 _sw(0x20, D_STAT) 抹掉 CIS5 中断位，导致 fileXioWrite 永久死锁。
- *
- * 此处：
- * - 全程保持关中断（直至最终 ExitHandler()），仅由单一 DMAC_SIF0 ISR 执行（绝不在定时器 ISR 中重入）；
- * - 循环排空 _sif_cmd_data.pktbuf 与 NETMAN BD，并在 iSifSetDChain() 后短轮询硬件 FIFO 瞬时落地的后续包。
- */
-int __wrap__SifCmdIntHandler(int channel)
+static u64 pfsnetISifRetryAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
 {
-    int progress;
-    int loops = 0;
-    int r;
-
-    (void)channel;
-
-    do {
-        progress = 0;
-
-        if (_sif_cmd_data.pktbuf != NULL) {
-            volatile SifCmdHeader_t *hdr = (volatile SifCmdHeader_t *)_sif_cmd_data.pktbuf;
-            int size = hdr->psize;
-            if (size != 0) {
-                u128 packet[8];
-                u128 *pktbuf = (u128 *)_sif_cmd_data.pktbuf;
-                int pktquads = (size + 30) >> 4;
-                int i = 0;
-                u32 id;
-                SifCmdHandlerData_t *cmd_handlers = NULL;
-                SifCmdHeader_t *localHdr;
-
-                hdr->psize = 0;
-                if (pktquads > 8)
-                    pktquads = 8;
-                while (pktquads-- > 0) {
-                    packet[i] = pktbuf[i];
-                    i++;
-                }
-
-                iSifSetDChain();
-
-                localHdr = (SifCmdHeader_t *)packet;
-                id = localHdr->cid & ~SIF_CMD_ID_SYSTEM;
-                if (localHdr->cid & SIF_CMD_ID_SYSTEM) {
-                    if (id < _sif_cmd_data.nr_sys_handlers)
-                        cmd_handlers = _sif_cmd_data.sys_cmd_handlers;
-                } else {
-                    if (id < _sif_cmd_data.nr_usr_handlers)
-                        cmd_handlers = _sif_cmd_data.usr_cmd_handlers;
-                }
-                if (cmd_handlers != NULL && cmd_handlers[id].handler != NULL)
-                    cmd_handlers[id].handler(packet, cmd_handlers[id].harg);
-
-                progress = 1;
-            }
-        }
-
-        if (g_nmFrameBufferStatus != NULL) {
-            volatile struct NetManBD *bdRd =
-                UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
-            volatile struct NetManBD *bdNext =
-                UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-            if (bdRd->length > 0 || bdNext->length > 0) {
-                if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
-                    g_nmIsProcessingRx = 1;
-                    iWakeupThread(g_nmRxThreadID);
-                    progress = 1;
-                }
-            }
-        }
-
-        if ((_lw(0x1000c000) & 0x100) == 0) {
-            int spin;
-            iSifSetDChain();
-            for (spin = 0; spin < 24; spin++) {
-                if ((_lw(0x1000c000) & 0x100) == 0) {
-                    progress = 1;
-                    break;
-                }
-                if (_sif_cmd_data.pktbuf != NULL &&
-                    ((volatile SifCmdHeader_t *)_sif_cmd_data.pktbuf)->psize != 0) {
-                    progress = 1;
-                    break;
-                }
-            }
-        }
-    } while (progress && ++loops < 16);
-
-    for (r = 0; r < 8; r++) {
-        if (g_isifRetryPool[r].active) {
-            if (__real_iSifSendCmd(g_isifRetryPool[r].cmd,
-                                   g_isifRetryPool[r].pkt,
-                                   g_isifRetryPool[r].packet_size,
-                                   g_isifRetryPool[r].src_extra,
-                                   g_isifRetryPool[r].dest_extra,
-                                   g_isifRetryPool[r].size_extra) != 0) {
-                g_isifRetryPool[r].active = 0;
-            }
-        }
-    }
-
-    ExitHandler();
-    return 0;
-}
-
-static u64 pfsnetRetryISifSendCmdCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
-{
-    pfsnet_isif_retry_t *slot = (pfsnet_isif_retry_t *)arg;
-    unsigned int did;
-
+    pfsnet_isif_retry_t *r = (pfsnet_isif_retry_t *)arg;
     (void)id;
+    (void)scheduled_time;
+    (void)actual_time;
     (void)pc_value;
 
-    if (slot == NULL || !slot->active)
-        return 0;
-    did = __real_iSifSendCmd(slot->cmd, slot->pkt, slot->packet_size,
-                             slot->src_extra, slot->dest_extra, slot->size_extra);
-    if (did != 0) {
-        slot->active = 0;
+    if ((_lw(0x1000c000) & 0x100) == 0)
+        iSifSetDChain();
+
+    if (__real_iSifSendCmd(r->cmd, r->pkt, r->packet_size, r->src_extra, r->dest_extra, r->size_extra) != 0) {
+        r->active = 0;
         return 0;
     }
-    return ((actual_time > scheduled_time) ? (actual_time - scheduled_time) : 0ULL) + 0x8000ULL;
+    return 0x4000;
 }
 
 unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
@@ -424,14 +281,14 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
         int i;
         for (i = 0; i < 8; i++) {
             if (!g_isifRetryPool[i].active) {
-                memcpy(g_isifRetryPool[i].pkt, packet, (size_t)packet_size);
+                g_isifRetryPool[i].active = 1;
                 g_isifRetryPool[i].cmd = cmd;
+                memcpy(g_isifRetryPool[i].pkt, packet, (size_t)packet_size);
                 g_isifRetryPool[i].packet_size = packet_size;
                 g_isifRetryPool[i].src_extra = src_extra;
                 g_isifRetryPool[i].dest_extra = dest_extra;
                 g_isifRetryPool[i].size_extra = size_extra;
-                g_isifRetryPool[i].active = 1;
-                if (iSetTimerAlarm(0x8000ULL, &pfsnetRetryISifSendCmdCb, &g_isifRetryPool[i]) >= 0)
+                if (iSetTimerAlarm(0x4000, &pfsnetISifRetryAlarmCb, &g_isifRetryPool[i]) >= 0)
                     return 1;
                 g_isifRetryPool[i].active = 0;
                 break;
@@ -443,22 +300,80 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
     return id;
 }
 
+static int g_nmRpcSvrThreadID = -1;
+static int g_nmRxThreadID = -1;
+static int g_nmSifHandlerID = -1;
+static unsigned char g_nmRpcSvrThreadStack[0x1000] __attribute__((aligned(16)));
+static unsigned char g_nmRxThreadStack[0x1000] __attribute__((aligned(16)));
+static volatile unsigned char g_nmIsInitialized;
+static volatile unsigned char g_nmIsProcessingRx;
+
+static struct NetManBD *g_nmFrameBufferStatus;
+static struct NetManBD *g_nmRxIOPFrameBufferStatus;
+static volatile unsigned short int g_nmRxBufferRdPtr;
+static volatile unsigned short int g_nmRxBufferNextRdPtr;
+static SifRpcDataQueue_t g_nmCbQueue;
+static SifRpcServerData_t g_nmCbSrv;
+
+#define PFSNET_NM_CLEAR_RING_DEPTH 8
+static volatile int g_nmClearDmaRing[PFSNET_NM_CLEAR_RING_DEPTH];
+static volatile int g_nmClearDmaIdx;
+
 static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
 {
     struct NetManBD *bd;
     SifDmaTransfer_t dmat;
+    int slot;
+    int oldId;
+    unsigned int id;
 
     bd = UNCACHED_SEG(&g_nmFrameBufferStatus[index]);
     bd->length = 0;
     bd->packet = packet;
     bd->payload = payload;
 
+    slot = g_nmClearDmaIdx;
+    g_nmClearDmaIdx = (slot + 1) % PFSNET_NM_CLEAR_RING_DEPTH;
+    oldId = g_nmClearDmaRing[slot];
+    if (oldId > 0) {
+        while (SifDmaStat(oldId) >= 0)
+            nopdelay();
+    }
+
     dmat.src = (void *)&g_nmFrameBufferStatus[index];
     dmat.dest = &g_nmRxIOPFrameBufferStatus[index];
     dmat.size = sizeof(struct NetManBD);
     dmat.attr = 0;
-    while (__wrap_SifSetDma(&dmat, 1) == 0)
+    while ((id = __wrap_SifSetDma(&dmat, 1)) == 0)
         nopdelay();
+    g_nmClearDmaRing[slot] = (int)id;
+}
+
+static s32 pfsnetNetManHandleRxEvent(s32 channel)
+{
+    struct NetManBD *bdRd;
+    struct NetManBD *bdNext;
+    int dchainStopped;
+
+    (void)channel;
+
+    dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
+    if (dchainStopped)
+        iSifSetDChain();
+
+    if (g_nmFrameBufferStatus != NULL) {
+        bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
+        bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
+        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
+            if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
+                g_nmIsProcessingRx = 1;
+                iWakeupThread(g_nmRxThreadID);
+            }
+        }
+    }
+
+    ExitHandler();
+    return 0;
 }
 
 int __wrap_NetManRPCAllocRxBuffers(void)
@@ -492,9 +407,9 @@ static void pfsnetNetManRxThread(void *arg)
         bd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
 
         do {
-            if ((_lw(0x1000c000) & 0x100) == 0)
-                SifSetDChain();
             DI();
+            if ((_lw(0x1000c000) & 0x100) == 0)
+                iSifSetDChain();
             PacketLength = bd->length;
             if (PacketLength > 0) {
                 run = 1;
@@ -553,6 +468,8 @@ static void *pfsnetNetManEERpcHandler(int fnum, void *buffer, int NumBytes)
 
                 if ((g_nmRxThreadID = CreateThread(&thread)) >= 0) {
                     StartThread(g_nmRxThreadID, NULL);
+                    /* next = -1：挂在 _SifCmdIntHandler 之后，确保 SIF0 DChain 绝不漏开 */
+                    g_nmSifHandlerID = AddDmacHandler(DMAC_SIF0, &pfsnetNetManHandleRxEvent, -1);
                     EnableDmac(DMAC_SIF0);
                     ((struct NetManEEInitResult *)buffer)->result = 0;
                     ((struct NetManEEInitResult *)buffer)->FrameBufferStatus = g_nmFrameBufferStatus;
@@ -621,6 +538,10 @@ void __wrap_NetManDeinitRPCServer(void)
     if (g_nmIsInitialized) {
         SifRemoveRpc(&g_nmCbSrv, &g_nmCbQueue);
         SifRemoveRpcQueue(&g_nmCbQueue);
+        if (g_nmSifHandlerID >= 0) {
+            RemoveDmacHandler(DMAC_SIF0, g_nmSifHandlerID);
+            g_nmSifHandlerID = -1;
+        }
         if (g_nmRpcSvrThreadID >= 0) {
             TerminateThread(g_nmRpcSvrThreadID);
             DeleteThread(g_nmRpcSvrThreadID);
@@ -697,23 +618,16 @@ static void freeMsg(pfsnet_arch_message_t *msg)
 }
 
 /*
- * 修复 PS2SDK ee/kernel/src/timer.c 中 SetNextComp 与 TimerHandler_callback 的硬件竞态：
+ * 修复 PS2SDK ee/kernel/src/timer.c 中 SetNextComp、TimerHandler_callback 与 iFreeTimerCounter 的硬件竞态：
  *
  * 1) timer.c:300-304 在 current_schedule < time_now + CLOCKS_GAP (仅 2 个 T2_COUNT 计数 = 3.47us)
  *    时，先执行 SetT2_COMP((*T2_COUNT) + 2) 再执行 SetT2_MODE((*T2_MODE) & ~(1 << 11)) 清 EQUF，
  *    若写完 T2_COMP 到清 EQUF 之间已跨过 2 个计数（3.47us），会把刚刚触发的 EQUF 抹掉，导致闹钟被推迟整整
  *    一轮 16 位溢出（113.77ms）甚至与 OVFF 叠加永久卡死；
  * 2) timer.c:402 的 TimerHandler_callback 仅在 ((*T2_MODE) & (1 << 10)) != 0 (EQUF=1) 时才遍历闹钟链表，
- *    一旦线程态 iSetTimerAlarm / iReleaseTimerAlarm 关中断执行 SetNextComp 清掉 EQUF，或闹钟恰好落在
- *    0xFFFF -> 0x0000 溢出中断 (OVFF) 边界，TimerHandler_callback 会直接跳过已到期的闹钟；
- * 3) DelayThread (delaythread.c:30) 的回调 DelayThreadWakeup_callback 在 TimerHandler_callback 遍历中途
- *    提前调用 ExitHandler() (sync; ei)。
- *
- * 此处通过 wrap SetNextComp、TimerHandler_callback 与 DelayThread：
- * - __wrap_SetNextComp 始终先清 EQUF 再写 T2_COMP，将最小安全提前量提升到 32 ticks (55.5us)，并在写完
- *   T2_COMP 后二次校验 T2_COUNT 是否已逼近/越过比较值；
- * - __wrap_TimerHandler_callback 先更新溢出计数，再无条件按时间戳 (abs_cmp >= target_cmp) 触发所有已到期闹钟；
- * - 按需单次注册闹钟（零常驻周期中断开销），保障 3.65MB/s 满速吞吐与数小时连续传输不挂死。
+ *    若闹钟恰好落在 0xFFFF -> 0x0000 溢出中断 (OVFF) 边界，TimerHandler_callback 会直接跳过已到期的闹钟；
+ * 3) timer.c:559-562 的 iFreeTimerCounter (由 ReleaseTimerAlarm 调用) 在 UnlinkAlarm_ForTimer 移除队首闹钟后
+ *    漏调 SetNextComp(iGetTimerSystemTime())，导致硬件 T2_COMP 仍停留在已释放闹钟的旧比较值上。
  */
 typedef struct pfsnet_counter_struct {
     struct pfsnet_counter_struct *timer_next;
@@ -741,14 +655,16 @@ typedef struct pfsnet_timer_ee_global {
 
 #define PFSNET_TIMER_MODE_HANDLER 0x00000002u
 #define PFSNET_PTR_TO_TIMER_ID(ptr_) ((s32)((((uiptr)(ptr_)) << 4) | ((ptr_)->timer_key)))
+#define PFSNET_CLOCKS_GAP 0x2000ULL /* 32 ticks @ BUSCLK/256 (~55.5us) */
 
 extern pfsnet_timer_ee_global_t g_Timer;
 extern void SetT2_COMP(u32 val);
 extern void SetT2_MODE(u32 val);
 extern void InsertAlarm_ForTimer(pfsnet_counter_struct_t *timer_link);
 extern pfsnet_counter_struct_t *UnlinkAlarm_ForTimer(pfsnet_counter_struct_t *timer_unlink);
+extern s32 __real_iFreeTimerCounter(s32 id);
 
-static inline u64 pfsnetApplyOverflow(void)
+static inline u64 pfsnetApplyOverflowInIsr(void)
 {
     u64 timer_system_time_now;
     u32 mode;
@@ -771,9 +687,6 @@ void __wrap_SetNextComp(u64 time_now)
     u64 current_schedule, next_schedule;
     pfsnet_counter_struct_t *timer_current;
     u32 shift, minGapTicks;
-    u64 minGapClocks;
-
-    (void)time_now;
 
     if (g_Timer.current_handling_timer_id >= 0)
         return;
@@ -797,14 +710,15 @@ void __wrap_SetNextComp(u64 time_now)
     }
 
     shift = ((*T2_MODE) & 3) << 2;
-    minGapTicks = 32u;
-    minGapClocks = (u64)minGapTicks << shift;
+    minGapTicks = (u32)(PFSNET_CLOCKS_GAP >> shift);
+    if (minGapTicks < 16u)
+        minGapTicks = 16u;
 
-    /* 始终先清 EQUF，再写 T2_COMP，防止写完 T2_COMP 后被随后的 SetT2_MODE 抹掉刚触发的 EQUF */
+    /* 始终先清 EQUF，再写 T2_COMP，杜绝写完 T2_COMP 后被 SetT2_MODE 抹掉刚触发的 EQUF */
     SetT2_MODE((*T2_MODE) & (~(1 << 11)));
-    time_now = pfsnetApplyOverflow();
+    time_now = iGetTimerSystemTime();
 
-    if (current_schedule <= (time_now + minGapClocks)) {
+    if (current_schedule <= (time_now + PFSNET_CLOCKS_GAP)) {
         SetT2_COMP(((*T2_COUNT) + minGapTicks) & 0xFFFFu);
     } else {
         u32 comp = (u32)((current_schedule >> shift) & 0xFFFFu);
@@ -816,6 +730,14 @@ void __wrap_SetNextComp(u64 time_now)
                 SetT2_COMP((cntNow + minGapTicks) & 0xFFFFu);
         }
     }
+}
+
+s32 __wrap_iFreeTimerCounter(s32 id)
+{
+    s32 ret = __real_iFreeTimerCounter(id);
+    if (ret == 0 && g_Timer.current_handling_timer_id < 0)
+        __wrap_SetNextComp(iGetTimerSystemTime());
+    return ret;
 }
 
 s32 __wrap_TimerHandler_callback(s32 cause, void *arg, void *addr)
@@ -830,14 +752,14 @@ s32 __wrap_TimerHandler_callback(s32 cause, void *arg, void *addr)
     (void)cause;
     (void)arg;
 
-    abs_cmp = pfsnetApplyOverflow();
+    abs_cmp = pfsnetApplyOverflowInIsr();
     if (((*T2_MODE) & (1 << 10)) != 0)
         SetT2_MODE((*T2_MODE) & (~(1 << 11)));
 
     timer_current = g_Timer.timer_counter_buf_alarm;
     while (timer_current != NULL) {
         target_cmp = timer_current->timer_schedule + timer_current->timer_base_time - timer_current->timer_base_count;
-        abs_cmp = pfsnetApplyOverflow();
+        abs_cmp = pfsnetApplyOverflowInIsr();
         if (abs_cmp < target_cmp)
             break;
 
@@ -869,57 +791,31 @@ s32 __wrap_TimerHandler_callback(s32 cause, void *arg, void *addr)
     }
 
     g_Timer.current_handling_timer_id = -1;
-    __wrap_SetNextComp(pfsnetApplyOverflow());
-    pfsnetApplyOverflow();
+    __wrap_SetNextComp(pfsnetApplyOverflowInIsr());
+    pfsnetApplyOverflowInIsr();
     ExitHandler();
     return 0;
 }
 
-typedef struct pfsnet_sema_wait {
-    s32 tid;
-    volatile int timedOut;
-} pfsnet_sema_wait_t;
-
 static u64 pfsnetWaitSemaAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
 {
-    pfsnet_sema_wait_t *w = (pfsnet_sema_wait_t *)arg;
-
+    s32 tid = (s32)(intptr_t)arg;
     (void)id;
+    (void)scheduled_time;
+    (void)actual_time;
     (void)pc_value;
 
-    if (w == NULL)
-        return 0;
-    if (iReleaseWaitThread(w->tid) >= 0) {
-        w->timedOut = 1;
-        return 0;
-    }
-    return ((actual_time > scheduled_time) ? (actual_time - scheduled_time) : 0ULL) + 0x8000ULL;
-}
-
-static int waitSemaTimeoutClocks(int sema, u64 clocks)
-{
-    pfsnet_sema_wait_t w;
-    s32 alarmId;
-    int ret;
-
-    if (clocks < 0x4000ULL)
-        clocks = 0x4000ULL;
-
-    w.tid = GetThreadId();
-    w.timedOut = 0;
-
-    alarmId = SetTimerAlarm(clocks, &pfsnetWaitSemaAlarmCb, &w);
-    if (alarmId < 0)
-        return (WaitSema(sema) == sema) ? sema : -1;
-
-    ret = WaitSema(sema);
-    ReleaseTimerAlarm(alarmId);
-
-    return (ret == sema && !w.timedOut) ? sema : -1;
+    if (iReleaseWaitThread(tid) < 0)
+        return 0x4000;
+    return 0;
 }
 
 static int waitSemaTimeoutMs(int sema, unsigned int msec)
 {
+    s32 timerid;
+    int ret;
+    u64 clocks;
+
     if (PollSema(sema) == sema)
         return sema;
     if (msec == 0)
@@ -927,35 +823,17 @@ static int waitSemaTimeoutMs(int sema, unsigned int msec)
     if (msec == UINT32_MAX)
         return (WaitSema(sema) == sema) ? sema : -1;
 
-    return waitSemaTimeoutClocks(sema, MSec2TimerBusClock(msec));
-}
+    clocks = MSec2TimerBusClock(msec);
+    if (clocks < 0x4000)
+        clocks = 0x4000;
 
-s32 __wrap_DelayThread(s32 microseconds)
-{
-    u32 eie;
-    s32 sema_id;
-    ee_sema_t sema;
-    u64 clocks;
+    timerid = SetTimerAlarm(clocks, &pfsnetWaitSemaAlarmCb, (void *)(intptr_t)GetThreadId());
+    if (timerid < 0)
+        return (WaitSema(sema) == sema) ? sema : -1;
 
-    if (microseconds <= 0)
-        return 0;
-
-    __asm__ __volatile__("mfc0\t%0, $12" : "=r"(eie));
-    if ((eie & 0x10000) == 0)
-        return 0x80008008; /* ECPUDI */
-
-    sema.attr = 0;
-    sema.max_count = 1;
-    sema.option = (u32)"PfsDelay";
-    sema.init_count = 0;
-    sema_id = CreateSema(&sema);
-    if (sema_id < 0)
-        return 0x80008003; /* ESEMAPHORE */
-
-    clocks = ((u64)(u32)microseconds * (u64)kBUSCLK) / (1000ULL * 1000ULL);
-    waitSemaTimeoutClocks(sema_id, clocks);
-    DeleteSema(sema_id);
-    return 0;
+    ret = WaitSema(sema);
+    ReleaseTimerAlarm(timerid);
+    return (ret == sema) ? sema : -1;
 }
 
 static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **message)

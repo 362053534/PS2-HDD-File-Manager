@@ -8,7 +8,7 @@ EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
 
 EE_INCS := -I./include -I$(PS2SDK)/ports/include -I$(PS2SDK)/ee/include -I$(PS2SDK)/common/include
 # 对齐 HDDTester：DUMMY_* / KERNEL_NOPATCH + gc-sections；勿链 -lcdvd / ps2time
-EE_CFLAGS += -Os -fdata-sections -ffunction-sections -DNEWLIB_PORT_AWARE \
+EE_CFLAGS += -Os -G0 -fdata-sections -ffunction-sections -DNEWLIB_PORT_AWARE \
 	-DDUMMY_TIMEZONE -DDUMMY_LIBC_INIT -DKERNEL_NOPATCH -D_EE
 EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=sys_now \
@@ -18,10 +18,9 @@ EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=SifSetDma \
 	-Wl,--wrap=SifSendCmd \
 	-Wl,--wrap=iSifSendCmd \
-	-Wl,--wrap=_SifCmdIntHandler \
 	-Wl,--wrap=SetNextComp \
 	-Wl,--wrap=TimerHandler_callback \
-	-Wl,--wrap=DelayThread \
+	-Wl,--wrap=iFreeTimerCounter \
 	-Wl,--wrap=NetManInitRPCServer \
 	-Wl,--wrap=NetManDeinitRPCServer \
 	-Wl,--wrap=NetManRPCAllocRxBuffers \
