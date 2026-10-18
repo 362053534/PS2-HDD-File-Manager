@@ -56,6 +56,7 @@ extern const struct lwip_memp_desc_min memp_SYS_TIMEOUT;
 extern void __real_memp_init(void);
 extern void memp_free_pool(const void *desc, void *mem);
 extern struct pbuf *__real_pbuf_alloc(pbuf_layer l, u16 size, pbuf_type type);
+extern err_t __real_netconn_recv_tcp_pbuf(void *conn, struct pbuf **new_buf);
 
 #define PFSNET_PBUF_POOL_STRIDE 1664u
 #define PFSNET_SMALL_POOL_STRIDE 64u
@@ -119,6 +120,21 @@ struct pbuf *__wrap_pbuf_alloc(pbuf_layer l, u16 size, pbuf_type type)
         }
     }
     return p;
+}
+
+/*
+ * lwIP 在收到带 TCP PSH 标志的报文时会给 pbuf 打上 PBUF_FLAG_PUSH(0x01)，
+ * 导致 lwip_recvfrom 每遇到 PSH 就设置 done=1 提前返回（即便 recvmbox 中仍有大量已到达的分片）。
+ * macOS XNU 在每次填满发送块或 TSO 切分末尾都会密集打上 TH_PUSH，导致 PS2 侧 recv() 频繁只读几 KB 就返回。
+ * 清除 PBUF_FLAG_PUSH 后：当 recvmbox 已空（rcvevent <= 0）时 lwip_recvfrom 仍会正常立即返回（不影响控制口短包），
+ * 当 recvmbox 中还有排队分片（rcvevent > 0）时则一次性把队列中所有 pbuf 连续拷完。
+ */
+err_t __wrap_netconn_recv_tcp_pbuf(void *conn, struct pbuf **new_buf)
+{
+    err_t err = __real_netconn_recv_tcp_pbuf(conn, new_buf);
+    if (err == 0 && new_buf != NULL && *new_buf != NULL)
+        (*new_buf)->flags &= (u8)~0x01u;
+    return err;
 }
 
 #define PFSNET_SYS_MAX_MESSAGES 1024

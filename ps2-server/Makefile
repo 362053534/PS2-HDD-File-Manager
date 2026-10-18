@@ -14,6 +14,7 @@ EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=sys_now \
 	-Wl,--wrap=memp_init \
 	-Wl,--wrap=pbuf_alloc \
+	-Wl,--wrap=netconn_recv_tcp_pbuf \
 	-Wl,--wrap=sys_init \
 	-Wl,--wrap=sys_mbox_new \
 	-Wl,--wrap=sys_mbox_free \

@@ -309,12 +309,19 @@ int main(int argc, char *argv[])
         NetManInit();
     }
 
-    /* RW 缓冲设为 128KiB：兼顾 HDD 连续 UDMA 吞吐与 SIF/IOP 调度粒度，避免单次 512KiB 长时间独占 IOP */
+    /* 对齐 HDLGameInstaller (FILEIO_BLOCK_SIZE = 256 * 2048 = 512KiB)：
+     * 配合 SMAP 优先级 28 与 EE 8MiB 环形缓冲，将单槽 512KiB SIF RPC 合并为 1 次传输，若 IOP 堆不足则逐级回退 */
     {
-        int rw = 128 * 1024;
+        int rw = 512 * 1024;
         if (fileXioSetRWBufferSize(rw) < 0) {
-            rw = 64 * 1024;
-            fileXioSetRWBufferSize(rw);
+            rw = 256 * 1024;
+            if (fileXioSetRWBufferSize(rw) < 0) {
+                rw = 128 * 1024;
+                if (fileXioSetRWBufferSize(rw) < 0) {
+                    rw = 64 * 1024;
+                    fileXioSetRWBufferSize(rw);
+                }
+            }
         }
     }
 

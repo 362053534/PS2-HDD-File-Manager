@@ -886,6 +886,10 @@ internal sealed class MainForm : Form
             _deviceCombo.SelectedIndex = _deviceCombo.Items.Count - 1;
             ResetPfsExplorer();
             AppendLog($"已连接 PfsNet（{ipAddress.Trim()}:{PfsNetProtocol.CommandPort}）。数据口：本机 TCP {PfsNetProtocol.DataPort}。features=0x{_pfsNet.Features:X}。");
+            if ((_pfsNet.Features & PfsNetProtocol.FeatStreamRing) == 0)
+            {
+                AppendLog("提示：检测到 PS2 端 PfsNetServer.elf 为旧版（未开启 8MB 环形缓冲与高速线程调度），请同步替换 PS2 上的 PfsNetServer.elf 以获得完整传输速度与防断线优化。");
+            }
         });
 
         if (_pfsNet.IsConnected)

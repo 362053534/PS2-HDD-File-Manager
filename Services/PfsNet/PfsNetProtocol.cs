@@ -14,6 +14,7 @@ internal static class PfsNetProtocol
     public const uint FeatDataChannel = 1u << 1;
     public const uint FeatApaSector = 1u << 2;
     public const uint FeatApaMutate = 1u << 3;
+    public const uint FeatStreamRing = 1u << 4;
 
     public const uint CmdHello = 0x0001;
     public const uint CmdPing = 0x0002;

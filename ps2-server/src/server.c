@@ -131,7 +131,8 @@ static int handleHello(struct PfsNetClient *client, const uint8_t *payload, uint
         return pfsnetSendResponse(client, PFSNET_ERR_VERSION, NULL, 0);
 
     features = PFSNET_FEAT_FILE_OPS | PFSNET_FEAT_DATA_CHANNEL
-        | PFSNET_FEAT_APA_SECTOR | PFSNET_FEAT_APA_MUTATE;
+        | PFSNET_FEAT_APA_SECTOR | PFSNET_FEAT_APA_MUTATE
+        | PFSNET_FEAT_STREAM_RING;
     reply[0] = PFSNET_MAGIC;
     reply[1] = PFSNET_PROTOCOL_VERSION;
     reply[2] = features;
@@ -196,7 +197,8 @@ static int startClientThread(struct PfsNetClient *client)
     thread.stack = client->stack;
     thread.stack_size = sizeof(client->stack);
     thread.gp_reg = &_gp;
-    thread.initial_priority = 0x40;
+    /* 置于 NETMAN(0x56..0x59)/tcpip(0x58) 与 ioWorker(0x5C) 之下，避免写盘阻塞网络收包与 ACK 发送 */
+    thread.initial_priority = 0x5D;
     thread.attr = 0;
     thread.option = 0;
 
@@ -298,7 +300,8 @@ int pfsnetStartServer(void)
     thread.stack = g_serverStack;
     thread.stack_size = sizeof(g_serverStack);
     thread.gp_reg = &_gp;
-    thread.initial_priority = 0x3f;
+    /* 低于 NETMAN(0x56..0x59) 与 tcpip(0x58)，高于 ioWorker(0x5C) 与 clientThread(0x5D) */
+    thread.initial_priority = 0x5B;
     thread.attr = 0;
     thread.option = 0;
 
