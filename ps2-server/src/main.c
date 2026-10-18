@@ -298,19 +298,23 @@ int main(int argc, char *argv[])
         waitStartToExit();
     }
 
-    loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
-    loadModuleBuffer(SMAP_irx, size_SMAP_irx, 0, NULL);
-    NetManInit();
-
-    /* 大 RW 缓冲放到模块齐后再申请，避免 IOP 堆在加载期被占满 */
     {
-        int rw = 512 * 1024;
+        /* FILEXIO.IRX 的 RPC 线程优先级为 40(0x28)，而 SMAP.IRX 默认线程优先级也是 40(0x28)。
+         * 在 macOS（默认不协商 802.3x PAUSE 流控帧）下，若两者同优先级，fileXio 连续写盘期间
+         * SMAP 无法抢占排空仅 16KB(10 帧) 的硬件 RX FIFO，导致硬件丢包触发 TCP 超时重传（速度跌至 ~2MB/s）。
+         * 将 SMAP 线程优先级提高到 28(0x1c)，使其在每片 16KB ATA DMA 间隙立即抢占排空 RX FIFO。 */
+        static char smapArg[] = "thpri=28";
+        loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
+        loadModuleBuffer(SMAP_irx, size_SMAP_irx, sizeof(smapArg), smapArg);
+        NetManInit();
+    }
+
+    /* RW 缓冲设为 128KiB：兼顾 HDD 连续 UDMA 吞吐与 SIF/IOP 调度粒度，避免单次 512KiB 长时间独占 IOP */
+    {
+        int rw = 128 * 1024;
         if (fileXioSetRWBufferSize(rw) < 0) {
-            rw = 256 * 1024;
-            if (fileXioSetRWBufferSize(rw) < 0) {
-                rw = 128 * 1024;
-                fileXioSetRWBufferSize(rw);
-            }
+            rw = 64 * 1024;
+            fileXioSetRWBufferSize(rw);
         }
     }
 

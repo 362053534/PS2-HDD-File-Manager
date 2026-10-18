@@ -577,9 +577,7 @@ internal sealed class PfsNetClient : IDisposable
         {
             dataClient.SendBufferSize = DataSocketBufferSize;
             dataClient.ReceiveBufferSize = DataSocketBufferSize;
-            // 单向大块顺序流关闭 Nagle 反而会让 512KiB%1460=108B 尾包与 65535 窗尾碎片化为小包，
-            // 额外消耗 PS2 侧 PBUF_POOL；保持 NoDelay=false 让内核合并为完整 1460B MSS 帧。
-            dataClient.NoDelay = false;
+            dataClient.NoDelay = true;
         }
         catch { /* 平台可能不支持，忽略 */ }
 
