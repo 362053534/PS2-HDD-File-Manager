@@ -4,18 +4,24 @@
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
+#include <errno.h>
 #include <kernel.h>
 #include <kernel_util.h>
 #include <sifdma.h>
 #include <sifcmd.h>
+#include <sifrpc.h>
 #include <timer.h>
 #include <timer_alarm.h>
 #include <delaythread.h>
 #include <debug.h>
 #include <netman.h>
+#include <netman_rpc.h>
 #include <ps2ip.h>
 
 #include "pfsnet.h"
+
+extern void *_gp;
+extern void NetManToggleGlobalNetIFLinkState(unsigned char state);
 
 /* GCC14 constructor 写入 .init_array，而 PS2 crt0 只遍历 .ctors，需手动填充 */
 extern void __ps2ipeeOpsInitializeImpl(void);
@@ -24,10 +30,40 @@ extern void __ps2ipeeOpsInitializeImpl(void);
  * PS2SDK 默认 sys_now() 为 clock() / 1000，而 _times()/clock() 用 32 位微秒计数，
  * 会在开机约 71.58 分钟（0xFFFFFFFF us）处从 4294967 跳回 0，破坏 lwIP TCP 定时器比较。
  * 此处用 64 位硬件总线计时器直接换算毫秒，保证在 49.7 天内单调递增并按 2^32 自然回绕。
+ * 同时顺带巡检 DMAC_SIF0_CHCR.STR (0x1000c000 & 0x100)，若意外停机立即恢复 DChain。
  */
 uint32_t __wrap_sys_now(void)
 {
+    int old = DIntr();
+    if ((_lw(0x1000c000) & 0x100) == 0)
+        iSifSetDChain();
+    if (old)
+        EIntr();
     return (uint32_t)(GetTimerSystemTime() / ((u64)kBUSCLK / 1000ULL));
+}
+
+/*
+ * 修复 PS2SDK ee/libcglue/src/lock.c 中 __retarget_lock_acquire_recursive /
+ * __retarget_lock_release_recursive 在无 DI()/EI() 保护下读写 lock->count 与 lock->thread_id
+ * 的竞态，防止多线程并发 malloc / memalign / free 时损坏堆锁。
+ */
+extern void __real___retarget_lock_acquire_recursive(void *lock);
+extern void __real___retarget_lock_release_recursive(void *lock);
+
+void __wrap___retarget_lock_acquire_recursive(void *lock)
+{
+    int old = DIntr();
+    __real___retarget_lock_acquire_recursive(lock);
+    if (old)
+        EIntr();
+}
+
+void __wrap___retarget_lock_release_recursive(void *lock)
+{
+    int old = DIntr();
+    __real___retarget_lock_release_recursive(lock);
+    if (old)
+        EIntr();
 }
 
 /*
@@ -143,18 +179,53 @@ err_t __wrap_netconn_recv_tcp_pbuf(void *conn, struct pbuf **new_buf)
 
 /*
  * 解决 EE BIOS 32 槽 SIF1 DMA 队列在突发流量下瞬时满载导致
- * fileXioWrite 的 _request_rdata (iSifSendCmd) 丢包永久死锁：
+ * fileXioWrite 的 _request_rdata (iSifSendCmd) 丢包永久死锁，以及
+ * NETMAN HandleRxEvent 在 DMAC_SIF0 中断链中漏调 iSifSetDChain() 导致 SIF0 永久停机：
  *
- * IOP 侧 fileXio_Write_RPC 通过 SifRpcGetOtherData 拉取写盘数据时，向 EE 发送 SIF_CMD_RPC_RDATA
- * 并睡眠在 WaitEventFlag 上等待 EE 回复 SIF_CMD_RPC_END。但 PS2SDK ee/kernel/src/sifrpc.c 的
- * _request_rdata 在中断里调用 iSifSendCmd(SIF_CMD_RPC_END) 时未检查返回值 0。一旦 SIF1 队列满载，
- * SIF_CMD_RPC_END 被静默丢弃会导致永久死锁。通过 wrap SifSendCmd / iSifSendCmd 在返回 0 时自动
- * 自旋或通过 iSetTimerAlarm 硬件定时器重试，确保零额外阻塞开销且 SIF 命令永不丢失。
+ * 1) SifSetDma 维护 12 槽在途 DMA ID 环（仅等待 12 次前的 DMA 完成），既避免单槽等待阻塞
+ *    NETMAN_RxThread 短突发，又将线程态 SIF1 占用严格限制在 <=18 槽以内，始终为 DMAC_SIF0
+ *    中断态 _request_rdata (iSifSendCmd) 预留 >=14 个空闲硬件槽位。
+ * 2) __wrap_iSifSendCmd 的定时器重试池将 packet 深拷贝到 64 字节对齐缓冲，防止异步重试时
+ *    读取已失效的调用栈或被后续请求覆盖的包头。
+ * 3) 接管 NETMAN EE 侧 rpc_server：将 HandleRxEvent 以 next=-1 挂在 DMAC_SIF0 链尾（在
+ *    _SifCmdIntHandler 之后执行），凡检测到 DMAC_SIF0_CHCR.STR (0x1000c000 & 0x100) 为 0
+ *    一律无条件调用 iSifSetDChain()，彻底杜绝因 RxBufferNextRdPtr 竞态或中途 SIF_DMA_INT_O
+ *    造成的 SIF0 (IOP->EE) 永久停机。
  */
+extern unsigned int __real_SifSetDma(SifDmaTransfer_t *sdd, s32 len);
 extern unsigned int __real_SifSendCmd(int cmd, void *packet, int packet_size,
                                       void *src_extra, void *dest_extra, int size_extra);
 extern unsigned int __real_iSifSendCmd(int cmd, void *packet, int packet_size,
                                        void *src_extra, void *dest_extra, int size_extra);
+
+#define PFSNET_SIF_DMA_RING_DEPTH 12
+static volatile int g_sifDmaRing[PFSNET_SIF_DMA_RING_DEPTH];
+static volatile int g_sifDmaRingIdx;
+
+unsigned int __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
+{
+    unsigned int id;
+    int slot;
+    int oldId;
+    int oldIntr = DIntr();
+
+    slot = g_sifDmaRingIdx;
+    g_sifDmaRingIdx = (slot + 1) % PFSNET_SIF_DMA_RING_DEPTH;
+    oldId = g_sifDmaRing[slot];
+    if (oldIntr)
+        EIntr();
+
+    if (oldId > 0) {
+        while (SifDmaStat(oldId) >= 0)
+            nopdelay();
+    }
+
+    while ((id = __real_SifSetDma(sdd, len)) == 0)
+        nopdelay();
+
+    g_sifDmaRing[slot] = (int)id;
+    return id;
+}
 
 unsigned int __wrap_SifSendCmd(int cmd, void *packet, int packet_size,
                                void *src_extra, void *dest_extra, int size_extra)
@@ -166,8 +237,8 @@ unsigned int __wrap_SifSendCmd(int cmd, void *packet, int packet_size,
 }
 
 typedef struct pfsnet_isif_retry {
+    u8 pkt[64] __attribute__((aligned(64)));
     int cmd;
-    void *packet;
     int packet_size;
     void *src_extra;
     void *dest_extra;
@@ -185,7 +256,10 @@ static u64 pfsnetISifRetryAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, v
     (void)actual_time;
     (void)pc_value;
 
-    if (__real_iSifSendCmd(r->cmd, r->packet, r->packet_size, r->src_extra, r->dest_extra, r->size_extra) != 0) {
+    if ((_lw(0x1000c000) & 0x100) == 0)
+        iSifSetDChain();
+
+    if (__real_iSifSendCmd(r->cmd, r->pkt, r->packet_size, r->src_extra, r->dest_extra, r->size_extra) != 0) {
         r->active = 0;
         return 0;
     }
@@ -203,13 +277,13 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
         if (id != 0)
             return id;
     }
-    {
+    if (packet != NULL && packet_size > 0 && packet_size <= 64) {
         int i;
         for (i = 0; i < 8; i++) {
             if (!g_isifRetryPool[i].active) {
                 g_isifRetryPool[i].active = 1;
                 g_isifRetryPool[i].cmd = cmd;
-                g_isifRetryPool[i].packet = packet;
+                memcpy(g_isifRetryPool[i].pkt, packet, (size_t)packet_size);
                 g_isifRetryPool[i].packet_size = packet_size;
                 g_isifRetryPool[i].src_extra = src_extra;
                 g_isifRetryPool[i].dest_extra = dest_extra;
@@ -224,6 +298,262 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
     while ((id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra)) == 0) {
     }
     return id;
+}
+
+static int g_nmRpcSvrThreadID = -1;
+static int g_nmRxThreadID = -1;
+static int g_nmSifHandlerID = -1;
+static unsigned char g_nmRpcSvrThreadStack[0x1000] __attribute__((aligned(16)));
+static unsigned char g_nmRxThreadStack[0x1000] __attribute__((aligned(16)));
+static volatile unsigned char g_nmIsInitialized;
+static volatile unsigned char g_nmIsProcessingRx;
+
+static struct NetManBD *g_nmFrameBufferStatus;
+static struct NetManBD *g_nmRxIOPFrameBufferStatus;
+static volatile unsigned short int g_nmRxBufferRdPtr;
+static volatile unsigned short int g_nmRxBufferNextRdPtr;
+static SifRpcDataQueue_t g_nmCbQueue;
+static SifRpcServerData_t g_nmCbSrv;
+
+#define PFSNET_NM_CLEAR_RING_DEPTH 8
+static volatile int g_nmClearDmaRing[PFSNET_NM_CLEAR_RING_DEPTH];
+static volatile int g_nmClearDmaIdx;
+
+static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
+{
+    struct NetManBD *bd;
+    SifDmaTransfer_t dmat;
+    int slot;
+    int oldId;
+    unsigned int id;
+
+    bd = UNCACHED_SEG(&g_nmFrameBufferStatus[index]);
+    bd->length = 0;
+    bd->packet = packet;
+    bd->payload = payload;
+
+    slot = g_nmClearDmaIdx;
+    g_nmClearDmaIdx = (slot + 1) % PFSNET_NM_CLEAR_RING_DEPTH;
+    oldId = g_nmClearDmaRing[slot];
+    if (oldId > 0) {
+        while (SifDmaStat(oldId) >= 0)
+            nopdelay();
+    }
+
+    dmat.src = (void *)&g_nmFrameBufferStatus[index];
+    dmat.dest = &g_nmRxIOPFrameBufferStatus[index];
+    dmat.size = sizeof(struct NetManBD);
+    dmat.attr = 0;
+    while ((id = __wrap_SifSetDma(&dmat, 1)) == 0)
+        nopdelay();
+    g_nmClearDmaRing[slot] = (int)id;
+}
+
+static s32 pfsnetNetManHandleRxEvent(s32 channel)
+{
+    struct NetManBD *bdRd;
+    struct NetManBD *bdNext;
+    int dchainStopped;
+
+    (void)channel;
+
+    dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
+    if (dchainStopped)
+        iSifSetDChain();
+
+    if (g_nmFrameBufferStatus != NULL) {
+        bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
+        bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
+        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
+            if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
+                g_nmIsProcessingRx = 1;
+                iWakeupThread(g_nmRxThreadID);
+            }
+        }
+    }
+
+    ExitHandler();
+    return 0;
+}
+
+int __wrap_NetManRPCAllocRxBuffers(void)
+{
+    int i;
+
+    for (i = 0; i < NETMAN_RPC_BLOCK_SIZE; i++) {
+        void *packet, *payload;
+
+        if ((packet = NetManNetProtStackAllocRxPacket(NETMAN_NETIF_FRAME_SIZE, &payload)) != NULL) {
+            pfsnetNetManClearBufferLen(i, packet, payload);
+        } else {
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+
+static void pfsnetNetManRxThread(void *arg)
+{
+    volatile struct NetManBD *bd;
+    u32 PacketLength, PacketLengthAligned;
+    u8 run;
+
+    (void)arg;
+
+    while (1) {
+        void *payload, *payloadNext;
+        void *packet, *packetNext;
+
+        bd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
+
+        do {
+            DI();
+            if ((_lw(0x1000c000) & 0x100) == 0)
+                iSifSetDChain();
+            PacketLength = bd->length;
+            if (PacketLength > 0) {
+                run = 1;
+            } else {
+                run = 0;
+                g_nmIsProcessingRx = 0;
+            }
+            EI();
+
+            if (!run)
+                SleepThread();
+        } while (!run);
+
+        payload = bd->payload;
+        packet = bd->packet;
+
+        while ((packetNext = NetManNetProtStackAllocRxPacket(NETMAN_NETIF_FRAME_SIZE, &payloadNext)) == NULL) {
+            DelayThread(200);
+        }
+        g_nmRxBufferNextRdPtr = (g_nmRxBufferNextRdPtr + 1) % NETMAN_RPC_BLOCK_SIZE;
+        pfsnetNetManClearBufferLen(g_nmRxBufferRdPtr, packetNext, payloadNext);
+        g_nmRxBufferRdPtr = g_nmRxBufferNextRdPtr;
+
+        PacketLengthAligned = (PacketLength + 63) & ~63;
+        SifWriteBackDCache(payload, PacketLengthAligned);
+        NetManNetProtStackReallocRxPacket(packet, PacketLength);
+        NetManNetProtStackEnQRxPacket(packet);
+    }
+}
+
+static void *pfsnetNetManEERpcHandler(int fnum, void *buffer, int NumBytes)
+{
+    ee_thread_t thread;
+    void *result;
+
+    (void)NumBytes;
+
+    switch (fnum) {
+        case NETMAN_EE_RPC_FUNC_INIT:
+            g_nmRxIOPFrameBufferStatus = *(void **)buffer;
+            if (g_nmFrameBufferStatus == NULL)
+                g_nmFrameBufferStatus = memalign(64, sizeof(struct NetManBD) * NETMAN_RPC_BLOCK_SIZE);
+
+            if (g_nmFrameBufferStatus != NULL) {
+                memset(UNCACHED_SEG(g_nmFrameBufferStatus), 0, sizeof(struct NetManBD) * NETMAN_RPC_BLOCK_SIZE);
+                g_nmRxBufferRdPtr = 0;
+                g_nmRxBufferNextRdPtr = 0;
+                g_nmIsProcessingRx = 0;
+
+                thread.func = &pfsnetNetManRxThread;
+                thread.stack = g_nmRxThreadStack;
+                thread.stack_size = sizeof(g_nmRxThreadStack);
+                thread.gp_reg = &_gp;
+                thread.initial_priority = 0x59;
+                thread.attr = thread.option = 0;
+
+                if ((g_nmRxThreadID = CreateThread(&thread)) >= 0) {
+                    StartThread(g_nmRxThreadID, NULL);
+                    /* next = -1：挂在 _SifCmdIntHandler 之后，确保 SIF0 DChain 绝不漏开 */
+                    g_nmSifHandlerID = AddDmacHandler(DMAC_SIF0, &pfsnetNetManHandleRxEvent, -1);
+                    EnableDmac(DMAC_SIF0);
+                    ((struct NetManEEInitResult *)buffer)->result = 0;
+                    ((struct NetManEEInitResult *)buffer)->FrameBufferStatus = g_nmFrameBufferStatus;
+                } else {
+                    ((struct NetManEEInitResult *)buffer)->result = g_nmRxThreadID;
+                }
+            } else {
+                ((struct NetManEEInitResult *)buffer)->result = -ENOMEM;
+            }
+            result = buffer;
+            break;
+        case NETMAN_EE_RPC_FUNC_DEINIT:
+            if (g_nmFrameBufferStatus != NULL) {
+                free(g_nmFrameBufferStatus);
+                g_nmFrameBufferStatus = NULL;
+            }
+            result = NULL;
+            break;
+        case NETMAN_EE_RPC_FUNC_HANDLE_LINK_STATUS_CHANGE:
+            NetManToggleGlobalNetIFLinkState(*(u32 *)buffer);
+            result = NULL;
+            break;
+        default:
+            *(int *)buffer = EINVAL;
+            result = buffer;
+    }
+
+    return result;
+}
+
+static void pfsnetNetManRpcThread(void *arg)
+{
+    static unsigned char cb_rpc_buffer[64] __attribute__((__aligned__(64)));
+
+    (void)arg;
+
+    SifSetRpcQueue(&g_nmCbQueue, g_nmRpcSvrThreadID);
+    SifRegisterRpc(&g_nmCbSrv, NETMAN_RPC_NUMBER, &pfsnetNetManEERpcHandler, cb_rpc_buffer, NULL, NULL, &g_nmCbQueue);
+    SifRpcLoop(&g_nmCbQueue);
+}
+
+int __wrap_NetManInitRPCServer(void)
+{
+    ee_thread_t ThreadData;
+
+    if (!g_nmIsInitialized) {
+        ThreadData.func = &pfsnetNetManRpcThread;
+        ThreadData.stack = g_nmRpcSvrThreadStack;
+        ThreadData.stack_size = sizeof(g_nmRpcSvrThreadStack);
+        ThreadData.gp_reg = &_gp;
+        ThreadData.initial_priority = 0x57;
+        ThreadData.attr = ThreadData.option = 0;
+
+        if ((g_nmRpcSvrThreadID = CreateThread(&ThreadData)) >= 0) {
+            StartThread(g_nmRpcSvrThreadID, NULL);
+            g_nmIsInitialized = 1;
+            return 0;
+        }
+        return g_nmRpcSvrThreadID;
+    }
+    return 0;
+}
+
+void __wrap_NetManDeinitRPCServer(void)
+{
+    if (g_nmIsInitialized) {
+        SifRemoveRpc(&g_nmCbSrv, &g_nmCbQueue);
+        SifRemoveRpcQueue(&g_nmCbQueue);
+        if (g_nmSifHandlerID >= 0) {
+            RemoveDmacHandler(DMAC_SIF0, g_nmSifHandlerID);
+            g_nmSifHandlerID = -1;
+        }
+        if (g_nmRpcSvrThreadID >= 0) {
+            TerminateThread(g_nmRpcSvrThreadID);
+            DeleteThread(g_nmRpcSvrThreadID);
+            g_nmRpcSvrThreadID = -1;
+        }
+        if (g_nmRxThreadID >= 0) {
+            TerminateThread(g_nmRxThreadID);
+            DeleteThread(g_nmRxThreadID);
+            g_nmRxThreadID = -1;
+        }
+        g_nmIsInitialized = 0;
+    }
 }
 
 #define PFSNET_SYS_MAX_MESSAGES 1024

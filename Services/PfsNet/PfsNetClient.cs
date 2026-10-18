@@ -358,7 +358,13 @@ internal sealed class PfsNetClient : IDisposable
                 catch (Exception ex) when (!ct.IsCancellationRequested && IsTransientTransferException(ex))
                 {
                     lastException = ex;
-                    await TryReconnectAndRemountUnlockedAsync(ct).ConfigureAwait(false);
+                    var reconnected = await TryReconnectAndRemountUnlockedAsync(ct).ConfigureAwait(false);
+                    if (!reconnected || !IsConnected || _mountedPartition is null)
+                    {
+                        throw new IOException(
+                            $"PfsNet 传输文件“{remoteFileName}”中断后无法重新连接 PS2（{_lastHost}）：{lastException.Message}",
+                            lastException);
+                    }
                     if (attempt < MaxPutAttempts)
                     {
                         await Task.Delay(TimeSpan.FromMilliseconds(1500 * attempt), ct).ConfigureAwait(false);
@@ -367,12 +373,13 @@ internal sealed class PfsNetClient : IDisposable
                 }
                 catch
                 {
+                    if (!IsConnected || _mountedPartition is null)
+                        throw;
                     await TryReconnectAndRemountUnlockedAsync(CancellationToken.None).ConfigureAwait(false);
                     throw;
                 }
             }
 
-            await TryReconnectAndRemountUnlockedAsync(CancellationToken.None).ConfigureAwait(false);
             throw new IOException(
                 $"PfsNet 传输文件“{remoteFileName}”中途数据连接断开（已自动重试 {MaxPutAttempts} 次仍失败）：{lastException?.Message}",
                 lastException);

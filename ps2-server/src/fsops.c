@@ -97,8 +97,11 @@ static void abortXferCleanup(void)
         fileXioClose(g_xfer.fileFd);
         g_xfer.fileFd = -1;
     }
-    if (g_xfer.kind == PFSNET_XFER_PUT && g_xfer.tempPath[0] != '\0')
+    if (g_xfer.kind == PFSNET_XFER_PUT && g_xfer.tempPath[0] != '\0') {
         fileXioRemove(g_xfer.tempPath);
+        if (g_mounted)
+            fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
+    }
     clearXferState();
 }
 
@@ -980,6 +983,8 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         if (g_lastPutErr == 0)
             g_lastPutErr = PFSNET_ERR_DATA_CONN;
         fileXioRemove(g_xfer.tempPath);
+        if (g_mounted)
+            fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
         clearXferState();
         return 0;
     }
@@ -1016,6 +1021,9 @@ static int handlePutEnd(struct PfsNetClient *client)
         abortXferCleanup();
         return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
     }
+
+    if (g_mounted)
+        fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
 
     clearXferState();
     return pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
