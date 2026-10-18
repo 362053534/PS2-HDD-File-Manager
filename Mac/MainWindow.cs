@@ -60,13 +60,10 @@ internal sealed class MainWindow : Window
     private readonly ListBox _entries = new() { SelectionMode = SelectionMode.Multiple };
     private readonly ContextMenu _entryMenu = new();
     private readonly MenuItem _copyMenuItem = new() { Header = "复制" };
-    private readonly MenuItem _exportMenuItem = new() { Header = "导出…" };
     private readonly MenuItem _deleteMenuItem = new() { Header = "删除" };
     private readonly MenuItem _renameMenuItem = new() { Header = "重命名" };
     private readonly Separator _entryMenuSeparator = new();
     private readonly MenuItem _pasteMenuItem = new() { Header = "粘贴" };
-    private readonly MenuItem _importFilesMenuItem = new() { Header = "导入文件…" };
-    private readonly MenuItem _importFolderMenuItem = new() { Header = "导入目录…" };
     private readonly MenuItem _newDirectoryMenuItem = new() { Header = "新建目录" };
     private readonly Separator _entryMenuSeparator2 = new();
     private readonly MenuItem _newPartitionMenuItem = new() { Header = "新建 PFS 分区" };
@@ -219,12 +216,9 @@ internal sealed class MainWindow : Window
         _entries.AddHandler(DragDrop.DropEvent, OnEntriesDrop);
 
         _copyMenuItem.Click += async (_, _) => await CopySelectedToClipboardAsync();
-        _exportMenuItem.Click += async (_, _) => await ExportSelectedAsync();
         _deleteMenuItem.Click += async (_, _) => await DeleteSelectedAsync();
         _renameMenuItem.Click += async (_, _) => await RenameSelectedAsync();
         _pasteMenuItem.Click += async (_, _) => await PasteImportAsync();
-        _importFilesMenuItem.Click += async (_, _) => await ImportFileAsync();
-        _importFolderMenuItem.Click += async (_, _) => await ImportFolderAsync();
         _newDirectoryMenuItem.Click += async (_, _) => await CreateDirectoryAsync();
         _newPartitionMenuItem.Click += async (_, _) => await CreatePfsPartitionAsync();
         _renamePartitionMenuItem.Click += async (_, _) => await RenameSelectedPartitionAsync();
@@ -232,13 +226,10 @@ internal sealed class MainWindow : Window
         _refreshMenuItem.Click += async (_, _) => await RefreshBrowserAsync();
 
         _entryMenu.Items.Add(_copyMenuItem);
-        _entryMenu.Items.Add(_exportMenuItem);
         _entryMenu.Items.Add(_deleteMenuItem);
         _entryMenu.Items.Add(_renameMenuItem);
         _entryMenu.Items.Add(_entryMenuSeparator);
         _entryMenu.Items.Add(_pasteMenuItem);
-        _entryMenu.Items.Add(_importFilesMenuItem);
-        _entryMenu.Items.Add(_importFolderMenuItem);
         _entryMenu.Items.Add(_newDirectoryMenuItem);
         _entryMenu.Items.Add(_entryMenuSeparator2);
         _entryMenu.Items.Add(_newPartitionMenuItem);
@@ -488,25 +479,18 @@ internal sealed class MainWindow : Window
         var selected = SelectedEntries();
         var inPartition = _activePartition is not null;
         var onFileItem = inPartition && selected.Count > 0;
-        var onSingleFile = inPartition && selected is [{ IsDirectory: false }];
 
         _copyMenuItem.IsVisible = onFileItem;
-        _exportMenuItem.IsVisible = onFileItem;
         _deleteMenuItem.IsVisible = onFileItem;
         _renameMenuItem.IsVisible = onFileItem;
         _entryMenuSeparator.IsVisible = onFileItem;
         _copyMenuItem.IsEnabled = onFileItem;
-        _exportMenuItem.IsEnabled = onSingleFile;
         _deleteMenuItem.IsEnabled = onFileItem;
         _renameMenuItem.IsEnabled = selected.Count == 1;
 
         _pasteMenuItem.IsVisible = inPartition;
-        _importFilesMenuItem.IsVisible = inPartition;
-        _importFolderMenuItem.IsVisible = inPartition;
         _newDirectoryMenuItem.IsVisible = inPartition;
         _pasteMenuItem.IsEnabled = inPartition;
-        _importFilesMenuItem.IsEnabled = inPartition;
-        _importFolderMenuItem.IsEnabled = inPartition;
         _newDirectoryMenuItem.IsEnabled = inPartition;
         _entryMenuSeparator2.IsVisible = inPartition;
 
@@ -1534,7 +1518,7 @@ internal sealed class MainWindow : Window
         var items = await GetClipboardFilePathsAsync();
         if (items.Length == 0)
         {
-            await ShowWarningAsync("剪贴板中没有可导入的文件或目录。请先在 Finder 中复制文件，或使用右键菜单「导入文件 / 导入目录」。");
+            await ShowWarningAsync("剪贴板中没有可导入的文件或目录。请先在 Finder 中复制文件或文件夹，或直接拖入窗口。");
             return;
         }
 
@@ -1592,9 +1576,10 @@ internal sealed class MainWindow : Window
         {
             try
             {
+                const string jxa = "ObjC.import('AppKit'); var pb = $.NSPasteboard.generalPasteboard; var urls = pb.readObjectsForClassesOptions($([$.NSURL.class]), $({})); var out = []; if (urls) { var n = urls.count; for (var i = 0; i < n; i++) { var p = ObjC.unwrap(urls.objectAtIndex(i).path); if (p) out.push(p); } } out.join('\\n');";
                 var res = await ProcessRunner.RunAsync(
                     "/usr/bin/osascript",
-                    "-e \"try\" -e \"POSIX path of (the clipboard as alias)\" -e \"end try\"");
+                    $"-l JavaScript -e \"{jxa.Replace("\"", "\\\"")}\"");
                 if (res.ExitCode == 0 && !string.IsNullOrWhiteSpace(res.StandardOutput))
                 {
                     foreach (var line in res.StandardOutput.Replace("\r", string.Empty).Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -1674,13 +1659,22 @@ internal sealed class MainWindow : Window
         if (paths.Length == 0)
             return;
 
-        if (OperatingSystem.IsMacOS() && File.Exists("/usr/bin/osascript") && paths.Length == 1)
+        if (OperatingSystem.IsMacOS() && File.Exists("/usr/bin/osascript"))
         {
             try
             {
-                var escaped = paths[0].Replace("\\", "\\\\").Replace("\"", "\\\"");
-                await ProcessRunner.RunAsync("/usr/bin/osascript", $"-e \"set the clipboard to (POSIX file \\\"{escaped}\\\")\"");
-                return;
+                var sb = new StringBuilder();
+                sb.Append("ObjC.import('AppKit'); var pb = $.NSPasteboard.generalPasteboard; pb.clearContents; var arr = $.NSMutableArray.alloc.init; ");
+                foreach (var path in paths)
+                {
+                    var escaped = path.Replace("\\", "\\\\").Replace("'", "\\'");
+                    sb.Append($"arr.addObject($.NSURL.fileURLWithPath('{escaped}')); ");
+                }
+                sb.Append("pb.writeObjects(arr);");
+                var script = sb.ToString().Replace("\"", "\\\"");
+                var res = await ProcessRunner.RunAsync("/usr/bin/osascript", $"-l JavaScript -e \"{script}\"");
+                if (res.ExitCode == 0)
+                    return;
             }
             catch
             {
