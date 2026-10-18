@@ -179,8 +179,14 @@ static void clientThread(void *arg)
             continue;
         }
 
-        if (pfsnetHandleCommand(client, hdr.command, client->rx, hdr.payload_length) < 0)
-            break;
+        {
+            int cmdRc;
+            pfsnetTrafficBegin();
+            cmdRc = pfsnetHandleCommand(client, hdr.command, client->rx, hdr.payload_length);
+            pfsnetTrafficEnd();
+            if (cmdRc < 0)
+                break;
+        }
     }
 
     closeClient(client);
