@@ -3,9 +3,13 @@
 #include <malloc.h>
 #include <string.h>
 #include <limits.h>
+#include <stdint.h>
 #include <kernel.h>
 #include <kernel_util.h>
+#include <sifdma.h>
+#include <sifcmd.h>
 #include <timer.h>
+#include <timer_alarm.h>
 #include <delaythread.h>
 #include <debug.h>
 #include <netman.h>
@@ -137,6 +141,119 @@ err_t __wrap_netconn_recv_tcp_pbuf(void *conn, struct pbuf **new_buf)
     return err;
 }
 
+/*
+ * 解决 EE BIOS 32 槽 SIF1 DMA 队列被 NETMAN_RxThread (ClearBufferLen) 塞满导致
+ * fileXioWrite 的 _request_rdata (iSifSendCmd) 丢包永久死锁：
+ *
+ * 1) EE 侧 NETMAN_RxThread 在 ClearBufferLen 中每处理一帧以太网包就调用一次
+ *    while (SifSetDma(&dmat, 1) == 0) {} (16 字节 NetManBD) 且从不等待 SifDmaStat，
+ *    突发收包或启动分配 64 个 RX 缓冲时瞬间塞满 EE BIOS 仅有的 32 个 SIF1 DMA 队列槽。
+ * 2) 与此同时，IOP 侧 fileXio_Write_RPC 通过 SifRpcGetOtherData 拉取每片 128KiB 写盘数据时，
+ *    向 EE 发送 SIF_CMD_RPC_RDATA 并睡眠在 WaitEventFlag 上等待 EE 回复 SIF_CMD_RPC_END。
+ *    但 PS2SDK ee/kernel/src/sifrpc.c 的 _request_rdata 在中断里调用 iSifSendCmd(SIF_CMD_RPC_END)
+ *    (内部需占用 2 个 SIF1 DMA 槽) 时完全未检查返回值 0！一旦 SIF1 队列当时剩余不足 2 槽，
+ *    SIF_CMD_RPC_END 被静默丢弃，IOP 侧 fileXio_Thread 与 EE 侧写盘线程永久死锁。
+ * 3) 通过 wrap SifSetDma 对 16 字节单描述符状态回写做 4 深度流水线限流（始终留出 28 个 SIF1 槽），
+ *    并 wrap SifSendCmd / iSifSendCmd 在队列满时自动自旋或通过 iSetTimerAlarm 硬件定时器重试，
+ *    确保 SIF RPC 命令与 _request_rdata 永不丢失。
+ */
+extern u32 __real_SifSetDma(SifDmaTransfer_t *sdd, s32 len);
+extern unsigned int __real_SifSendCmd(int cmd, void *packet, int packet_size,
+                                      void *src_extra, void *dest_extra, int size_extra);
+extern unsigned int __real_iSifSendCmd(int cmd, void *packet, int packet_size,
+                                       void *src_extra, void *dest_extra, int size_extra);
+
+u32 __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
+{
+    static u32 s_bdDmaRing[4];
+    static unsigned int s_bdDmaIdx;
+    u32 id;
+
+    if (len == 1 && sdd != NULL && sdd->size <= 32 && sdd->attr == 0) {
+        u32 prev = s_bdDmaRing[s_bdDmaIdx];
+        if (prev != 0) {
+            while (SifDmaStat(prev) >= 0) {
+            }
+        }
+        while ((id = __real_SifSetDma(sdd, len)) == 0) {
+        }
+        s_bdDmaRing[s_bdDmaIdx] = id;
+        s_bdDmaIdx = (s_bdDmaIdx + 1u) & 3u;
+        return id;
+    }
+    return __real_SifSetDma(sdd, len);
+}
+
+unsigned int __wrap_SifSendCmd(int cmd, void *packet, int packet_size,
+                               void *src_extra, void *dest_extra, int size_extra)
+{
+    unsigned int id;
+    while ((id = __real_SifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra)) == 0)
+        nopdelay();
+    return id;
+}
+
+typedef struct pfsnet_isif_retry {
+    int cmd;
+    void *packet;
+    int packet_size;
+    void *src_extra;
+    void *dest_extra;
+    int size_extra;
+    volatile int active;
+} pfsnet_isif_retry_t;
+
+static pfsnet_isif_retry_t g_isifRetryPool[8];
+
+static u64 pfsnetISifRetryAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
+{
+    pfsnet_isif_retry_t *r = (pfsnet_isif_retry_t *)arg;
+    (void)id;
+    (void)scheduled_time;
+    (void)actual_time;
+    (void)pc_value;
+
+    if (__real_iSifSendCmd(r->cmd, r->packet, r->packet_size, r->src_extra, r->dest_extra, r->size_extra) != 0) {
+        r->active = 0;
+        return 0;
+    }
+    return 0x4000;
+}
+
+unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
+                                void *src_extra, void *dest_extra, int size_extra)
+{
+    unsigned int id;
+    int spin;
+
+    for (spin = 0; spin < 256; spin++) {
+        id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra);
+        if (id != 0)
+            return id;
+    }
+    {
+        int i;
+        for (i = 0; i < 8; i++) {
+            if (!g_isifRetryPool[i].active) {
+                g_isifRetryPool[i].active = 1;
+                g_isifRetryPool[i].cmd = cmd;
+                g_isifRetryPool[i].packet = packet;
+                g_isifRetryPool[i].packet_size = packet_size;
+                g_isifRetryPool[i].src_extra = src_extra;
+                g_isifRetryPool[i].dest_extra = dest_extra;
+                g_isifRetryPool[i].size_extra = size_extra;
+                if (iSetTimerAlarm(0x4000, &pfsnetISifRetryAlarmCb, &g_isifRetryPool[i]) >= 0)
+                    return 1;
+                g_isifRetryPool[i].active = 0;
+                break;
+            }
+        }
+    }
+    while ((id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra)) == 0) {
+    }
+    return id;
+}
+
 #define PFSNET_SYS_MAX_MESSAGES 1024
 #define PFSNET_SYS_ARCH_TIMEOUT 0xffffffffUL
 
@@ -198,28 +315,57 @@ static void freeMsg(pfsnet_arch_message_t *msg)
     SignalSema(g_msgCountSema);
 }
 
+/*
+ * 修复 PS2SDK WaitSemaEx (ee/kernel/src/kernel_util.c) 的超时丢失竞态：
+ *
+ * WaitSemaEx 先调 SetTimerAlarm（内部 EIntr 开中断）再调 WaitSema。
+ * 当 tcpip_thread 在 sys_timeouts_mbox_fetch 传入短超时（如 1ms）或在 SetTimerAlarm 与 WaitSema 之间
+ * 被抢占时，定时器中断在线程进入 WAIT 状态前触发，iReleaseWaitThread 对 READY 线程返回 <0 且闹钟被销毁，
+ * 随后 tcpip_thread 进入 WaitSema(mbox) 永久睡眠（LWIP_TCPIP_CORE_LOCKING=1 下无人向该 mbox 投递消息），
+ * 导致全栈 TCP/ARP 定时器彻底停摆、PS2 失联。
+ *
+ * 此处：
+ * 1) 先走 PollSema 快路径，队列有包时零硬件定时器开销（避免每 GB 约 70 万次 Timer2 闹钟创建/销毁）；
+ * 2) 若闹钟触发时目标线程尚未进入 WaitSema (iReleaseWaitThread < 0)，返回 0x4000 (~111us) 继续重触发，
+ *    直到成功将线程从 WaitSema 唤醒或被 ReleaseTimerAlarm 取消。
+ */
+static u64 pfsnetWaitSemaAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
+{
+    s32 tid = (s32)(intptr_t)arg;
+    (void)id;
+    (void)scheduled_time;
+    (void)actual_time;
+    (void)pc_value;
+
+    if (iReleaseWaitThread(tid) < 0)
+        return 0x4000;
+    return 0;
+}
+
 static int waitSemaTimeoutMs(int sema, unsigned int msec)
 {
+    s32 timerid;
     int ret;
-    u64 timeoutUsec;
-    u64 *timeoutPtr;
+    u64 clocks;
 
-    if (msec == 0) {
-        if (PollSema(sema) < 0)
-            return -1;
+    if (PollSema(sema) == sema)
         return sema;
-    }
-
-    timeoutPtr = NULL;
-    if (msec != UINT32_MAX) {
-        timeoutUsec = (u64)msec * 1000ULL;
-        timeoutPtr = &timeoutUsec;
-    }
-
-    ret = WaitSemaEx(sema, 1, timeoutPtr);
-    if (ret < 0)
+    if (msec == 0)
         return -1;
-    return sema;
+    if (msec == UINT32_MAX)
+        return (WaitSema(sema) == sema) ? sema : -1;
+
+    clocks = MSec2TimerBusClock(msec);
+    if (clocks < 0x4000)
+        clocks = 0x4000;
+
+    timerid = SetTimerAlarm(clocks, &pfsnetWaitSemaAlarmCb, (void *)(intptr_t)GetThreadId());
+    if (timerid < 0)
+        return (WaitSema(sema) == sema) ? sema : -1;
+
+    ret = WaitSema(sema);
+    ReleaseTimerAlarm(timerid);
+    return (ret == sema) ? sema : -1;
 }
 
 static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **message)
@@ -237,16 +383,22 @@ static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **
     EI();
 }
 
-static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t mBox, u32 timeout)
+static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox, u32 timeout)
 {
+    pfsnet_sys_mbox_t mBox;
+    int sema;
     int result;
 
-    if (timeout > 0)
-        result = waitSemaTimeoutMs(mBox->MessageCountSema, timeout);
-    else
-        result = WaitSema(mBox->MessageCountSema);
+    if (pMBox == NULL || (mBox = *pMBox) == NULL)
+        return -1;
+    sema = mBox->MessageCountSema;
 
-    if (result == mBox->MessageCountSema) {
+    if (timeout > 0)
+        result = waitSemaTimeoutMs(sema, timeout);
+    else
+        result = WaitSema(sema);
+
+    if (result == sema && *pMBox == mBox) {
         retrieveMbxInternal(mBox, message);
         return 0;
     }
@@ -255,7 +407,7 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t mBox, u
 
 static int pollMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t mBox)
 {
-    if (PollSema(mBox->MessageCountSema) == mBox->MessageCountSema) {
+    if (mBox != NULL && PollSema(mBox->MessageCountSema) == mBox->MessageCountSema) {
         retrieveMbxInternal(mBox, message);
         return 0;
     }
@@ -264,16 +416,22 @@ static int pollMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t mBox)
 
 static void sendMbx(pfsnet_sys_mbox_t *mbox, pfsnet_arch_message_t *msg, void *sys_msg)
 {
+    pfsnet_sys_mbox_t m;
+
+    if (mbox == NULL || (m = *mbox) == NULL) {
+        freeMsg(msg);
+        return;
+    }
     DI();
     msg->sys_msg = sys_msg;
     msg->next = NULL;
-    if ((*mbox)->FirstMessage == NULL)
-        (*mbox)->FirstMessage = msg;
-    if ((*mbox)->LastMessage != NULL)
-        (*mbox)->LastMessage->next = msg;
-    (*mbox)->LastMessage = msg;
+    if (m->FirstMessage == NULL)
+        m->FirstMessage = msg;
+    if (m->LastMessage != NULL)
+        m->LastMessage->next = msg;
+    m->LastMessage = msg;
     EI();
-    SignalSema((*mbox)->MessageCountSema);
+    SignalSema(m->MessageCountSema);
 }
 
 void __wrap_sys_init(void)
@@ -324,21 +482,27 @@ err_t __wrap_sys_mbox_new(pfsnet_sys_mbox_t *mbox, int size)
 
 void __wrap_sys_mbox_free(pfsnet_sys_mbox_t *pMBox)
 {
+    pfsnet_sys_mbox_t mBox;
     pfsnet_arch_message_t *message, *nextMessage;
 
-    if (pMBox == NULL || *pMBox == NULL)
+    if (pMBox == NULL || (mBox = *pMBox) == NULL)
         return;
 
-    message = (*pMBox)->FirstMessage;
+    DI();
+    *pMBox = NULL;
+    message = mBox->FirstMessage;
+    mBox->FirstMessage = NULL;
+    mBox->LastMessage = NULL;
+    EI();
+
     while (message != NULL) {
         nextMessage = message->next;
         freeMsg(message);
         message = nextMessage;
     }
 
-    DeleteSema((*pMBox)->MessageCountSema);
-    free(*pMBox);
-    *pMBox = NULL;
+    DeleteSema(mBox->MessageCountSema);
+    free(mBox);
 }
 
 err_t __wrap_sys_mbox_trypost(pfsnet_sys_mbox_t *mbox, void *sys_msg)
@@ -363,7 +527,7 @@ u32 __wrap_sys_arch_mbox_fetch(pfsnet_sys_mbox_t *pMBox, void **ppvMSG, u32 u32T
     pfsnet_arch_message_t *pmsg = NULL;
     u32 start = __wrap_sys_now();
 
-    if (receiveMbx(&pmsg, *pMBox, u32Timeout) == 0) {
+    if (receiveMbx(&pmsg, pMBox, u32Timeout) == 0) {
         u32 elapsed = __wrap_sys_now() - start;
         if (pmsg != NULL) {
             if (ppvMSG != NULL)

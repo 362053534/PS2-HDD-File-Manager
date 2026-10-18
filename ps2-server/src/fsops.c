@@ -863,15 +863,13 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         SignalSema(g_ioSemStart);
 
         while (got < totalBytes && !failed) {
-            int firstLen;
-            int totalWrite;
-            int count = 1;
+            int bankLen;
             uint8_t *src;
             int written = 0;
 
             WaitSema(g_putFillSem);
-            firstLen = g_ringBankLen[rdIdx];
-            if (firstLen <= 0) {
+            bankLen = g_ringBankLen[rdIdx];
+            if (bankLen <= 0) {
                 if (g_lastPutErr == 0)
                     g_lastPutErr = PFSNET_ERR_DATA_CONN;
                 failed = 1;
@@ -879,26 +877,9 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
             }
 
             src = g_ringBase + ((size_t)rdIdx * (size_t)PFSNET_XFER_BUF);
-            totalWrite = firstLen;
 
-            /* 合并物理连续的已就绪槽（最多 4 槽 = 2MiB），减少 SIF/PFS 写盘切换开销 */
-            while (count < 4
-                   && (rdIdx + count) < g_ringBanks
-                   && g_ringBankLen[rdIdx + count - 1] == PFSNET_XFER_BUF
-                   && PollSema(g_putFillSem) == g_putFillSem) {
-                int nextLen = g_ringBankLen[rdIdx + count];
-                if (nextLen <= 0) {
-                    if (g_lastPutErr == 0)
-                        g_lastPutErr = PFSNET_ERR_DATA_CONN;
-                    failed = 1;
-                    break;
-                }
-                totalWrite += nextLen;
-                count++;
-            }
-
-            while (written < totalWrite) {
-                int wr = fileXioWrite(fd, src + written, totalWrite - written);
+            while (written < bankLen) {
+                int wr = fileXioWrite(fd, src + written, bankLen - written);
                 if (wr <= 0) {
                     g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                     failed = 1;
@@ -909,15 +890,14 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
                 written += wr;
             }
 
-            for (i = 0; i < count; i++)
-                SignalSema(g_putFreeSem);
+            SignalSema(g_putFreeSem);
 
             if (!failed)
-                got += (uint64_t)totalWrite;
+                got += (uint64_t)bankLen;
 
-            rdIdx += count;
+            rdIdx++;
             if (rdIdx >= g_ringBanks)
-                rdIdx -= g_ringBanks;
+                rdIdx = 0;
         }
 
         if (failed) {

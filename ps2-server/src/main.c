@@ -298,32 +298,14 @@ int main(int argc, char *argv[])
         waitStartToExit();
     }
 
-    {
-        /* FILEXIO.IRX 的 RPC 线程优先级为 40(0x28)，而 SMAP.IRX 默认线程优先级也是 40(0x28)。
-         * 在 macOS（默认不协商 802.3x PAUSE 流控帧）下，若两者同优先级，fileXio 连续写盘期间
-         * SMAP 无法抢占排空仅 16KB(10 帧) 的硬件 RX FIFO，导致硬件丢包触发 TCP 超时重传（速度跌至 ~2MB/s）。
-         * 将 SMAP 线程优先级提高到 28(0x1c)，使其在每片 16KB ATA DMA 间隙立即抢占排空 RX FIFO。 */
-        static char smapArg[] = "thpri=28";
-        loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
-        loadModuleBuffer(SMAP_irx, size_SMAP_irx, sizeof(smapArg), smapArg);
-        NetManInit();
-    }
-
-    /* 对齐 HDLGameInstaller (FILEIO_BLOCK_SIZE = 256 * 2048 = 512KiB)：
-     * 配合 SMAP 优先级 28 与 EE 8MiB 环形缓冲，将单槽 512KiB SIF RPC 合并为 1 次传输，若 IOP 堆不足则逐级回退 */
-    {
-        int rw = 512 * 1024;
-        if (fileXioSetRWBufferSize(rw) < 0) {
-            rw = 256 * 1024;
-            if (fileXioSetRWBufferSize(rw) < 0) {
-                rw = 128 * 1024;
-                if (fileXioSetRWBufferSize(rw) < 0) {
-                    rw = 64 * 1024;
-                    fileXioSetRWBufferSize(rw);
-                }
-            }
-        }
-    }
+    /* 对齐 362053534/HDLGameInstaller (main.c:131-132)：
+     * SMAP.IRX 保持默认线程优先级 0x28(40)，严禁高于 NETMAN.IRX 的 RPC 服务线程 0x27(39)，
+     * 否则 SMAP 在 NetManRpcNetProtStackAllocRxPacket 的 while(bd->length != 0){} 自旋时会饿死
+     * NETMAN_RPC_srv(39) 与 fileXio_Thread(40) 导致死锁。ATA DMA 期间 fileXio_Thread 睡眠在
+     * WaitEventFlag 上，SMAP(40) 依然可在每片 DMA 间隙立即运行排空 RX FIFO。 */
+    loadModuleBuffer(NETMAN_irx, size_NETMAN_irx, 0, NULL);
+    loadModuleBuffer(SMAP_irx, size_SMAP_irx, 0, NULL);
+    NetManInit();
 
     /*
      * 1) DHCP
@@ -351,6 +333,12 @@ int main(int argc, char *argv[])
             failNoIp();
         }
     }
+
+    /* 对齐 362053534/HDLGameInstaller (main.h:28 FILEIO_BLOCK_SIZE = 256 * 512 = 128KiB)：
+     * 在 ps2ipInit (NetManRegisterNetworkStack) 与 USB 模块分配完 IOP 堆之后再设置 128KiB RWBufferSize，
+     * 避免过度占用仅 2MiB 的 IOP 系统内存。 */
+    if (fileXioSetRWBufferSize(128 * 1024) < 0)
+        fileXioSetRWBufferSize(64 * 1024);
 
     /* 清屏后只保留最终状态；链路用 DHCP 阶段缓存，不再 NetManIoctl */
     ethGetIpDisplay(ipText, sizeof(ipText));
