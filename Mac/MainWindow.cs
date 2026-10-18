@@ -2014,14 +2014,14 @@ internal sealed class MainWindow : Window
                 {
                     var sec = Math.Max(0.001, fileSw.Elapsed.TotalSeconds);
                     var mbps = (fileLength / (1024.0 * 1024.0)) / sec;
-                    AppendLog($"[{idx + 1}/{pendingImports.Count}] 已导入 {remoteName}（{FormatByteSize((ulong)Math.Max(0, fileLength))}，用时 {fileSw.Elapsed:mm\\:ss}，{mbps:F2} MB/s）");
+                    AppendLog($"[{idx + 1}/{pendingImports.Count}] 已导入 {remoteName}（{FormatBytes(Math.Max(0, fileLength))}，用时 {fileSw.Elapsed:mm\\:ss}，{mbps:F2} MB/s）");
                 }
             }
 
             batchSw.Stop();
             var batchSec = Math.Max(0.001, batchSw.Elapsed.TotalSeconds);
             var batchMbps = (batchTotalBytes / (1024.0 * 1024.0)) / batchSec;
-            AppendLog($"已通过 PfsNet 导入 {pendingImports.Count} 个文件（共 {FormatByteSize((ulong)Math.Max(0, batchTotalBytes))}，总用时 {batchSw.Elapsed:hh\\:mm\\:ss}，平均 {batchMbps:F2} MB/s）。");
+            AppendLog($"已通过 PfsNet 导入 {pendingImports.Count} 个文件（共 {FormatBytes(Math.Max(0, batchTotalBytes))}，总用时 {batchSw.Elapsed:hh\\:mm\\:ss}，平均 {batchMbps:F2} MB/s）。");
             return;
         }
 

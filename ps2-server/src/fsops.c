@@ -1038,12 +1038,6 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
 
     g_xferClientSock = -1;
     g_xfer.dataSock = -1;
-    if (got != totalBytes) {
-        struct linger lg;
-        lg.l_onoff = 1;
-        lg.l_linger = 0;
-        setsockopt(dataSock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
-    }
     close(dataSock);
     fileXioClose(fd);
 
@@ -1253,10 +1247,6 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
     fileXioClose(fd);
 
     if (sent != toSend) {
-        struct linger lg;
-        lg.l_onoff = 1;
-        lg.l_linger = 0;
-        setsockopt(dataSock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         g_xfer.dataSock = -1;
         close(dataSock);
         return 0;
