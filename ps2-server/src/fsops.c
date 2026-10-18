@@ -21,10 +21,14 @@
 #define PFSNET_XFER_NONE 0
 #define PFSNET_XFER_PUT 1
 #define PFSNET_XFER_GET 2
-/* 512KiB：对齐 HDL 大批次，显著减少 fileXio SIF 往返；双缓冲另占一份 */
+/* 512KiB：对齐 HDL 大批次，显著减少 fileXio SIF 往返；多槽环形缓冲吸收硬盘寻道/元数据刷新峰值 */
 #define PFSNET_XFER_BUF (512 * 1024)
+#define PFSNET_RING_MAX_BANKS 16 /* 16 * 512KiB = 8MiB EE 环形缓冲 */
 #define PFSNET_IO_STACK 0x2000
 #define PFSNET_PUT_OVERWRITE 1u
+
+#define PFSNET_IO_MODE_SINGLE 0
+#define PFSNET_IO_MODE_PUT_RING 1
 
 extern void *_gp;
 
@@ -44,8 +48,17 @@ static struct {
     char finalPath[768];
 } g_xfer;
 
-/* [0]/[1] 乒乓：堆上分配，避免 ~1MiB BSS 拖慢 crt0 清零 / 撑大 ELF MemSiz */
+/* [0]/[1] 乒乓及多槽环形缓冲池：堆上分配，避免 BSS 拖慢 crt0 清零 / 撑大 ELF MemSiz */
 static uint8_t *g_xferBuf[2];
+static uint8_t *g_ringBase;
+static int g_ringBanks;
+static volatile int g_ringBankLen[PFSNET_RING_MAX_BANKS];
+static int g_putFreeSem = -1;
+static int g_putFillSem = -1;
+static volatile int g_putStop;
+static volatile int g_xferClientSock = -1;
+static uint64_t g_putTotalBytes;
+static volatile int g_ioMode;
 static uint32_t g_tempSeq;
 
 /* 网络收发工作线程（主线程专跑 fileXio，避免并发 RPC） */
@@ -74,6 +87,7 @@ static void clearXferState(void)
 
 static void abortXferCleanup(void)
 {
+    g_putStop = 1;
     if (g_xfer.dataSock >= 0) {
         close(g_xfer.dataSock);
         g_xfer.dataSock = -1;
@@ -101,14 +115,24 @@ int pfsnetFsInit(void)
     g_mountedTotalBytes = 0;
     clearXferState();
 
-    if (!g_xferBuf[0])
-        g_xferBuf[0] = (uint8_t *)memalign(64, PFSNET_XFER_BUF);
-    if (!g_xferBuf[1])
-        g_xferBuf[1] = (uint8_t *)memalign(64, PFSNET_XFER_BUF);
-    if (!g_xferBuf[0] || !g_xferBuf[1]) {
+    if (!g_ringBase) {
+        static const int bankTry[] = { PFSNET_RING_MAX_BANKS, 8, 4, 2 };
+        unsigned int i;
+        for (i = 0; i < sizeof(bankTry) / sizeof(bankTry[0]); i++) {
+            size_t total = (size_t)bankTry[i] * (size_t)PFSNET_XFER_BUF;
+            g_ringBase = (uint8_t *)memalign(64, total);
+            if (g_ringBase != NULL) {
+                g_ringBanks = bankTry[i];
+                break;
+            }
+        }
+    }
+    if (!g_ringBase || g_ringBanks < 2) {
         scr_printf("FATAL: xfer buf alloc failed\n");
         return -1;
     }
+    g_xferBuf[0] = g_ringBase;
+    g_xferBuf[1] = g_ringBase + PFSNET_XFER_BUF;
 
     initIoWorker();
     return 0;
@@ -116,9 +140,10 @@ int pfsnetFsInit(void)
 
 void pfsnetFsAbortActiveSocket(void)
 {
-    int sock = g_xfer.dataSock;
-    if (sock >= 0)
-        shutdown(sock, SHUT_RDWR);
+    /* 仅置位 g_putStop：lwIP 在 LWIP_NETCONN_FULLDUPLEX=0 下禁止跨线程对正阻塞在 recv/send 的
+     * netconn 调用 shutdown/close（netconn_drain 会直接销毁 recvmbox 导致并发崩溃或死锁）。
+     * dataSock 配有 1 秒 SO_RCVTIMEO/SO_SNDTIMEO，ioWorker 会在 <=1 秒内自行唤醒检测 g_putStop 退出。 */
+    g_putStop = 1;
 }
 
 void pfsnetFsForceUmount(void)
@@ -556,17 +581,48 @@ static int handleRename(struct PfsNetClient *client, const uint8_t *payload, uin
     return pfsnetSendResponse(client, mapErrno(result), NULL, 0);
 }
 
+static int controlSocketHasPendingAbortOrClose(void)
+{
+    int csock = g_xferClientSock;
+    char peekByte;
+    int r;
+
+    if (csock < 0)
+        return 0;
+    r = recv(csock, &peekByte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r >= 0)
+        return 1; /* >0: 控制口已收到客户端发来的 ABORT 等指令；==0: 控制口已断开 */
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return 0;
+    return 1;
+}
+
 static int xferSendAll(int sock, const void *buf, int len)
 {
     const char *ptr = (const char *)buf;
     int sent = 0;
     int ok = 1;
+    int idleLoops = 0;
 
     pfsnetTrafficBegin();
     while (sent < len) {
-        int n = send(sock, ptr + sent, len - sent, 0);
+        int n;
+        if (g_putStop) {
+            ok = 0;
+            break;
+        }
+        n = send(sock, ptr + sent, len - sent, 0);
         if (n > 0) {
             sent += n;
+            idleLoops = 0;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 30) {
+            if (controlSocketHasPendingAbortOrClose()) {
+                g_putStop = 1;
+                ok = 0;
+                break;
+            }
             continue;
         }
         ok = 0;
@@ -581,15 +637,31 @@ static int xferRecvAll(int sock, void *buf, int len)
     char *ptr = (char *)buf;
     int got = 0;
     int ok = 1;
+    int idleLoops = 0;
 
     pfsnetTrafficBegin();
     while (got < len) {
-        int n = recv(sock, ptr + got, len - got, 0);
-        if (n <= 0) {
+        int n;
+        if (g_putStop) {
             ok = 0;
             break;
         }
-        got += n;
+        n = recv(sock, ptr + got, len - got, 0);
+        if (n > 0) {
+            got += n;
+            idleLoops = 0;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 30) {
+            if (controlSocketHasPendingAbortOrClose()) {
+                g_putStop = 1;
+                ok = 0;
+                break;
+            }
+            continue;
+        }
+        ok = 0;
+        break;
     }
     pfsnetTrafficEnd();
     return ok ? got : -1;
@@ -600,6 +672,39 @@ static void ioWorker(void *arg)
     (void)arg;
     for (;;) {
         WaitSema(g_ioSemStart);
+        if (g_ioMode == PFSNET_IO_MODE_PUT_RING) {
+            uint64_t netRem = g_putTotalBytes;
+            int wrIdx = 0;
+
+            while (netRem > 0 && !g_putStop) {
+                int chunk = netRem > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)netRem;
+                uint8_t *dst = g_ringBase + ((size_t)wrIdx * (size_t)PFSNET_XFER_BUF);
+                int r;
+
+                WaitSema(g_putFreeSem);
+                if (g_putStop) {
+                    g_ringBankLen[wrIdx] = -1;
+                    SignalSema(g_putFillSem);
+                    break;
+                }
+                r = xferRecvAll(g_ioSock, dst, chunk);
+                if (r != chunk) {
+                    /* 数据口提前断开或被取消：立即置位 g_putStop，通知写盘线程跳过环形缓冲中尚未写盘的旧块 */
+                    g_putStop = 1;
+                    g_ringBankLen[wrIdx] = -1;
+                    SignalSema(g_putFillSem);
+                    break;
+                }
+                g_ringBankLen[wrIdx] = r;
+                SignalSema(g_putFillSem);
+                netRem -= (uint64_t)r;
+                wrIdx++;
+                if (wrIdx >= g_ringBanks)
+                    wrIdx = 0;
+            }
+            SignalSema(g_ioSemDone);
+            continue;
+        }
         if (g_ioIsSend)
             g_ioResult = xferSendAll(g_ioSock, g_ioBuf, g_ioLen);
         else
@@ -627,13 +732,27 @@ static int initIoWorker(void)
         return -1;
     }
 
+    memset(&sem, 0, sizeof(sem));
+    sem.init_count = 0;
+    sem.max_count = PFSNET_RING_MAX_BANKS;
+    g_putFreeSem = CreateSema(&sem);
+    g_putFillSem = CreateSema(&sem);
+    if (g_putFreeSem < 0 || g_putFillSem < 0) {
+        g_ioAsync = 0;
+        return -1;
+    }
+
     memset(&th, 0, sizeof(th));
     th.func = &ioWorker;
     th.stack = g_ioStack;
     th.stack_size = sizeof(g_ioStack);
     th.gp_reg = &_gp;
-    /* 必须低于客户端(0x40)：若 I/O 线程更高优，recv/send 有数据时会饿死 fileXio，双缓冲退化成串行≈半速 */
-    th.initial_priority = 0x41;
+    /* 必须高于 NETMAN_RxThread(0x59) 且略低于 clientThread(0x40)：
+     * lwIP 的 pcb->rcv_wnd 在 tcp_input(NETMAN_RxThread) 中扣减，仅在应用线程调用
+     * netconn_recv_tcp_pbuf -> tcp_recved 时恢复。ioWorker(0x42) 高于 NETMAN_RxThread(0x59)
+     * 可在每收到一个分片释放 lock_tcpip_core 后立即调用 tcp_recved 推进窗口右沿并拷入 8MiB 环形缓冲，
+     * 避免 NETMAN_RxThread 连续收包把 rcv_wnd 扣到 0 触发 ZeroWindow 锯齿停顿。 */
+    th.initial_priority = 0x42;
     th.attr = 0;
     th.option = 0;
 
@@ -649,6 +768,7 @@ static int initIoWorker(void)
 
 static void ioBegin(int isSend, int sock, void *buf, int len)
 {
+    g_ioMode = PFSNET_IO_MODE_SINGLE;
     g_ioIsSend = isSend;
     g_ioSock = sock;
     g_ioBuf = buf;
@@ -677,7 +797,9 @@ static void tuneDataSocket(int sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
-    tv.tv_sec = 30;
+    /* 单次 recv/send 超时设为 1 秒（由 xferRecvAll/xferSendAll 最多重试 30 次实现 30 秒空闲总超时），
+     * 便于客户端取消传输或控制口收到 ABORT 时在 <=1 秒内响应退出。 */
+    tv.tv_sec = 1;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -773,12 +895,80 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         return 0;
     }
     g_xfer.dataSock = dataSock;
+    g_xferClientSock = client->socket;
+    g_putStop = 0;
 
-    /* 双缓冲（2x512KiB 乒乓）：收下一包 512KiB 的同时把上一包 512KiB 写入 HDD。
-     * 每轮严格限制在途网络接收不超过 1 个 512KiB 槽位，避免 ioWorker 以 100Mbps 线速无节制连续灌包
-     * 争抢 IOP DEV9 dma_lock_sem 与 SIF 总线导致写盘降速。 */
+    /* 多槽环形缓冲（16x512KiB = 8MiB）：ioWorker 连续排空 TCP 窗口，clientThread 连续写盘 */
     g_lastPutErr = 0;
-    {
+    if (g_ioAsync && g_putFreeSem >= 0 && g_putFillSem >= 0) {
+        int i;
+        int rdIdx = 0;
+        int failed = 0;
+
+        while (PollSema(g_putFreeSem) == g_putFreeSem) {
+        }
+        while (PollSema(g_putFillSem) == g_putFillSem) {
+        }
+        for (i = 0; i < g_ringBanks; i++) {
+            g_ringBankLen[i] = 0;
+            SignalSema(g_putFreeSem);
+        }
+
+        g_putTotalBytes = totalBytes;
+        g_ioSock = dataSock;
+        g_ioMode = PFSNET_IO_MODE_PUT_RING;
+        SignalSema(g_ioSemStart);
+
+        while (got < totalBytes && !failed) {
+            int bankLen;
+            uint8_t *src;
+            int written = 0;
+
+            WaitSema(g_putFillSem);
+            bankLen = g_ringBankLen[rdIdx];
+            if (bankLen <= 0 || g_putStop) {
+                if (g_lastPutErr == 0)
+                    g_lastPutErr = PFSNET_ERR_DATA_CONN;
+                failed = 1;
+                break;
+            }
+
+            src = g_ringBase + ((size_t)rdIdx * (size_t)PFSNET_XFER_BUF);
+
+            while (written < bankLen) {
+                int wr;
+                if (g_putStop) {
+                    if (g_lastPutErr == 0)
+                        g_lastPutErr = PFSNET_ERR_DATA_CONN;
+                    failed = 1;
+                    break;
+                }
+                wr = fileXioWrite(fd, src + written, bankLen - written);
+                if (wr <= 0) {
+                    g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
+                    failed = 1;
+                    g_putStop = 1;
+                    break;
+                }
+                written += wr;
+            }
+
+            SignalSema(g_putFreeSem);
+
+            if (!failed)
+                got += (uint64_t)bankLen;
+
+            rdIdx++;
+            if (rdIdx >= g_ringBanks)
+                rdIdx = 0;
+        }
+
+        if (failed) {
+            g_putStop = 1;
+            SignalSema(g_putFreeSem);
+        }
+        WaitSema(g_ioSemDone);
+    } else {
         int idx = 0;
         int havePending = 0;
         int pendingIdx = 0;
@@ -797,11 +987,16 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
             if (havePending) {
                 int written = 0;
                 while (written < pendingLen) {
-                    int wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
+                    int wr;
+                    if (g_putStop) {
+                        failed = 1;
+                        break;
+                    }
+                    wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
                     if (wr <= 0) {
                         g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                         failed = 1;
-                        shutdown(dataSock, SHUT_RDWR);
+                        g_putStop = 1;
                         break;
                     }
                     written += wr;
@@ -841,7 +1036,14 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         }
     }
 
+    g_xferClientSock = -1;
     g_xfer.dataSock = -1;
+    if (got != totalBytes) {
+        struct linger lg;
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+        setsockopt(dataSock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
     close(dataSock);
     fileXioClose(fd);
 
@@ -970,6 +1172,8 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         return 0;
     }
     g_xfer.dataSock = dataSock;
+    g_xferClientSock = client->socket;
+    g_putStop = 0;
 
     /* 双缓冲：与 Put 对称——先启动上一块 send，再读下一块（重叠）。
      * 旧顺序「先读满再等 send」在读快于 TCP 时会让磁盘空等。 */
@@ -994,11 +1198,15 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
                 int chunk = remain > (uint64_t)PFSNET_XFER_BUF ? PFSNET_XFER_BUF : (int)remain;
 
                 while (rd < chunk) {
-                    int n = fileXioRead(fd, g_xferBuf[idx] + rd, chunk - rd);
+                    int n;
+                    if (g_putStop) {
+                        failed = 1;
+                        break;
+                    }
+                    n = fileXioRead(fd, g_xferBuf[idx] + rd, chunk - rd);
                     if (n < 0) {
                         failed = 1;
-                        if (ioStarted)
-                            shutdown(dataSock, SHUT_RDWR);
+                        g_putStop = 1;
                         break;
                     }
                     if (n == 0)
@@ -1041,9 +1249,14 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         (void)failed;
     }
 
+    g_xferClientSock = -1;
     fileXioClose(fd);
 
     if (sent != toSend) {
+        struct linger lg;
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+        setsockopt(dataSock, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         g_xfer.dataSock = -1;
         close(dataSock);
         return 0;

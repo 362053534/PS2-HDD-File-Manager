@@ -352,7 +352,8 @@ internal sealed class PfsNetClient : IDisposable
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    await TryReconnectAndRemountUnlockedAsync(CancellationToken.None).ConfigureAwait(false);
+                    if (!IsConnected || _mountedPartition is null)
+                        await TryReconnectAndRemountUnlockedAsync(CancellationToken.None, maxAttempts: 1, timeoutSeconds: 3).ConfigureAwait(false);
                     throw;
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested && IsTransientTransferException(ex))
@@ -415,8 +416,13 @@ internal sealed class PfsNetClient : IDisposable
 
             using var dataClient = await acceptTask.ConfigureAwait(false);
             accepted = true;
-            // 取消时主动关闭数据口，避免 WriteAsync 在部分平台上迟迟不响应 CT。
-            using var cancelClose = ct.Register(() => { try { dataClient.Client.Close(); } catch { } });
+            // 取消时立刻设 LingerState(true, 0) 发送 RST 并关闭数据口，丢弃内核发缓冲中未发完的字节，
+            // 让 PS2 侧 ioWorker 立即从 recv() 退出并停止写盘。
+            using var cancelClose = ct.Register(() =>
+            {
+                try { dataClient.Client.LingerState = new LingerOption(true, 0); } catch { }
+                try { dataClient.Client.Close(); } catch { }
+            });
             ConfigureDataSocket(dataClient);
 
             await using var dataStream = dataClient.GetStream();
@@ -444,6 +450,7 @@ internal sealed class PfsNetClient : IDisposable
                 if (!ct.IsCancellationRequested)
                 {
                     writeTimedOut = true;
+                    try { dataClient.Client.LingerState = new LingerOption(true, 0); } catch { }
                     try { dataClient.Client.Close(); } catch { }
                 }
             });
@@ -494,11 +501,10 @@ internal sealed class PfsNetClient : IDisposable
         }
         catch (Exception ex)
         {
-            // PS2 在数据流未满时需要先完成 fileXioClose + fileXioRemove(tempPath)，大文件清理可能耗时数秒至十余秒；
-            // 给足 30 秒等待 ABORT 应答，避免 2 秒超时直接打断控制连接导致“尚未连接 PfsNet”。
             try
             {
-                using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var abortTimeoutSec = ct.IsCancellationRequested ? 8 : 15;
+                using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(abortTimeoutSec));
                 await SendSimpleAsync(PfsNetProtocol.CmdPutAbort, ReadOnlyMemory<byte>.Empty, abortCts.Token).ConfigureAwait(false);
             }
             catch
@@ -524,14 +530,14 @@ internal sealed class PfsNetClient : IDisposable
     private static bool IsTransientTransferException(Exception ex) =>
         ex is IOException or SocketException or TimeoutException;
 
-    private async Task TryReconnectAndRemountUnlockedAsync(CancellationToken ct)
+    private async Task TryReconnectAndRemountUnlockedAsync(CancellationToken ct, int maxAttempts = 5, int timeoutSeconds = 10)
     {
         if (IsConnected && _mountedPartition is not null)
         {
             try
             {
                 using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                pingCts.CancelAfter(TimeSpan.FromSeconds(5));
+                pingCts.CancelAfter(TimeSpan.FromSeconds(Math.Min(5, timeoutSeconds)));
                 await SendSimpleAsync(PfsNetProtocol.CmdPing, ReadOnlyMemory<byte>.Empty, pingCts.Token).ConfigureAwait(false);
                 return;
             }
@@ -546,12 +552,12 @@ internal sealed class PfsNetClient : IDisposable
 
         var host = _lastHost;
         var part = _lastMountedPartition;
-        for (var attempt = 1; attempt <= 5; attempt++)
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
                 using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                connectCts.CancelAfter(TimeSpan.FromSeconds(10));
+                connectCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
                 await ConnectSocketUnlockedAsync(host, connectCts.Token).ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(part))
                     await MountUnlockedAsync(part, connectCts.Token).ConfigureAwait(false);
@@ -560,7 +566,7 @@ internal sealed class PfsNetClient : IDisposable
             catch
             {
                 try { DisconnectUnlocked(); } catch { }
-                if (attempt < 5)
+                if (attempt < maxAttempts)
                 {
                     try { await Task.Delay(TimeSpan.FromMilliseconds(1500 * attempt), ct).ConfigureAwait(false); }
                     catch { return; }
@@ -675,8 +681,12 @@ internal sealed class PfsNetClient : IDisposable
 
             using var dataClient = await acceptTask;
             accepted = true;
-            // 取消时主动关闭数据口，避免 ReadAsync 在部分平台上迟迟不响应 CT。
-            using var cancelClose = ct.Register(() => { try { dataClient.Client.Close(); } catch { } });
+            // 取消时立刻设 LingerState(true, 0) 发送 RST 并关闭数据口，让 PS2 侧 ioWorker 立即从 send() 退出。
+            using var cancelClose = ct.Register(() =>
+            {
+                try { dataClient.Client.LingerState = new LingerOption(true, 0); } catch { }
+                try { dataClient.Client.Close(); } catch { }
+            });
             try
             {
                 dataClient.ReceiveBufferSize = 512 * 1024;
@@ -715,13 +725,17 @@ internal sealed class PfsNetClient : IDisposable
         {
             try
             {
-                using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                var abortTimeoutSec = ct.IsCancellationRequested ? 8 : 15;
+                using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(abortTimeoutSec));
                 await SendSimpleAsync(PfsNetProtocol.CmdGetAbort, ReadOnlyMemory<byte>.Empty, abortCts.Token).ConfigureAwait(false);
             }
             catch
             {
                 try { DisconnectUnlocked(); } catch { /* 尽力恢复 */ }
-                await TryReconnectAndRemountUnlockedAsync(CancellationToken.None).ConfigureAwait(false);
+                await TryReconnectAndRemountUnlockedAsync(
+                    CancellationToken.None,
+                    maxAttempts: ct.IsCancellationRequested ? 1 : 5,
+                    timeoutSeconds: ct.IsCancellationRequested ? 3 : 10).ConfigureAwait(false);
             }
             if (ct.IsCancellationRequested)
                 throw new OperationCanceledException("传输已取消。", ex, ct);

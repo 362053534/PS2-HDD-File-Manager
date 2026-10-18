@@ -1987,11 +1987,15 @@ internal sealed class MainWindow : Window
         if (PfsNetProtocol.IsNetworkDevice(device))
         {
             await _pfsNet.MountAsync(partition, CancellationToken.None);
-            foreach (var item in pendingImports)
+            var batchSw = System.Diagnostics.Stopwatch.StartNew();
+            long batchTotalBytes = 0;
+            for (var idx = 0; idx < pendingImports.Count; idx++)
             {
+                var item = pendingImports[idx];
                 cancellationToken.ThrowIfCancellationRequested();
                 var fileLength = new FileInfo(item.LocalFilePath).Length;
                 var remoteName = PfsNameEncoding.ToPfsFileName(Path.GetFileName(item.LocalFilePath));
+                var fileSw = System.Diagnostics.Stopwatch.StartNew();
                 await _pfsNet.PutFileAsync(
                     item.RemoteDirectory,
                     remoteName,
@@ -2003,10 +2007,21 @@ internal sealed class MainWindow : Window
                         SetImportProgress(progress, item.LocalFilePath, Math.Clamp(bytes, 0, fileLength), isCompleted: false);
                         return Task.CompletedTask;
                     });
+                fileSw.Stop();
                 SetImportProgress(progress, item.LocalFilePath, fileLength, isCompleted: true);
+                batchTotalBytes += fileLength;
+                if (fileLength >= 1024 * 1024 || pendingImports.Count <= 32)
+                {
+                    var sec = Math.Max(0.001, fileSw.Elapsed.TotalSeconds);
+                    var mbps = (fileLength / (1024.0 * 1024.0)) / sec;
+                    AppendLog($"[{idx + 1}/{pendingImports.Count}] 已导入 {remoteName}（{FormatByteSize((ulong)Math.Max(0, fileLength))}，用时 {fileSw.Elapsed:mm\\:ss}，{mbps:F2} MB/s）");
+                }
             }
 
-            AppendLog($"已通过 PfsNet 导入 {pendingImports.Count} 个文件。");
+            batchSw.Stop();
+            var batchSec = Math.Max(0.001, batchSw.Elapsed.TotalSeconds);
+            var batchMbps = (batchTotalBytes / (1024.0 * 1024.0)) / batchSec;
+            AppendLog($"已通过 PfsNet 导入 {pendingImports.Count} 个文件（共 {FormatByteSize((ulong)Math.Max(0, batchTotalBytes))}，总用时 {batchSw.Elapsed:hh\\:mm\\:ss}，平均 {batchMbps:F2} MB/s）。");
             return;
         }
 
