@@ -1324,7 +1324,6 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
     int r;
 
     StartTimerSystemTime();
-    pfsnetEnsureMasterTimer();
 
     /* 与 HDL/OPL 一致：链路模式失败不在此中止（否则永远到不了 ps2ipInit） */
     ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO);
