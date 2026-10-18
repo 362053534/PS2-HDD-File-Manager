@@ -696,9 +696,12 @@ static int initIoWorker(void)
     th.stack = g_ioStack;
     th.stack_size = sizeof(g_ioStack);
     th.gp_reg = &_gp;
-    /* 置于 NETMAN(0x56..0x59)/tcpip(0x58) 之下、clientThread(0x5D) 之上（对齐 HDLGameInstaller）：
-     * 既不抢占底层网卡收包与 ACK 发送，又保证写盘期间网络线程优先把 TCP 窗口排空到 8MiB 环形缓冲。 */
-    th.initial_priority = 0x5C;
+    /* 必须高于 NETMAN_RxThread(0x59) 且略低于 clientThread(0x40)：
+     * lwIP 的 pcb->rcv_wnd 在 tcp_input(NETMAN_RxThread) 中扣减，仅在应用线程调用
+     * netconn_recv_tcp_pbuf -> tcp_recved 时恢复。ioWorker(0x42) 高于 NETMAN_RxThread(0x59)
+     * 可在每收到一个分片释放 lock_tcpip_core 后立即调用 tcp_recved 推进窗口右沿并拷入 8MiB 环形缓冲，
+     * 避免 NETMAN_RxThread 连续收包把 rcv_wnd 扣到 0 触发 ZeroWindow 锯齿停顿。 */
+    th.initial_priority = 0x42;
     th.attr = 0;
     th.option = 0;
 

@@ -197,8 +197,10 @@ static int startClientThread(struct PfsNetClient *client)
     thread.stack = client->stack;
     thread.stack_size = sizeof(client->stack);
     thread.gp_reg = &_gp;
-    /* 置于 NETMAN(0x56..0x59)/tcpip(0x58) 与 ioWorker(0x5C) 之下，避免写盘阻塞网络收包与 ACK 发送 */
-    thread.initial_priority = 0x5D;
+    /* 高于 ioWorker(0x42) 与 NETMAN_RxThread(0x59)：
+     * clientThread 在写盘期间 99.5% 时间睡眠在 SifCallRpc(WaitSema) 上，
+     * 略高于 ioWorker 可保证每写完一槽 512KiB 立即在 <0.3ms 内向 IOP 下发下一槽 RPC，消除硬盘空转间隙。 */
+    thread.initial_priority = 0x40;
     thread.attr = 0;
     thread.option = 0;
 
@@ -300,8 +302,8 @@ int pfsnetStartServer(void)
     thread.stack = g_serverStack;
     thread.stack_size = sizeof(g_serverStack);
     thread.gp_reg = &_gp;
-    /* 低于 NETMAN(0x56..0x59) 与 tcpip(0x58)，高于 ioWorker(0x5C) 与 clientThread(0x5D) */
-    thread.initial_priority = 0x5B;
+    /* 高于 clientThread(0x40) 与 ioWorker(0x42)，保证控制连接接入与重连抢占响应 */
+    thread.initial_priority = 0x3f;
     thread.attr = 0;
     thread.option = 0;
 

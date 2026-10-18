@@ -15,7 +15,6 @@ EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=memp_init \
 	-Wl,--wrap=pbuf_alloc \
 	-Wl,--wrap=netconn_recv_tcp_pbuf \
-	-Wl,--wrap=SifSetDma \
 	-Wl,--wrap=SifSendCmd \
 	-Wl,--wrap=iSifSendCmd \
 	-Wl,--wrap=sys_init \

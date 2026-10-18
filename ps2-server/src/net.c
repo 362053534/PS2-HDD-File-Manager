@@ -142,47 +142,19 @@ err_t __wrap_netconn_recv_tcp_pbuf(void *conn, struct pbuf **new_buf)
 }
 
 /*
- * 解决 EE BIOS 32 槽 SIF1 DMA 队列被 NETMAN_RxThread (ClearBufferLen) 塞满导致
+ * 解决 EE BIOS 32 槽 SIF1 DMA 队列在突发流量下瞬时满载导致
  * fileXioWrite 的 _request_rdata (iSifSendCmd) 丢包永久死锁：
  *
- * 1) EE 侧 NETMAN_RxThread 在 ClearBufferLen 中每处理一帧以太网包就调用一次
- *    while (SifSetDma(&dmat, 1) == 0) {} (16 字节 NetManBD) 且从不等待 SifDmaStat，
- *    突发收包或启动分配 64 个 RX 缓冲时瞬间塞满 EE BIOS 仅有的 32 个 SIF1 DMA 队列槽。
- * 2) 与此同时，IOP 侧 fileXio_Write_RPC 通过 SifRpcGetOtherData 拉取每片 128KiB 写盘数据时，
- *    向 EE 发送 SIF_CMD_RPC_RDATA 并睡眠在 WaitEventFlag 上等待 EE 回复 SIF_CMD_RPC_END。
- *    但 PS2SDK ee/kernel/src/sifrpc.c 的 _request_rdata 在中断里调用 iSifSendCmd(SIF_CMD_RPC_END)
- *    (内部需占用 2 个 SIF1 DMA 槽) 时完全未检查返回值 0！一旦 SIF1 队列当时剩余不足 2 槽，
- *    SIF_CMD_RPC_END 被静默丢弃，IOP 侧 fileXio_Thread 与 EE 侧写盘线程永久死锁。
- * 3) 通过 wrap SifSetDma 对 16 字节单描述符状态回写做 4 深度流水线限流（始终留出 28 个 SIF1 槽），
- *    并 wrap SifSendCmd / iSifSendCmd 在队列满时自动自旋或通过 iSetTimerAlarm 硬件定时器重试，
- *    确保 SIF RPC 命令与 _request_rdata 永不丢失。
+ * IOP 侧 fileXio_Write_RPC 通过 SifRpcGetOtherData 拉取写盘数据时，向 EE 发送 SIF_CMD_RPC_RDATA
+ * 并睡眠在 WaitEventFlag 上等待 EE 回复 SIF_CMD_RPC_END。但 PS2SDK ee/kernel/src/sifrpc.c 的
+ * _request_rdata 在中断里调用 iSifSendCmd(SIF_CMD_RPC_END) 时未检查返回值 0。一旦 SIF1 队列满载，
+ * SIF_CMD_RPC_END 被静默丢弃会导致永久死锁。通过 wrap SifSendCmd / iSifSendCmd 在返回 0 时自动
+ * 自旋或通过 iSetTimerAlarm 硬件定时器重试，确保零额外阻塞开销且 SIF 命令永不丢失。
  */
-extern u32 __real_SifSetDma(SifDmaTransfer_t *sdd, s32 len);
 extern unsigned int __real_SifSendCmd(int cmd, void *packet, int packet_size,
                                       void *src_extra, void *dest_extra, int size_extra);
 extern unsigned int __real_iSifSendCmd(int cmd, void *packet, int packet_size,
                                        void *src_extra, void *dest_extra, int size_extra);
-
-u32 __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
-{
-    static u32 s_bdDmaRing[4];
-    static unsigned int s_bdDmaIdx;
-    u32 id;
-
-    if (len == 1 && sdd != NULL && sdd->size <= 32 && sdd->attr == 0) {
-        u32 prev = s_bdDmaRing[s_bdDmaIdx];
-        if (prev != 0) {
-            while (SifDmaStat(prev) >= 0) {
-            }
-        }
-        while ((id = __real_SifSetDma(sdd, len)) == 0) {
-        }
-        s_bdDmaRing[s_bdDmaIdx] = id;
-        s_bdDmaIdx = (s_bdDmaIdx + 1u) & 3u;
-        return id;
-    }
-    return __real_SifSetDma(sdd, len);
-}
 
 unsigned int __wrap_SifSendCmd(int cmd, void *packet, int packet_size,
                                void *src_extra, void *dest_extra, int size_extra)

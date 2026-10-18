@@ -588,18 +588,6 @@ internal sealed class PfsNetClient : IDisposable
         }
         catch { /* 平台可能不支持，忽略 */ }
 
-        if (OperatingSystem.IsMacOS())
-        {
-            try
-            {
-                // macOS XNU 默认 SO_SNDLOWAT 仅 2048B，当 512KiB 发送缓冲填满后，
-                // PS2 每确认 2 个 MSS（2920B）就会触发 kqueue EVFILT_WRITE 唤醒与线程池派发（每 512KiB 约 180 次唤醒 + 360 次 send）。
-                // 将 SO_SNDLOWAT 设为 64KiB（对齐 XNU sosendmaxchain），使每次唤醒至少拷入一整块 64KiB 巨型簇。
-                dataClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendLowWater, 64 * 1024);
-            }
-            catch { /* 忽略 */ }
-        }
-
         try
         {
             var socket = dataClient.Client;
