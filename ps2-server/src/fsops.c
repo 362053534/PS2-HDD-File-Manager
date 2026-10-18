@@ -656,11 +656,11 @@ static int ioEnd(void)
     return g_ioResult;
 }
 
-/* 数据通道：关 Nagle；缓冲对齐 lwIP TCP_WND(64KiB)/64-pbuf 池上限，避免 512KiB 积压耗尽 PBUF_POOL */
+/* 数据通道：关 Nagle；缓冲对齐 XFER 块，避免 512KiB 收发被 256KiB 窗反复截断 */
 static void tuneDataSocket(int sock)
 {
     int yes = 1;
-    int buf = 128 * 1024;
+    int buf = PFSNET_XFER_BUF;
 
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));

@@ -9,9 +9,7 @@ using System.Text;
 internal sealed class PfsNetClient : IDisposable
 {
     private const int FileBufferSize = 512 * 1024;
-    // 对齐 PS2 lwIP TCP_WND (65535)，避免千兆网卡单次 512KiB 突发冲垮 PS2 SMAP RX FIFO 与 64-pbuf 池。
-    private const int DataWriteChunkSize = 64 * 1024;
-    private const int DataSocketSendBufferSize = 128 * 1024;
+    private const int DataSocketBufferSize = 512 * 1024;
     private const int MaxPutAttempts = 3;
 
     private TcpClient? _client;
@@ -425,17 +423,10 @@ internal sealed class PfsNetClient : IDisposable
                 if (n <= 0)
                     throw new IOException("本地文件读取提前结束。");
 
-                var offset = 0;
-                while (offset < n)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    var chunk = Math.Min(DataWriteChunkSize, n - offset);
-                    await WriteDataChunkAsync(dataStream, buffer.AsMemory(offset, chunk), ct).ConfigureAwait(false);
-                    offset += chunk;
-                    sent += chunk;
-                    if (progress is not null)
-                        await progress(sent).ConfigureAwait(false);
-                }
+                await dataStream.WriteAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false);
+                sent += n;
+                if (progress is not null)
+                    await progress(sent).ConfigureAwait(false);
             }
 
             await dataStream.FlushAsync(ct).ConfigureAwait(false);
@@ -469,20 +460,6 @@ internal sealed class PfsNetClient : IDisposable
                 try { (await acceptTask).Dispose(); }
                 catch { /* BEGIN 失败或 listener 已停 */ }
             }
-        }
-    }
-
-    private static async Task WriteDataChunkAsync(Stream dataStream, ReadOnlyMemory<byte> chunk, CancellationToken cancellationToken)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(30));
-        try
-        {
-            await dataStream.WriteAsync(chunk, timeout.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            throw new TimeoutException("向 PS2 数据通道写入超时（30s）。");
         }
     }
 
@@ -554,8 +531,8 @@ internal sealed class PfsNetClient : IDisposable
     {
         try
         {
-            dataClient.SendBufferSize = DataSocketSendBufferSize;
-            dataClient.ReceiveBufferSize = FileBufferSize;
+            dataClient.SendBufferSize = DataSocketBufferSize;
+            dataClient.ReceiveBufferSize = DataSocketBufferSize;
             dataClient.NoDelay = true;
         }
         catch { /* 平台可能不支持，忽略 */ }
