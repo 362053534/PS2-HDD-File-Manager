@@ -134,6 +134,8 @@ internal sealed class MainWindow : Window
     private bool _suppressShowSystemPartitionsEvent;
     private bool _suppressDeviceComboEvent;
     private CancellationTokenSource? _transferCts;
+    private readonly object _sleepGuardLock = new();
+    private Process? _caffeinateProcess;
 
     public MainWindow()
     {
@@ -159,6 +161,7 @@ internal sealed class MainWindow : Window
         Opened += async (_, _) => await RefreshDisksAsync();
         Closed += (_, _) =>
         {
+            StopMacSleepGuard();
             try { _pfsNet.Disconnect(); } catch { }
             _pfsNet.Dispose();
             _nbd.Dispose();
@@ -2775,14 +2778,63 @@ internal sealed class MainWindow : Window
 
     private void BeginFileTransfer()
     {
-        Interlocked.Increment(ref _fileTransferDepth);
+        if (Interlocked.Increment(ref _fileTransferDepth) == 1)
+            StartMacSleepGuard();
         UpdateSourceRefreshEnabled();
     }
 
     private void EndFileTransfer()
     {
-        Interlocked.Decrement(ref _fileTransferDepth);
+        if (Interlocked.Decrement(ref _fileTransferDepth) <= 0)
+            StopMacSleepGuard();
         UpdateSourceRefreshEnabled();
+    }
+
+    private void StartMacSleepGuard()
+    {
+        if (!OperatingSystem.IsMacOS() || !File.Exists("/usr/bin/caffeinate"))
+            return;
+
+        lock (_sleepGuardLock)
+        {
+            if (_caffeinateProcess is { HasExited: false })
+                return;
+            try
+            {
+                _caffeinateProcess = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "/usr/bin/caffeinate",
+                    Arguments = $"-di -w {Environment.ProcessId}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+            }
+            catch
+            {
+                _caffeinateProcess = null;
+            }
+        }
+    }
+
+    private void StopMacSleepGuard()
+    {
+        lock (_sleepGuardLock)
+        {
+            var proc = _caffeinateProcess;
+            _caffeinateProcess = null;
+            if (proc is null)
+                return;
+            try
+            {
+                if (!proc.HasExited)
+                    proc.Kill();
+            }
+            catch { }
+            finally
+            {
+                try { proc.Dispose(); } catch { }
+            }
+        }
     }
 
     private void UpdateSourceRefreshEnabled() =>

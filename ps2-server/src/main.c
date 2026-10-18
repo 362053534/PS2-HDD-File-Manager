@@ -92,7 +92,7 @@ static int loadModuleBuffer(void *buffer, unsigned int size, int argc, char *arg
 static void loadHddStack(void)
 {
     static char hddArg[] = "-o" "\0" "4" "\0" "-n" "\0" "128";
-    static char pfsArg[] = "-m" "\0" "2" "\0" "-o" "\0" "4" "\0" "-n" "\0" "12";
+    static char pfsArg[] = "-m" "\0" "2" "\0" "-o" "\0" "4" "\0" "-n" "\0" "32";
 
     loadModuleBuffer(ATAD_irx, size_ATAD_irx, 0, NULL);
     loadModuleBuffer(HDD_irx, size_HDD_irx, sizeof(hddArg), hddArg);

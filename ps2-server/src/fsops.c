@@ -59,6 +59,7 @@ static void *g_ioBuf;
 static int g_ioLen;
 static int g_ioResult;
 static int g_ioIsSend;
+static int32_t g_lastPutErr;
 
 static void clearXferState(void)
 {
@@ -655,11 +656,11 @@ static int ioEnd(void)
     return g_ioResult;
 }
 
-/* 数据通道：关 Nagle；缓冲对齐 XFER 块，避免 512KiB 收发被 256KiB 窗反复截断 */
+/* 数据通道：关 Nagle；缓冲对齐 lwIP TCP_WND(64KiB)/64-pbuf 池上限，避免 512KiB 积压耗尽 PBUF_POOL */
 static void tuneDataSocket(int sock)
 {
     int yes = 1;
-    int buf = PFSNET_XFER_BUF;
+    int buf = 128 * 1024;
 
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
@@ -757,6 +758,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     }
 
     /* 双缓冲：收下一包同时把上一包写入 HDD */
+    g_lastPutErr = 0;
     {
         int idx = 0;
         int havePending = 0;
@@ -778,6 +780,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
                 while (written < pendingLen) {
                     int wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
                     if (wr <= 0) {
+                        g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                         failed = 1;
                         break;
                     }
@@ -788,8 +791,11 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
                 havePending = 0;
             }
 
-            if (ioEnd() < 0)
+            if (ioEnd() < 0) {
+                if (g_lastPutErr == 0)
+                    g_lastPutErr = PFSNET_ERR_DATA_CONN;
                 failed = 1;
+            }
             if (failed)
                 break;
 
@@ -804,6 +810,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
             while (written < pendingLen) {
                 int wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
                 if (wr <= 0) {
+                    g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                     failed = 1;
                     break;
                 }
@@ -818,6 +825,8 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     fileXioClose(fd);
 
     if (got != totalBytes) {
+        if (g_lastPutErr == 0)
+            g_lastPutErr = PFSNET_ERR_DATA_CONN;
         fileXioRemove(g_xfer.tempPath);
         clearXferState();
         return 0;
@@ -835,8 +844,12 @@ static int handlePutEnd(struct PfsNetClient *client)
 {
     int result;
 
-    if (g_xfer.kind != PFSNET_XFER_PUT)
-        return pfsnetSendResponse(client, PFSNET_ERR_INVAL, NULL, 0);
+    if (g_xfer.kind != PFSNET_XFER_PUT) {
+        int32_t err = g_lastPutErr != 0 ? g_lastPutErr : PFSNET_ERR_INVAL;
+        g_lastPutErr = 0;
+        return pfsnetSendResponse(client, err, NULL, 0);
+    }
+    g_lastPutErr = 0;
 
     if ((g_xfer.flags & PFSNET_PUT_OVERWRITE) && pathExists(g_xfer.finalPath)) {
         result = fileXioRemove(g_xfer.finalPath);
