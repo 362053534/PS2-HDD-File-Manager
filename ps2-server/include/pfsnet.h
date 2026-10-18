@@ -49,6 +49,7 @@ int ethReadCurrentConfig(struct ip4_addr *ip, struct ip4_addr *nm, struct ip4_ad
 int pfsnetFsInit(void);
 void pfsnetFsForceUmount(void);
 void pfsnetFsAbortActiveSocket(void);
+void pfsnetWakeMboxWaiter(int tid);
 int pfsnetIsMounted(void);
 const char *pfsnetMountedPartition(void);
 

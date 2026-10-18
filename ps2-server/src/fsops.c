@@ -139,10 +139,21 @@ int pfsnetFsInit(void)
 
 void pfsnetFsAbortActiveSocket(void)
 {
-    /* 仅置位 g_putStop：lwIP 在 LWIP_NETCONN_FULLDUPLEX=0 下禁止跨线程对正阻塞在 recv/send 的
-     * netconn 调用 shutdown/close（netconn_drain 会直接销毁 recvmbox 导致并发崩溃或死锁）。
-     * dataSock 配有 1 秒 SO_RCVTIMEO/SO_SNDTIMEO，ioWorker 会在 <=1 秒内自行唤醒检测 g_putStop 退出。 */
+    int wasStopped;
+    int old = DIntr();
+    wasStopped = g_putStop;
     g_putStop = 1;
+    if (old)
+        EIntr();
+
+    if (!wasStopped) {
+        if (g_putFreeSem >= 0)
+            SignalSema(g_putFreeSem);
+        if (g_putFillSem >= 0)
+            SignalSema(g_putFillSem);
+        if (g_ioTid >= 0)
+            pfsnetWakeMboxWaiter(g_ioTid);
+    }
 }
 
 void pfsnetFsForceUmount(void)
@@ -585,7 +596,6 @@ static int xferSendAll(int sock, const void *buf, int len)
     const char *ptr = (const char *)buf;
     int sent = 0;
     int ok = 1;
-    int idleLoops = 0;
 
     pfsnetTrafficBegin();
     while (sent < len) {
@@ -595,15 +605,11 @@ static int xferSendAll(int sock, const void *buf, int len)
             break;
         }
         n = send(sock, ptr + sent, len - sent, 0);
-        if (n > 0) {
-            sent += n;
-            idleLoops = 0;
-            continue;
+        if (n <= 0) {
+            ok = 0;
+            break;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 6)
-            continue;
-        ok = 0;
-        break;
+        sent += n;
     }
     pfsnetTrafficEnd();
     return ok ? sent : -1;
@@ -614,7 +620,6 @@ static int xferRecvAll(int sock, void *buf, int len)
     char *ptr = (char *)buf;
     int got = 0;
     int ok = 1;
-    int idleLoops = 0;
 
     pfsnetTrafficBegin();
     while (got < len) {
@@ -624,15 +629,11 @@ static int xferRecvAll(int sock, void *buf, int len)
             break;
         }
         n = recv(sock, ptr + got, len - got, 0);
-        if (n > 0) {
-            got += n;
-            idleLoops = 0;
-            continue;
+        if (n <= 0) {
+            ok = 0;
+            break;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_putStop && ++idleLoops < 6)
-            continue;
-        ok = 0;
-        break;
+        got += n;
     }
     pfsnetTrafficEnd();
     return ok ? got : -1;
@@ -768,9 +769,9 @@ static void tuneDataSocket(int sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
-    /* 单次 recv/send 超时设为 5 秒（由 xferRecvAll/xferSendAll 最多重试 6 次实现 30 秒空闲总超时）；
-     * 客户端取消传输时会主动关闭数据口触发 RST/FIN 立即唤醒 recv，无需短超时轮询。 */
-    tv.tv_sec = 5;
+    /* 数据口空闲超时设为 30 秒，避免 PFS 元数据刷盘或寻道停顿时误超时；
+     * 取消传输或控制口断开时由 pfsnetCheckRxAbortFrame / pfsnetFsAbortActiveSocket 毫秒级唤醒。 */
+    tv.tv_sec = 30;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -936,6 +937,8 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         if (failed) {
             g_putStop = 1;
             SignalSema(g_putFreeSem);
+            if (g_ioTid >= 0)
+                pfsnetWakeMboxWaiter(g_ioTid);
         }
         WaitSema(g_ioSemDone);
     } else {

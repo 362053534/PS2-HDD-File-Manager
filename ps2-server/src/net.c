@@ -44,26 +44,69 @@ uint32_t __wrap_sys_now(void)
 
 /*
  * 修复 PS2SDK ee/libcglue/src/lock.c 中 __retarget_lock_acquire_recursive /
- * __retarget_lock_release_recursive 在无 DI()/EI() 保护下读写 lock->count 与 lock->thread_id
- * 的竞态，防止多线程并发 malloc / memalign / free 时损坏堆锁。
+ * __retarget_lock_release_recursive 的中断态竞态：
+ *
+ * 切记：PS2 EE (R5900) 的 COP0 Status.EIE (bit 16) 是全局 CPU 寄存器位，跨 WaitSema / SignalSema
+ * 线程上下文切换时 BIOS 不会按线程保存/恢复 Status.EIE！若在 DIntr() (EIE=0) 期间调用 WaitSema 或
+ * SignalSema 触发线程切换，被切入的线程（如 ioWorker 0x42 / NETMAN_TxThread 0x56）会在 EIE=0 状态
+ * 下运行，且其后续 DIntr() 返回 0 不再调用 EIntr()，导致全机硬件中断（DMAC_SIF0 / INTC_TIM2）永久关闭！
+ * 因此 DIntr()/EIntr() 只能包裹非阻塞的字段读写，WaitSema 与 SignalSema 必须在开中断下调用。
  */
-extern void __real___retarget_lock_acquire_recursive(void *lock);
-extern void __real___retarget_lock_release_recursive(void *lock);
+struct pfsnet_retarget_lock {
+    int32_t sem_id;
+    int32_t thread_id;
+    int32_t count;
+};
 
-void __wrap___retarget_lock_acquire_recursive(void *lock)
+void __wrap___retarget_lock_acquire_recursive(void *lockPtr)
 {
-    int old = DIntr();
-    __real___retarget_lock_acquire_recursive(lock);
+    struct pfsnet_retarget_lock *lock = (struct pfsnet_retarget_lock *)lockPtr;
+    int32_t tid;
+    int old;
+
+    if (lock == NULL)
+        return;
+    tid = GetThreadId();
+    old = DIntr();
+    if (lock->count > 0 && lock->thread_id == tid) {
+        lock->count++;
+        if (old)
+            EIntr();
+        return;
+    }
+    if (old)
+        EIntr();
+
+    WaitSema(lock->sem_id);
+
+    old = DIntr();
+    lock->thread_id = tid;
+    lock->count = 1;
     if (old)
         EIntr();
 }
 
-void __wrap___retarget_lock_release_recursive(void *lock)
+void __wrap___retarget_lock_release_recursive(void *lockPtr)
 {
-    int old = DIntr();
-    __real___retarget_lock_release_recursive(lock);
+    struct pfsnet_retarget_lock *lock = (struct pfsnet_retarget_lock *)lockPtr;
+    int release = 0;
+    int old;
+
+    if (lock == NULL)
+        return;
+    old = DIntr();
+    if (lock->count > 1) {
+        lock->count--;
+    } else {
+        lock->count = 0;
+        lock->thread_id = -1;
+        release = 1;
+    }
     if (old)
         EIntr();
+
+    if (release)
+        SignalSema(lock->sem_id);
 }
 
 /*
@@ -271,14 +314,19 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
 {
     unsigned int id;
     int spin;
+    int old;
 
     for (spin = 0; spin < 256; spin++) {
+        old = DIntr();
         id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra);
+        if (old)
+            EIntr();
         if (id != 0)
             return id;
     }
     if (packet != NULL && packet_size > 0 && packet_size <= 64) {
         int i;
+        old = DIntr();
         for (i = 0; i < 8; i++) {
             if (!g_isifRetryPool[i].active) {
                 g_isifRetryPool[i].active = 1;
@@ -288,16 +336,26 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
                 g_isifRetryPool[i].src_extra = src_extra;
                 g_isifRetryPool[i].dest_extra = dest_extra;
                 g_isifRetryPool[i].size_extra = size_extra;
-                if (iSetTimerAlarm(0x4000, &pfsnetISifRetryAlarmCb, &g_isifRetryPool[i]) >= 0)
+                if (iSetTimerAlarm(0x4000, &pfsnetISifRetryAlarmCb, &g_isifRetryPool[i]) >= 0) {
+                    if (old)
+                        EIntr();
                     return 1;
+                }
                 g_isifRetryPool[i].active = 0;
                 break;
             }
         }
+        if (old)
+            EIntr();
     }
-    while ((id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra)) == 0) {
+    for (;;) {
+        old = DIntr();
+        id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra);
+        if (old)
+            EIntr();
+        if (id != 0)
+            return id;
     }
-    return id;
 }
 
 static int g_nmRpcSvrThreadID = -1;
@@ -376,6 +434,64 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
     return 0;
 }
 
+static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
+{
+    u32 ihl, totLen, tcpOff, doff, dataOff, dataLen;
+    u16 dstPort;
+    u8 flags;
+
+    if (frame == NULL || len < 54u)
+        return;
+    if (frame[12] != 0x08u || frame[13] != 0x00u)
+        return;
+    if ((frame[14] >> 4) != 4u)
+        return;
+    ihl = (u32)(frame[14] & 0x0Fu) * 4u;
+    if (ihl < 20u || len < 14u + ihl + 20u)
+        return;
+    if (frame[23] != 6u)
+        return;
+    totLen = ((u32)frame[16] << 8) | (u32)frame[17];
+    if (totLen < ihl + 20u)
+        return;
+    if (14u + totLen < len)
+        len = 14u + totLen;
+
+    tcpOff = 14u + ihl;
+    dstPort = (u16)(((u16)frame[tcpOff + 2u] << 8) | (u16)frame[tcpOff + 3u]);
+    flags = frame[tcpOff + 13u];
+
+    if (dstPort == PFSNET_DATA_PORT) {
+        if ((flags & 0x04u) != 0)
+            pfsnetFsAbortActiveSocket();
+        return;
+    }
+
+    if (dstPort == PFSNET_COMMAND_PORT) {
+        if ((flags & 0x05u) != 0) {
+            pfsnetFsAbortActiveSocket();
+            return;
+        }
+        doff = (u32)(frame[tcpOff + 12u] >> 4) * 4u;
+        if (doff < 20u || len < tcpOff + doff + PFSNET_HEADER_SIZE)
+            return;
+        dataOff = tcpOff + doff;
+        dataLen = len - dataOff;
+        if (dataLen >= PFSNET_HEADER_SIZE) {
+            u32 cmd = (u32)frame[dataOff]
+                | ((u32)frame[dataOff + 1u] << 8)
+                | ((u32)frame[dataOff + 2u] << 16)
+                | ((u32)frame[dataOff + 3u] << 24);
+            u32 payLen = (u32)frame[dataOff + 4u]
+                | ((u32)frame[dataOff + 5u] << 8)
+                | ((u32)frame[dataOff + 6u] << 16)
+                | ((u32)frame[dataOff + 7u] << 24);
+            if ((cmd == PFSNET_CMD_PUT_ABORT || cmd == PFSNET_CMD_GET_ABORT) && payLen == 0u)
+                pfsnetFsAbortActiveSocket();
+        }
+    }
+}
+
 int __wrap_NetManRPCAllocRxBuffers(void)
 {
     int i;
@@ -384,6 +500,7 @@ int __wrap_NetManRPCAllocRxBuffers(void)
         void *packet, *payload;
 
         if ((packet = NetManNetProtStackAllocRxPacket(NETMAN_NETIF_FRAME_SIZE, &payload)) != NULL) {
+            SifWriteBackDCache(payload, (NETMAN_NETIF_FRAME_SIZE + 63) & ~63);
             pfsnetNetManClearBufferLen(i, packet, payload);
         } else {
             return -ENOMEM;
@@ -429,12 +546,14 @@ static void pfsnetNetManRxThread(void *arg)
         while ((packetNext = NetManNetProtStackAllocRxPacket(NETMAN_NETIF_FRAME_SIZE, &payloadNext)) == NULL) {
             DelayThread(200);
         }
+        SifWriteBackDCache(payloadNext, (NETMAN_NETIF_FRAME_SIZE + 63) & ~63);
         g_nmRxBufferNextRdPtr = (g_nmRxBufferNextRdPtr + 1) % NETMAN_RPC_BLOCK_SIZE;
         pfsnetNetManClearBufferLen(g_nmRxBufferRdPtr, packetNext, payloadNext);
         g_nmRxBufferRdPtr = g_nmRxBufferNextRdPtr;
 
         PacketLengthAligned = (PacketLength + 63) & ~63;
         SifWriteBackDCache(payload, PacketLengthAligned);
+        pfsnetCheckRxAbortFrame((const u8 *)payload, PacketLength);
         NetManNetProtStackReallocRxPacket(packet, PacketLength);
         NetManNetProtStackEnQRxPacket(packet);
     }
@@ -582,11 +701,12 @@ static pfsnet_arch_message_t *tryAllocMsg(void)
     pfsnet_arch_message_t *message;
 
     if (PollSema(g_msgCountSema) == g_msgCountSema) {
-        DI();
+        int old = DIntr();
         message = g_freeHead;
         if (message != NULL)
             g_freeHead = message->next;
-        EI();
+        if (old)
+            EIntr();
     } else {
         message = NULL;
     }
@@ -596,224 +716,119 @@ static pfsnet_arch_message_t *tryAllocMsg(void)
 static pfsnet_arch_message_t *allocMsg(void)
 {
     pfsnet_arch_message_t *message;
+    int old;
 
     WaitSema(g_msgCountSema);
-    DI();
+    old = DIntr();
     message = g_freeHead;
     if (message != NULL)
         g_freeHead = message->next;
-    EI();
+    if (old)
+        EIntr();
     return message;
 }
 
 static void freeMsg(pfsnet_arch_message_t *msg)
 {
+    int old;
+
     if (msg == NULL)
         return;
-    DI();
+    old = DIntr();
     msg->next = g_freeHead;
     g_freeHead = msg;
-    EI();
+    if (old)
+        EIntr();
     SignalSema(g_msgCountSema);
 }
 
-/*
- * 修复 PS2SDK ee/kernel/src/timer.c 中 SetNextComp、TimerHandler_callback 与 iFreeTimerCounter 的硬件竞态：
- *
- * 1) timer.c:300-304 在 current_schedule < time_now + CLOCKS_GAP (仅 2 个 T2_COUNT 计数 = 3.47us)
- *    时，先执行 SetT2_COMP((*T2_COUNT) + 2) 再执行 SetT2_MODE((*T2_MODE) & ~(1 << 11)) 清 EQUF，
- *    若写完 T2_COMP 到清 EQUF 之间已跨过 2 个计数（3.47us），会把刚刚触发的 EQUF 抹掉，导致闹钟被推迟整整
- *    一轮 16 位溢出（113.77ms）甚至与 OVFF 叠加永久卡死；
- * 2) timer.c:402 的 TimerHandler_callback 仅在 ((*T2_MODE) & (1 << 10)) != 0 (EQUF=1) 时才遍历闹钟链表，
- *    若闹钟恰好落在 0xFFFF -> 0x0000 溢出中断 (OVFF) 边界，TimerHandler_callback 会直接跳过已到期的闹钟；
- * 3) timer.c:559-562 的 iFreeTimerCounter (由 ReleaseTimerAlarm 调用) 在 UnlinkAlarm_ForTimer 移除队首闹钟后
- *    漏调 SetNextComp(iGetTimerSystemTime())，导致硬件 T2_COMP 仍停留在已释放闹钟的旧比较值上。
- */
-typedef struct pfsnet_counter_struct {
-    struct pfsnet_counter_struct *timer_next;
-    struct pfsnet_counter_struct *timer_previous;
-    vu32 timer_key;
-    u32 timer_mode;
-    u64 timer_base_time;
-    u64 timer_base_count;
-    u64 timer_schedule;
-    timer_alarm_handler_t callback_handler;
-    void *gp_value;
-    void *callback_handler_arg;
-    u32 padding[3];
-} pfsnet_counter_struct_t __attribute__((aligned(64)));
+typedef struct pfsnet_wait_sema_ctx {
+    s32 tid;
+    volatile int fired;
+    volatile int done;
+} pfsnet_wait_sema_ctx_t;
 
-typedef struct pfsnet_timer_ee_global {
-    vu64 timer_handled_count;
-    s32 intc_handler;
-    vu32 timer_counter_total;
-    vu32 timer_counter_used;
-    pfsnet_counter_struct_t *timer_counter_buf_free;
-    pfsnet_counter_struct_t *timer_counter_buf_alarm;
-    vs32 current_handling_timer_id;
-} pfsnet_timer_ee_global_t;
+#define PFSNET_MBOX_WAIT_SLOTS 8
+static volatile int g_mboxWaitTids[PFSNET_MBOX_WAIT_SLOTS] = {
+    -1, -1, -1, -1, -1, -1, -1, -1
+};
 
-#define PFSNET_TIMER_MODE_HANDLER 0x00000002u
-#define PFSNET_PTR_TO_TIMER_ID(ptr_) ((s32)((((uiptr)(ptr_)) << 4) | ((ptr_)->timer_key)))
-#define PFSNET_CLOCKS_GAP 0x2000ULL /* 32 ticks @ BUSCLK/256 (~55.5us) */
-
-extern pfsnet_timer_ee_global_t g_Timer;
-extern void SetT2_COMP(u32 val);
-extern void SetT2_MODE(u32 val);
-extern void InsertAlarm_ForTimer(pfsnet_counter_struct_t *timer_link);
-extern pfsnet_counter_struct_t *UnlinkAlarm_ForTimer(pfsnet_counter_struct_t *timer_unlink);
-extern s32 __real_iFreeTimerCounter(s32 id);
-
-static inline u64 pfsnetApplyOverflowInIsr(void)
+static int pfsnetEnterMboxWait(int tid)
 {
-    u64 timer_system_time_now;
-    u32 mode;
-    u32 low;
-
-    low = *T2_COUNT;
-    mode = *T2_MODE;
-    if ((mode & (1 << 11)) != 0) {
-        g_Timer.timer_handled_count += 1;
-        SetT2_MODE(mode & (~(1 << 10)));
-        low = *T2_COUNT;
-    }
-    timer_system_time_now = (g_Timer.timer_handled_count << 16) | low;
-    timer_system_time_now = timer_system_time_now << ((mode & 3) << 2);
-    return timer_system_time_now;
-}
-
-void __wrap_SetNextComp(u64 time_now)
-{
-    u64 current_schedule, next_schedule;
-    pfsnet_counter_struct_t *timer_current;
-    u32 shift, minGapTicks;
-
-    if (g_Timer.current_handling_timer_id >= 0)
-        return;
-
-    timer_current = g_Timer.timer_counter_buf_alarm;
-    if (timer_current == NULL) {
-        SetT2_COMP(0);
-        SetT2_MODE((*T2_MODE) & (~(1 << 11)));
-        return;
-    }
-
-    current_schedule = timer_current->timer_schedule + timer_current->timer_base_time - timer_current->timer_base_count;
-    timer_current = timer_current->timer_next;
-    while (timer_current != NULL) {
-        next_schedule = timer_current->timer_schedule + timer_current->timer_base_time - timer_current->timer_base_count;
-        if (next_schedule < (current_schedule + 0x200ULL))
-            current_schedule = next_schedule;
-        else
-            break;
-        timer_current = timer_current->timer_next;
-    }
-
-    shift = ((*T2_MODE) & 3) << 2;
-    minGapTicks = (u32)(PFSNET_CLOCKS_GAP >> shift);
-    if (minGapTicks < 16u)
-        minGapTicks = 16u;
-
-    /* 始终先清 EQUF，再写 T2_COMP，杜绝写完 T2_COMP 后被 SetT2_MODE 抹掉刚触发的 EQUF */
-    SetT2_MODE((*T2_MODE) & (~(1 << 11)));
-    time_now = iGetTimerSystemTime();
-
-    if (current_schedule <= (time_now + PFSNET_CLOCKS_GAP)) {
-        SetT2_COMP(((*T2_COUNT) + minGapTicks) & 0xFFFFu);
-    } else {
-        u32 comp = (u32)((current_schedule >> shift) & 0xFFFFu);
-        SetT2_COMP(comp);
-        if ((current_schedule - time_now) < (0x8000ULL << shift)) {
-            u32 cntNow = (*T2_COUNT) & 0xFFFFu;
-            s16 diff = (s16)((u16)comp - (u16)cntNow);
-            if (diff < (s16)minGapTicks)
-                SetT2_COMP((cntNow + minGapTicks) & 0xFFFFu);
+    int i;
+    int old = DIntr();
+    for (i = 0; i < PFSNET_MBOX_WAIT_SLOTS; i++) {
+        if (g_mboxWaitTids[i] < 0) {
+            g_mboxWaitTids[i] = tid;
+            if (old)
+                EIntr();
+            return i;
         }
     }
+    if (old)
+        EIntr();
+    return -1;
 }
 
-s32 __wrap_iFreeTimerCounter(s32 id)
+static void pfsnetLeaveMboxWait(int slot)
 {
-    s32 ret = __real_iFreeTimerCounter(id);
-    if (ret == 0 && g_Timer.current_handling_timer_id < 0)
-        __wrap_SetNextComp(iGetTimerSystemTime());
-    return ret;
+    int old;
+    if (slot < 0 || slot >= PFSNET_MBOX_WAIT_SLOTS)
+        return;
+    old = DIntr();
+    g_mboxWaitTids[slot] = -1;
+    if (old)
+        EIntr();
 }
 
-s32 __wrap_TimerHandler_callback(s32 cause, void *arg, void *addr)
+void pfsnetWakeMboxWaiter(int tid)
 {
-    pfsnet_counter_struct_t *timer_current;
-    pfsnet_counter_struct_t *timer_next;
-    u64 target_cmp;
-    u64 abs_cmp;
-    u32 timer_id;
-    u64 timer_schedule_next;
+    int i;
+    int shouldWake = 0;
+    int old;
 
-    (void)cause;
-    (void)arg;
-
-    abs_cmp = pfsnetApplyOverflowInIsr();
-    if (((*T2_MODE) & (1 << 10)) != 0)
-        SetT2_MODE((*T2_MODE) & (~(1 << 11)));
-
-    timer_current = g_Timer.timer_counter_buf_alarm;
-    while (timer_current != NULL) {
-        target_cmp = timer_current->timer_schedule + timer_current->timer_base_time - timer_current->timer_base_count;
-        abs_cmp = pfsnetApplyOverflowInIsr();
-        if (abs_cmp < target_cmp)
+    if (tid < 0)
+        return;
+    old = DIntr();
+    for (i = 0; i < PFSNET_MBOX_WAIT_SLOTS; i++) {
+        if (g_mboxWaitTids[i] == tid) {
+            shouldWake = 1;
             break;
-
-        timer_next = UnlinkAlarm_ForTimer(timer_current);
-        timer_id = (u32)PFSNET_PTR_TO_TIMER_ID(timer_current);
-        g_Timer.current_handling_timer_id = (s32)timer_id;
-        SetGP(timer_current->gp_value);
-        timer_schedule_next = timer_current->callback_handler(
-            (s32)timer_id,
-            timer_current->timer_schedule,
-            (abs_cmp + timer_current->timer_base_count) - timer_current->timer_base_time,
-            timer_current->callback_handler_arg,
-            addr);
-        if (timer_schedule_next == 0) {
-            timer_current->timer_mode &= ~PFSNET_TIMER_MODE_HANDLER;
-        } else if (timer_schedule_next == (u64)-1) {
-            timer_current->timer_next = g_Timer.timer_counter_buf_free;
-            g_Timer.timer_counter_buf_free = timer_current;
-            timer_current->timer_key = 0;
-            timer_current->timer_mode = 0;
-            g_Timer.timer_counter_used -= 1;
-        } else {
-            if (timer_schedule_next < 0x3999ULL)
-                timer_schedule_next = 0x3999ULL;
-            timer_current->timer_schedule += timer_schedule_next;
-            InsertAlarm_ForTimer(timer_current);
         }
-        timer_current = timer_next;
     }
+    if (old)
+        EIntr();
 
-    g_Timer.current_handling_timer_id = -1;
-    __wrap_SetNextComp(pfsnetApplyOverflowInIsr());
-    pfsnetApplyOverflowInIsr();
-    ExitHandler();
-    return 0;
+    if (shouldWake)
+        ReleaseWaitThread(tid);
 }
 
 static u64 pfsnetWaitSemaAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
 {
-    s32 tid = (s32)(intptr_t)arg;
+    pfsnet_wait_sema_ctx_t *ctx = (pfsnet_wait_sema_ctx_t *)arg;
     (void)id;
     (void)scheduled_time;
     (void)actual_time;
     (void)pc_value;
 
-    if (iReleaseWaitThread(tid) < 0)
+    if (ctx == NULL || ctx->done) {
+        if (ctx != NULL)
+            ctx->fired = 1;
+        return 0;
+    }
+    if (iReleaseWaitThread(ctx->tid) < 0)
         return 0x4000;
+    ctx->fired = 1;
     return 0;
 }
 
 static int waitSemaTimeoutMs(int sema, unsigned int msec)
 {
+    pfsnet_wait_sema_ctx_t ctx;
     s32 timerid;
     int ret;
+    int old;
+    int alreadyFired;
     u64 clocks;
 
     if (PollSema(sema) == sema)
@@ -827,20 +842,32 @@ static int waitSemaTimeoutMs(int sema, unsigned int msec)
     if (clocks < 0x4000)
         clocks = 0x4000;
 
-    timerid = SetTimerAlarm(clocks, &pfsnetWaitSemaAlarmCb, (void *)(intptr_t)GetThreadId());
+    ctx.tid = GetThreadId();
+    ctx.fired = 0;
+    ctx.done = 0;
+
+    timerid = SetTimerAlarm(clocks, &pfsnetWaitSemaAlarmCb, &ctx);
     if (timerid < 0)
         return (WaitSema(sema) == sema) ? sema : -1;
 
     ret = WaitSema(sema);
-    ReleaseTimerAlarm(timerid);
+
+    old = DIntr();
+    ctx.done = 1;
+    alreadyFired = ctx.fired;
+    if (old)
+        EIntr();
+
+    if (!alreadyFired)
+        ReleaseTimerAlarm(timerid);
     return (ret == sema) ? sema : -1;
 }
 
 static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **message)
 {
     pfsnet_arch_message_t *nextMessage;
+    int old = DIntr();
 
-    DI();
     *message = mBox->FirstMessage;
     nextMessage = ((*message != NULL) && ((unsigned int)(*message)->next != 0xFFFFFFFFu))
         ? (*message)->next
@@ -848,7 +875,8 @@ static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **
     if (mBox->FirstMessage == mBox->LastMessage)
         mBox->LastMessage = NULL;
     mBox->FirstMessage = nextMessage;
-    EI();
+    if (old)
+        EIntr();
 }
 
 static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox, u32 timeout)
@@ -856,15 +884,26 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox,
     pfsnet_sys_mbox_t mBox;
     int sema;
     int result;
+    int slot;
 
     if (pMBox == NULL || (mBox = *pMBox) == NULL)
         return -1;
     sema = mBox->MessageCountSema;
 
+    if (PollSema(sema) == sema) {
+        if (*pMBox == mBox) {
+            retrieveMbxInternal(mBox, message);
+            return 0;
+        }
+        return -1;
+    }
+
+    slot = pfsnetEnterMboxWait(GetThreadId());
     if (timeout > 0)
         result = waitSemaTimeoutMs(sema, timeout);
     else
         result = WaitSema(sema);
+    pfsnetLeaveMboxWait(slot);
 
     if (result == sema && *pMBox == mBox) {
         retrieveMbxInternal(mBox, message);
@@ -885,12 +924,13 @@ static int pollMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t mBox)
 static void sendMbx(pfsnet_sys_mbox_t *mbox, pfsnet_arch_message_t *msg, void *sys_msg)
 {
     pfsnet_sys_mbox_t m;
+    int old;
 
     if (mbox == NULL || (m = *mbox) == NULL) {
         freeMsg(msg);
         return;
     }
-    DI();
+    old = DIntr();
     msg->sys_msg = sys_msg;
     msg->next = NULL;
     if (m->FirstMessage == NULL)
@@ -898,7 +938,8 @@ static void sendMbx(pfsnet_sys_mbox_t *mbox, pfsnet_arch_message_t *msg, void *s
     if (m->LastMessage != NULL)
         m->LastMessage->next = msg;
     m->LastMessage = msg;
-    EI();
+    if (old)
+        EIntr();
     SignalSema(m->MessageCountSema);
 }
 
@@ -952,16 +993,18 @@ void __wrap_sys_mbox_free(pfsnet_sys_mbox_t *pMBox)
 {
     pfsnet_sys_mbox_t mBox;
     pfsnet_arch_message_t *message, *nextMessage;
+    int old;
 
     if (pMBox == NULL || (mBox = *pMBox) == NULL)
         return;
 
-    DI();
+    old = DIntr();
     *pMBox = NULL;
     message = mBox->FirstMessage;
     mBox->FirstMessage = NULL;
     mBox->LastMessage = NULL;
-    EI();
+    if (old)
+        EIntr();
 
     while (message != NULL) {
         nextMessage = message->next;

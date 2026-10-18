@@ -53,6 +53,7 @@ static uint8_t g_serverStack[PFSNET_SERVER_STACK] __attribute__((aligned(16)));
 static int g_listenSocket = -1;
 static int g_serverThreadId = -1;
 static volatile int g_serverStop;
+static volatile int g_clientStop;
 static struct PfsNetClient g_client;
 
 static int sendAll(int sock, const void *buf, int len)
@@ -63,7 +64,12 @@ static int sendAll(int sock, const void *buf, int len)
 
     pfsnetTrafficBegin();
     while (sent < len) {
-        int n = send(sock, ptr + sent, len - sent, 0);
+        int n;
+        if (g_clientStop || g_serverStop) {
+            ok = 0;
+            break;
+        }
+        n = send(sock, ptr + sent, len - sent, 0);
         if (n <= 0) {
             ok = 0;
             break;
@@ -82,7 +88,12 @@ static int recvAll(int sock, void *buf, int len)
 
     pfsnetTrafficBegin();
     while (got < len) {
-        int n = recv(sock, ptr + got, len - got, 0);
+        int n;
+        if (g_clientStop || g_serverStop) {
+            ok = 0;
+            break;
+        }
+        n = recv(sock, ptr + got, len - got, 0);
         if (n <= 0) {
             ok = 0;
             break;
@@ -142,12 +153,11 @@ static int handleHello(struct PfsNetClient *client, const uint8_t *payload, uint
 
 static void closeClient(struct PfsNetClient *client)
 {
-    if (client->socket >= 0) {
-        close(client->socket);
-        client->socket = -1;
-    }
+    int fd = client->socket;
+    client->socket = -1;
+    if (fd >= 0)
+        close(fd);
     client->verified = 0;
-    client->running = 0;
     pfsnetFsForceUmount();
 }
 
@@ -159,7 +169,7 @@ static void clientThread(void *arg)
     client->running = 1;
     client->verified = 0;
 
-    while (client->running) {
+    while (client->running && !g_clientStop && !g_serverStop) {
         if (recvAll(client->socket, &hdr, sizeof(hdr)) < 0)
             break;
         if (hdr.payload_length > PFSNET_RECV_MAX)
@@ -190,6 +200,8 @@ static void clientThread(void *arg)
     }
 
     closeClient(client);
+    client->threadId = -1;
+    client->running = 0;
     ExitDeleteThread();
 }
 
@@ -229,39 +241,46 @@ static void serverThread(void *arg)
     while (!g_serverStop) {
         addrLen = sizeof(addr);
         clientSock = accept(g_listenSocket, (struct sockaddr *)&addr, &addrLen);
-        if (g_serverStop)
+        if (g_serverStop) {
+            if (clientSock >= 0)
+                close(clientSock);
             break;
+        }
         if (clientSock < 0) {
             /* close listen 后 accept 会立刻失败；必须让出 CPU，否则 0x3f 忙等饿死退出路径 */
             DelayThread(20000);
             continue;
         }
 
-        /* 单客户端：若旧连接仍在，主动关闭旧控制口与数据口，等旧线程清理退出后再接管新连接 */
+        /* 单客户端：若旧连接仍在，通过协作标志 + pfsnetWakeMboxWaiter 唤醒旧线程自行 close/umount 退出；
+         * 切勿跨线程对正阻塞在 recv 的 socket 调用 shutdown/close（LWIP_NETCONN_FULLDUPLEX=0），
+         * 也切勿在旧线程完成 pfsnetFsForceUmount 前 memset 栈区！ */
         if (g_client.running) {
-            int oldFd = g_client.socket;
             int waitTicks;
-            g_client.socket = -1;
-            if (oldFd >= 0) {
-                shutdown(oldFd, SHUT_RDWR);
-                close(oldFd);
-            }
+            g_clientStop = 1;
             pfsnetFsAbortActiveSocket();
-            for (waitTicks = 0; waitTicks < 300 && g_client.running; waitTicks++)
+            for (waitTicks = 0; waitTicks < 300 && g_client.running; waitTicks++) {
+                if (g_client.threadId >= 0)
+                    pfsnetWakeMboxWaiter(g_client.threadId);
                 DelayThread(50000);
+            }
             if (g_client.running) {
                 close(clientSock);
                 continue;
             }
         }
 
-        memset(&g_client, 0, sizeof(g_client));
+        g_clientStop = 0;
         g_client.socket = clientSock;
         g_client.peer = addr;
+        g_client.verified = 0;
+        g_client.threadId = -1;
+        g_client.running = 1;
         scr_printf("Client connected.\n");
         if (startClientThread(&g_client) < 0) {
             close(clientSock);
             g_client.socket = -1;
+            g_client.running = 0;
             scr_printf("Client thread failed.\n");
         }
     }
@@ -325,20 +344,13 @@ int pfsnetStartServer(void)
 void pfsnetStopServer(void)
 {
     int listenFd;
-    int clientFd;
 
-    /* 协作式停服：只关 socket 让 accept/recv 返回。禁止 TerminateThread——
-     * 线程若卡在 lwIP/IOP RPC，杀掉会把后续 umount / 退出一起卡死。 */
+    /* 协作式停服：通过标志位 + pfsnetWakeMboxWaiter 唤醒 clientThread / ioWorker 自行退出 */
     g_serverStop = 1;
-    g_client.running = 0;
-
-    clientFd = g_client.socket;
-    g_client.socket = -1;
-    if (clientFd >= 0) {
-        shutdown(clientFd, SHUT_RDWR);
-        close(clientFd);
-    }
+    g_clientStop = 1;
     pfsnetFsAbortActiveSocket();
+    if (g_client.running && g_client.threadId >= 0)
+        pfsnetWakeMboxWaiter(g_client.threadId);
 
     listenFd = g_listenSocket;
     g_listenSocket = -1;
