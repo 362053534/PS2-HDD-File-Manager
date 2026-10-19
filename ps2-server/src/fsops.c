@@ -183,6 +183,11 @@ int pfsnetFsInit(void)
     return 0;
 }
 
+int pfsnetFsShouldAbortIoTid(int tid)
+{
+    return (tid >= 0 && tid == g_ioTid && g_putStop != 0) ? 1 : 0;
+}
+
 void pfsnetFsAbortActiveTransfer(int userAbort)
 {
     int wasStopped;
@@ -204,9 +209,15 @@ void pfsnetFsAbortActiveTransfer(int userAbort)
             SignalSema(g_putFreeSem);
         if (g_putFillSem >= 0)
             SignalSema(g_putFillSem);
-        if (g_ioTid >= 0)
-            pfsnetWakeMboxWaiter(g_ioTid);
+    } else {
+        ee_sema_t st;
+        if (g_putFreeSem >= 0 && ReferSemaStatus(g_putFreeSem, &st) >= 0 && st.count <= 0)
+            SignalSema(g_putFreeSem);
+        if (g_putFillSem >= 0 && ReferSemaStatus(g_putFillSem, &st) >= 0 && st.count <= 0)
+            SignalSema(g_putFillSem);
     }
+    if (g_ioTid >= 0)
+        pfsnetWakeMboxWaiter(g_ioTid);
 }
 
 void pfsnetFsAbortActiveSocket(void)

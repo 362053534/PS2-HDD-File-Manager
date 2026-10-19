@@ -34,11 +34,6 @@ extern void __ps2ipeeOpsInitializeImpl(void);
  */
 uint32_t __wrap_sys_now(void)
 {
-    int old = DIntr();
-    if ((_lw(0x1000c000) & 0x100) == 0)
-        iSifSetDChain();
-    if (old)
-        EIntr();
     return (uint32_t)(GetTimerSystemTime() / ((u64)kBUSCLK / 1000ULL));
 }
 
@@ -212,44 +207,84 @@ struct pbuf *__wrap_pbuf_alloc(pbuf_layer l, u16 size, pbuf_type type)
  * 清除 PBUF_FLAG_PUSH 后：当 recvmbox 已空（rcvevent <= 0）时 lwip_recvfrom 仍会正常立即返回（不影响控制口短包），
  * 当 recvmbox 中还有排队分片（rcvevent > 0）时则一次性把队列中所有 pbuf 连续拷完。
  */
+int pfsnetShouldAbortMbox(int tid)
+{
+    if (tid < 0)
+        return 0;
+    return (pfsnetFsShouldAbortIoTid(tid) || pfsnetServerShouldAbortClientTid(tid)) ? 1 : 0;
+}
+
 err_t __wrap_netconn_recv_tcp_pbuf(void *conn, struct pbuf **new_buf)
 {
-    err_t err = __real_netconn_recv_tcp_pbuf(conn, new_buf);
-    if (err == 0 && new_buf != NULL && *new_buf != NULL)
-        (*new_buf)->flags &= (u8)~0x01u;
+    err_t err;
+    if (pfsnetShouldAbortMbox(GetThreadId()))
+        return (err_t)-13; /* ERR_ABRT */
+    err = __real_netconn_recv_tcp_pbuf(conn, new_buf);
+    if (err == 0 && new_buf != NULL && *new_buf != NULL) {
+        if (!pfsnetShouldAbortMbox(GetThreadId()))
+            (*new_buf)->flags &= (u8)~0x01u;
+        else
+            (*new_buf)->flags |= (u8)0x01u;
+    }
     return err;
 }
 
 /*
- * 解决 EE BIOS 32 槽 SIF1 DMA 队列在突发流量下瞬时满载导致
- * fileXioWrite 的 _request_rdata (iSifSendCmd) 丢包永久死锁，以及
- * NETMAN HandleRxEvent 在 DMAC_SIF0 中断链中漏调 iSifSetDChain() 导致 SIF0 永久停机：
+ * 解决 EE BIOS SIF1 DMA 与 DMAC_SIF0 的三类底层硬件/中断竞态：
  *
- * 1) SifSetDma 维护 12 槽在途 DMA ID 环（仅等待 12 次前的 DMA 完成），既避免单槽等待阻塞
- *    NETMAN_RxThread 短突发，又将线程态 SIF1 占用严格限制在 <=18 槽以内，始终为 DMAC_SIF0
- *    中断态 _request_rdata (iSifSendCmd) 预留 >=14 个空闲硬件槽位。
- * 2) __wrap_iSifSendCmd 的定时器重试池将 packet 深拷贝到 64 字节对齐缓冲，防止异步重试时
- *    读取已失效的调用栈或被后续请求覆盖的包头。
- * 3) 接管 NETMAN EE 侧 rpc_server：将 HandleRxEvent 以 next=-1 挂在 DMAC_SIF0 链尾（在
- *    _SifCmdIntHandler 之后执行），凡检测到 DMAC_SIF0_CHCR.STR (0x1000c000 & 0x100) 为 0
- *    一律无条件调用 iSifSetDChain()，彻底杜绝因 RxBufferNextRdPtr 竞态或中途 SIF_DMA_INT_O
- *    造成的 SIF0 (IOP->EE) 永久停机。
+ * 1) 在 PS2 EE 上，BIOS 的 SifSetDma 与 SifDmaStat 系统调用在 Status.EXL=0、Status.EIE=1
+ *    （开中断且允许线程抢占）下操作 BIOS 内部 SIF1 DMA 环（sif_curbuf / dmatag_index）。
+ *    当 pfsnetNetManRxThread(0x59) 或 NETMAN_TxThread(0x56) 正在执行 __real_SifSetDma 或
+ *    SifDmaStat 时，若被 DMAC_SIF0 的 _request_rdata (iSifSendCmd -> iSifSetDma) 中断抢占，
+ *    或被中断唤醒的 clientThread(0x40 -> fileXioWrite -> SifSendCmd -> SifSetDma) 线程抢占，
+ *    两处会并发改写 BIOS SIF1 DMA 环，导致 fileXioWrite 的 64KiB sceSifGetOtherData 丢包永卡。
+ *    因此所有 __real_SifSetDma、__real_iSifSetDma、__real_SifDmaStat、__real_iSifSendCmd 调用
+ *    一律包裹在 DIntr()/EIntr() 中（与 IOP 侧 sifman.c 的 CpuSuspendIntr 完全对称）。
+ * 2) SifSetDma 维护 8 槽在途 DMA ID 环（仅等待 8 次前的 DMA 完成），将线程态 SIF1 占用严格限制
+ *    在 <=16 个硬件 tag 以内，始终为中断态 _request_rdata 预留 >=16 个空闲硬件槽位。
+ * 3) 通过 --wrap=_SifCmdIntHandler 接管 DMAC_SIF0 中断处理：去除 PS2SDK 原版 _SifCmdIntHandler
+ *    开头错误的 EI()（防止 INTC_TIM1/VBLANK/TIM2 抢占 _SifCmdIntHandler 导致 i* 系统调用重入），
+ *    并在同一个关中断 DMAC_SIF0 处理函数内统一完成 SIFCMD 分发、NETMAN RX 唤醒与尾部唯一一次
+ *    iSifSetDChain() 重装，彻底杜绝提前重装覆盖未读 pktbuf 或双重 iSifSetDChain() 破坏 QWC。
  */
 extern unsigned int __real_SifSetDma(SifDmaTransfer_t *sdd, s32 len);
+extern unsigned int __real_iSifSetDma(SifDmaTransfer_t *sdd, s32 len);
+extern int __real_SifDmaStat(unsigned int id);
 extern unsigned int __real_SifSendCmd(int cmd, void *packet, int packet_size,
                                       void *src_extra, void *dest_extra, int size_extra);
 extern unsigned int __real_iSifSendCmd(int cmd, void *packet, int packet_size,
                                        void *src_extra, void *dest_extra, int size_extra);
 
-#define PFSNET_SIF_DMA_RING_DEPTH 12
+#define PFSNET_SIF_DMA_RING_DEPTH 8
 static volatile int g_sifDmaRing[PFSNET_SIF_DMA_RING_DEPTH];
 static volatile int g_sifDmaRingIdx;
+
+int __wrap_SifDmaStat(unsigned int id)
+{
+    int ret;
+    int old = DIntr();
+    ret = __real_SifDmaStat(id);
+    if (old)
+        EIntr();
+    return ret;
+}
+
+unsigned int __wrap_iSifSetDma(SifDmaTransfer_t *sdd, s32 len)
+{
+    unsigned int id;
+    int old = DIntr();
+    id = __real_iSifSetDma(sdd, len);
+    if (old)
+        EIntr();
+    return id;
+}
 
 unsigned int __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
 {
     unsigned int id;
     int slot;
     int oldId;
+    int stat;
     int oldIntr = DIntr();
 
     slot = g_sifDmaRingIdx;
@@ -259,14 +294,29 @@ unsigned int __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
         EIntr();
 
     if (oldId > 0) {
-        while (SifDmaStat(oldId) >= 0)
+        for (;;) {
+            oldIntr = DIntr();
+            stat = __real_SifDmaStat((unsigned int)oldId);
+            if (oldIntr)
+                EIntr();
+            if (stat < 0)
+                break;
             nopdelay();
+        }
     }
 
-    while ((id = __real_SifSetDma(sdd, len)) == 0)
+    for (;;) {
+        oldIntr = DIntr();
+        id = __real_SifSetDma(sdd, len);
+        if (id != 0)
+            g_sifDmaRing[slot] = (int)id;
+        if (oldIntr)
+            EIntr();
+        if (id != 0)
+            break;
         nopdelay();
+    }
 
-    g_sifDmaRing[slot] = (int)id;
     return id;
 }
 
@@ -401,6 +451,25 @@ static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
     g_nmClearDmaRing[slot] = (int)id;
 }
 
+#define PFSNET_MBOX_WAIT_SLOTS 8
+static volatile int g_mboxWaitTids[PFSNET_MBOX_WAIT_SLOTS] = {
+    -1, -1, -1, -1, -1, -1, -1, -1
+};
+
+struct pfsnet_sif_cmd_data {
+    void *pktbuf;
+    void *unused;
+    void *iopbuf;
+    SifCmdHandlerData_t *sys_cmd_handlers;
+    u32 nr_sys_handlers;
+    SifCmdHandlerData_t *usr_cmd_handlers;
+    u32 nr_usr_handlers;
+    int *sregs;
+};
+extern struct pfsnet_sif_cmd_data _sif_cmd_data;
+
+static volatile int g_sif0StallTicks;
+
 static void pfsnetPollWaitSlotsInIsr(void)
 {
     u64 now;
@@ -423,29 +492,115 @@ static void pfsnetPollWaitSlotsInIsr(void)
     for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
         if (g_waitSlots[i].active && (s64)(now - g_waitSlots[i].deadline) >= 0) {
             s32 tid = g_waitSlots[i].tid;
-            if (iReleaseWaitThread(tid) >= 0)
-                g_waitSlots[i].active = 0;
+            if (tid >= 0)
+                iReleaseWaitThread(tid);
         }
     }
+
+    for (i = 0; i < PFSNET_MBOX_WAIT_SLOTS; i++) {
+        s32 tid = g_mboxWaitTids[i];
+        if (tid >= 0 && pfsnetShouldAbortMbox(tid))
+            iReleaseWaitThread(tid);
+    }
+}
+
+int __wrap__SifCmdIntHandler(int channel)
+{
+    u128 packet[8];
+    u128 *pktbuf;
+    struct pfsnet_sif_cmd_data *cmd_data = &_sif_cmd_data;
+    SifCmdHeader_t *header;
+    SifCmdHandlerData_t *cmd_handlers;
+    int size, pktquads, id, i = 0;
+
+    (void)channel;
+
+    /*
+     * 严禁像 PS2SDK 原版 _SifCmdIntHandler 那样在入口调用 EI()！
+     * 原版入口调用 EI() 会导致 INTC_TIM1/VBLANK/TIM2 抢占 _SifCmdIntHandler，
+     * 在读取 pktbuf 与调用 _request_end / _request_rdata / _request_call 期间发生重入竞态。
+     */
+    DI();
+    g_sif0StallTicks = 0;
+
+    header = (SifCmdHeader_t *)cmd_data->pktbuf;
+    size = (header != NULL) ? header->psize : 0;
+    if (size != 0) {
+        pktquads = (size + 30) >> 4;
+        header->psize = 0;
+        if (pktquads > 8)
+            pktquads = 8;
+        if (pktquads > 0) {
+            pktbuf = (u128 *)cmd_data->pktbuf;
+            while (pktquads--) {
+                packet[i] = pktbuf[i];
+                i++;
+            }
+        }
+
+        header = (SifCmdHeader_t *)packet;
+        id = header->cid & ~SIF_CMD_ID_SYSTEM;
+
+        if (header->cid & SIF_CMD_ID_SYSTEM) {
+            cmd_handlers = ((u32)id < cmd_data->nr_sys_handlers) ? cmd_data->sys_cmd_handlers : NULL;
+        } else {
+            cmd_handlers = ((u32)id < cmd_data->nr_usr_handlers) ? cmd_data->usr_cmd_handlers : NULL;
+        }
+
+        if (cmd_handlers != NULL && cmd_handlers[id].handler != NULL)
+            cmd_handlers[id].handler(packet, cmd_handlers[id].harg);
+    }
+
+    if (g_nmFrameBufferStatus != NULL) {
+        struct NetManBD *bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
+        struct NetManBD *bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
+        if (bdRd->length > 0 || bdNext->length > 0 || size == 0) {
+            if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
+                g_nmIsProcessingRx = 1;
+                iWakeupThread(g_nmRxThreadID);
+            }
+        }
+    }
+
+    pfsnetPollWaitSlotsInIsr();
+
+    if ((_lw(0x1000c000) & 0x100) == 0)
+        iSifSetDChain();
+
+    ExitHandler();
+    return 0;
 }
 
 static s32 pfsnetHwTickIsr(s32 cause)
 {
     struct NetManBD *bdRd;
     struct NetManBD *bdNext;
-    int dchainStopped;
+
+    DI();
 
     if (cause == INTC_TIM1)
         *T1_MODE = (*T1_MODE) | (1 << 10) | (1 << 11);
 
-    dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
-    if (dchainStopped)
-        iSifSetDChain();
+    /*
+     * 仅当 DMAC_SIF0_CHCR.STR 为 0、D_STAT 中无挂起的 DMAC_SIF0 中断 (bit 5)、
+     * 且 pktbuf 中无未读 SIFCMD 包持续满 20ms 时才兜底调用 iSifSetDChain()，
+     * 绝不在 DMAC_SIF0 中断尚未被 CPU 响应前抢先重装 DChain。
+     */
+    if ((_lw(0x1000c000) & 0x100) == 0 &&
+        (_lw(0x1000e010) & 0x20) == 0 &&
+        (_sif_cmd_data.pktbuf == NULL || ((SifCmdHeader_t *)_sif_cmd_data.pktbuf)->psize == 0)) {
+        if (++g_sif0StallTicks >= 20) {
+            g_sif0StallTicks = 0;
+            iSifSetDChain();
+        }
+    } else {
+        g_sif0StallTicks = 0;
+    }
 
     if (g_nmFrameBufferStatus != NULL) {
         bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
         bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
+        if (bdRd->length > 0 || bdNext->length > 0) {
             if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
                 g_nmIsProcessingRx = 1;
                 iWakeupThread(g_nmRxThreadID);
@@ -496,34 +651,6 @@ static void pfsnetEnsureHwTickInstalled(void)
     }
     if (old)
         EIntr();
-}
-
-static s32 pfsnetNetManHandleRxEvent(s32 channel)
-{
-    struct NetManBD *bdRd;
-    struct NetManBD *bdNext;
-    int dchainStopped;
-
-    (void)channel;
-
-    dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
-    if (dchainStopped)
-        iSifSetDChain();
-
-    if (g_nmFrameBufferStatus != NULL) {
-        bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
-        bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
-            if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
-                g_nmIsProcessingRx = 1;
-                iWakeupThread(g_nmRxThreadID);
-            }
-        }
-    }
-
-    pfsnetPollWaitSlotsInIsr();
-    ExitHandler();
-    return 0;
 }
 
 static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
@@ -622,8 +749,6 @@ static void pfsnetNetManRxThread(void *arg)
 
         do {
             DI();
-            if ((_lw(0x1000c000) & 0x100) == 0)
-                iSifSetDChain();
             PacketLength = bd->length;
             if (PacketLength > 0) {
                 run = 1;
@@ -684,8 +809,10 @@ static void *pfsnetNetManEERpcHandler(int fnum, void *buffer, int NumBytes)
 
                 if ((g_nmRxThreadID = CreateThread(&thread)) >= 0) {
                     StartThread(g_nmRxThreadID, NULL);
-                    /* next = -1：挂在 _SifCmdIntHandler 之后，确保 SIF0 DChain 绝不漏开 */
-                    g_nmSifHandlerID = AddDmacHandler(DMAC_SIF0, &pfsnetNetManHandleRxEvent, -1);
+                    /* DMAC_SIF0 统一由 __wrap__SifCmdIntHandler 在关中断下处理，避免双 handler 重装 DChain 竞态 */
+                    g_nmSifHandlerID = -1;
+                    if ((_lw(0x1000c000) & 0x100) == 0)
+                        SifSetDChain();
                     EnableDmac(DMAC_SIF0);
                     ((struct NetManEEInitResult *)buffer)->result = 0;
                     ((struct NetManEEInitResult *)buffer)->FrameBufferStatus = g_nmFrameBufferStatus;
@@ -839,11 +966,6 @@ static void freeMsg(pfsnet_arch_message_t *msg)
     SignalSema(g_msgCountSema);
 }
 
-#define PFSNET_MBOX_WAIT_SLOTS 8
-static volatile int g_mboxWaitTids[PFSNET_MBOX_WAIT_SLOTS] = {
-    -1, -1, -1, -1, -1, -1, -1, -1
-};
-
 static int pfsnetEnterMboxWait(int tid)
 {
     int i;
@@ -976,6 +1098,7 @@ static int waitSemaTimeoutMs(int sema, unsigned int msec)
     int slot;
     int ret;
     u64 clocks;
+    u64 deadline;
 
     if (PollSema(sema) == sema)
         return sema;
@@ -990,11 +1113,15 @@ static int waitSemaTimeoutMs(int sema, unsigned int msec)
     if (clocks < 0x4000)
         clocks = 0x4000;
 
-    slot = pfsnetAllocWaitSlot(GetThreadId(), GetTimerSystemTime() + clocks);
+    deadline = GetTimerSystemTime() + clocks;
+    slot = pfsnetAllocWaitSlot(GetThreadId(), deadline);
     if (slot < 0)
         return (WaitSema(sema) == sema) ? sema : -1;
 
-    ret = WaitSema(sema);
+    if ((s64)(GetTimerSystemTime() - deadline) < 0)
+        ret = WaitSema(sema);
+    else
+        ret = PollSema(sema);
     pfsnetFreeWaitSlot(slot);
     return (ret == sema) ? sema : -1;
 }
@@ -1021,8 +1148,12 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox,
     int sema;
     int result;
     int slot;
+    int tid;
 
     if (pMBox == NULL || (mBox = *pMBox) == NULL)
+        return -1;
+    tid = GetThreadId();
+    if (pfsnetShouldAbortMbox(tid))
         return -1;
     sema = mBox->MessageCountSema;
 
@@ -1034,7 +1165,11 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox,
         return -1;
     }
 
-    slot = pfsnetEnterMboxWait(GetThreadId());
+    slot = pfsnetEnterMboxWait(tid);
+    if (pfsnetShouldAbortMbox(tid)) {
+        pfsnetLeaveMboxWait(slot);
+        return -1;
+    }
     if (timeout > 0)
         result = waitSemaTimeoutMs(sema, timeout);
     else

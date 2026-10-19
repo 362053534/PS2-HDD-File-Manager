@@ -151,6 +151,11 @@ static int handleHello(struct PfsNetClient *client, const uint8_t *payload, uint
     return pfsnetSendResponse(client, PFSNET_OK, reply, sizeof(reply));
 }
 
+int pfsnetServerShouldAbortClientTid(int tid)
+{
+    return (tid >= 0 && tid == g_client.threadId && (g_clientStop != 0 || g_serverStop != 0)) ? 1 : 0;
+}
+
 static void closeClient(struct PfsNetClient *client)
 {
     int fd = client->socket;
@@ -263,6 +268,7 @@ static void serverThread(void *arg)
             g_clientStop = 1;
             pfsnetFsAbortActiveSocket();
             for (waitTicks = 0; waitTicks < 600 && g_client.running; waitTicks++) {
+                pfsnetFsAbortActiveSocket();
                 if (g_client.threadId >= 0)
                     pfsnetWakeMboxWaiter(g_client.threadId);
                 DelayThread(50000);
