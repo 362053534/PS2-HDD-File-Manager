@@ -128,7 +128,6 @@ extern const struct lwip_memp_desc_min memp_PBUF_POOL;
 extern const struct lwip_memp_desc_min memp_PBUF;
 extern const struct lwip_memp_desc_min memp_TCP_SEG;
 extern const struct lwip_memp_desc_min memp_TCPIP_MSG_API;
-extern const struct lwip_memp_desc_min memp_TCPIP_MSG_INPKT;
 extern const struct lwip_memp_desc_min memp_NETBUF;
 extern const struct lwip_memp_desc_min memp_SYS_TIMEOUT;
 
@@ -170,7 +169,6 @@ void __wrap_memp_init(void)
     if (!g_extraMempInitialized) {
         g_extraMempInitialized = 1;
         expandLwipPool(&memp_PBUF_POOL, 512, PFSNET_PBUF_POOL_STRIDE);
-        expandLwipPool(&memp_TCPIP_MSG_INPKT, 512, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_TCP_SEG, 256, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_PBUF, 256, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_TCPIP_MSG_API, 256, PFSNET_SMALL_POOL_STRIDE);
@@ -1001,14 +999,10 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox,
         return -1;
 
     slot = pfsnetEnterMboxWait(tid);
-    if (timeout > 0) {
+    if (timeout > 0)
         result = waitSemaTimeoutMs(sema, timeout);
-    } else if (pfsnetFsIsIoTid(tid)) {
-        /* 数据口收发线程：若因无线闪断/网线拔出超过 15 秒无任何报文，自动超时退出以便主控重连续传 */
-        result = waitSemaTimeoutMs(sema, 15000u);
-    } else {
+    else
         result = WaitSema(sema);
-    }
     pfsnetLeaveMboxWait(slot);
 
     if (result == sema && *pMBox == mBox) {
