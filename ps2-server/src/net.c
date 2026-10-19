@@ -33,11 +33,11 @@ struct pfsnet_sif_cmd_data {
     void *pktbuf;
     void *unused;
     void *iopbuf;
-    SifCmdHandlerData_t *cmd_handlers;
-    u32 nr_cmd_handlers;
     SifCmdHandlerData_t *sys_cmd_handlers;
     u32 nr_sys_handlers;
-    u32 *sregs;
+    SifCmdHandlerData_t *usr_cmd_handlers;
+    u32 nr_usr_handlers;
+    int *sregs;
 };
 
 extern struct pfsnet_sif_cmd_data _sif_cmd_data;
@@ -413,17 +413,17 @@ int __wrap__SifCmdIntHandler(int channel)
                 i++;
             } while (--qwords);
 
-            id = ((SifCmdHeader_t *)packet)->cid;
-            if ((id & SYSTEM_CMD) != 0) {
-                id &= ~SYSTEM_CMD;
+            id = (u32)((SifCmdHeader_t *)packet)->cid;
+            if ((id & (u32)SIF_CMD_ID_SYSTEM) != 0) {
+                id &= ~(u32)SIF_CMD_ID_SYSTEM;
                 if (id < _sif_cmd_data.nr_sys_handlers) {
                     cmd_handlers = _sif_cmd_data.sys_cmd_handlers;
                     if (cmd_handlers[id].handler)
                         cmd_handlers[id].handler(packet, cmd_handlers[id].harg);
                 }
             } else {
-                if (id < _sif_cmd_data.nr_cmd_handlers) {
-                    cmd_handlers = _sif_cmd_data.cmd_handlers;
+                if (id < _sif_cmd_data.nr_usr_handlers) {
+                    cmd_handlers = _sif_cmd_data.usr_cmd_handlers;
                     if (cmd_handlers[id].handler)
                         cmd_handlers[id].handler(packet, cmd_handlers[id].harg);
                 }
