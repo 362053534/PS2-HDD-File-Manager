@@ -51,6 +51,8 @@ void pfsnetFsClientCleanup(void);
 void pfsnetFsForceUmount(void);
 void pfsnetFsAbortActiveSocket(void);
 void pfsnetFsAbortActiveTransfer(int userAbort);
+int pfsnetFsIsTransferActive(void);
+int pfsnetFsIsIoTid(int tid);
 int pfsnetFsShouldAbortIoTid(int tid);
 int pfsnetServerShouldAbortClientTid(int tid);
 int pfsnetShouldAbortMbox(int tid);

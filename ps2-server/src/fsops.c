@@ -183,6 +183,16 @@ int pfsnetFsInit(void)
     return 0;
 }
 
+int pfsnetFsIsTransferActive(void)
+{
+    return g_xferActive != 0;
+}
+
+int pfsnetFsIsIoTid(int tid)
+{
+    return (tid >= 0 && tid == g_ioTid) ? 1 : 0;
+}
+
 int pfsnetFsShouldAbortIoTid(int tid)
 {
     return (tid >= 0 && tid == g_ioTid && g_putStop != 0) ? 1 : 0;

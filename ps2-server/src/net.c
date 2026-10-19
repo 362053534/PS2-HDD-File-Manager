@@ -26,6 +26,8 @@ extern void NetManToggleGlobalNetIFLinkState(unsigned char state);
 /* GCC14 constructor 写入 .init_array，而 PS2 crt0 只遍历 .ctors，需手动填充 */
 extern void __ps2ipeeOpsInitializeImpl(void);
 
+static void pfsnetEnsureTimerInit(void);
+
 /*
  * PS2SDK 默认 sys_now() 为 clock() / 1000，而 _times()/clock() 用 32 位微秒计数，
  * 会在开机约 71.58 分钟（0xFFFFFFFF us）处从 4294967 跳回 0，破坏 lwIP TCP 定时器比较。
@@ -34,6 +36,11 @@ extern void __ps2ipeeOpsInitializeImpl(void);
  */
 uint32_t __wrap_sys_now(void)
 {
+    int old = DIntr();
+    if ((_lw(0x1000c000) & 0x100) == 0)
+        iSifSetDChain();
+    if (old)
+        EIntr();
     return (uint32_t)(GetTimerSystemTime() / ((u64)kBUSCLK / 1000ULL));
 }
 
@@ -108,17 +115,10 @@ void __wrap___retarget_lock_release_recursive(void *lockPtr)
  * 解决大文件顺序传输（如 2GB+ PFS 分段/子分区切换写盘停顿）时 PS2 端死锁断线：
  *
  * 1) PS2SDK libps2ip.a 默认 PBUF_POOL_SIZE = 128，其中 NETMAN 固定占走 64 个 RX 环缓冲，
- *    仅剩 64 个 PBUF_POOL 供整个 lwIP 使用。当大文件写到约 2GB 触发 PFS 元数据/日志刷盘或
- *    跨 APA 子分区找空闲块时，fileXioWrite 耗时变长，ioWorker 收完当前 512KiB 后暂停 recv，
- *    主机端发来的 TCP 窗口帧 + 尾包/重传帧一旦塞满剩余 64 个 PBUF_POOL，EE 侧 NETMAN_RxThread
- *    会在 while (AllocRxPacket() == NULL) {} 死循环，进而导致 IOP 侧 SMAP (优先级 0x28)
- *    在 while (bd->length != 0) {} 忙等，饿死低优先级的 fileXio/pfs/atad 写盘线程，形成
- *    EE <-> IOP 四方永久死锁。
- * 2) 通过 wrap memp_init 与 pbuf_alloc，在启动时利用 EE 充裕内存向 PBUF_POOL 等池追加
- *    512 个 64 字节对齐缓冲（可用 RX 缓冲从 64 扩至 576+），并在 pbuf_alloc 兜底动态扩容，
+ *    仅剩 64 个 PBUF_POOL 供整个 lwIP 使用；且 MEMP_NUM_TCPIP_MSG_INPKT 仅 50（小于 64）。
+ * 2) 通过 wrap memp_init 与 pbuf_alloc，在启动时利用 EE 充裕内存向 PBUF_POOL、TCPIP_MSG_INPKT
+ *    等池追加 64 字节对齐缓冲（可用 RX 缓冲从 64 扩至 576+），并在 pbuf_alloc 兜底动态扩容，
  *    确保 AllocRxPacket 永不返回 NULL。
- * 3) 同时替换 sys_arch 消息池（从 100 扩至 1024），并将 sys_arch_mbox_fetch / sys_arch_sem_wait
- *    内部的 32 位 clock() 微秒计时替换为 64 位单调毫秒计时，消除 35.79 / 71.58 分钟溢出。
  */
 struct lwip_memp_desc_min {
     u16 size;
@@ -128,6 +128,7 @@ extern const struct lwip_memp_desc_min memp_PBUF_POOL;
 extern const struct lwip_memp_desc_min memp_PBUF;
 extern const struct lwip_memp_desc_min memp_TCP_SEG;
 extern const struct lwip_memp_desc_min memp_TCPIP_MSG_API;
+extern const struct lwip_memp_desc_min memp_TCPIP_MSG_INPKT;
 extern const struct lwip_memp_desc_min memp_NETBUF;
 extern const struct lwip_memp_desc_min memp_SYS_TIMEOUT;
 
@@ -169,6 +170,7 @@ void __wrap_memp_init(void)
     if (!g_extraMempInitialized) {
         g_extraMempInitialized = 1;
         expandLwipPool(&memp_PBUF_POOL, 512, PFSNET_PBUF_POOL_STRIDE);
+        expandLwipPool(&memp_TCPIP_MSG_INPKT, 512, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_TCP_SEG, 256, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_PBUF, 256, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_TCPIP_MSG_API, 256, PFSNET_SMALL_POOL_STRIDE);
@@ -207,116 +209,57 @@ struct pbuf *__wrap_pbuf_alloc(pbuf_layer l, u16 size, pbuf_type type)
  * 清除 PBUF_FLAG_PUSH 后：当 recvmbox 已空（rcvevent <= 0）时 lwip_recvfrom 仍会正常立即返回（不影响控制口短包），
  * 当 recvmbox 中还有排队分片（rcvevent > 0）时则一次性把队列中所有 pbuf 连续拷完。
  */
-int pfsnetShouldAbortMbox(int tid)
-{
-    if (tid < 0)
-        return 0;
-    return (pfsnetFsShouldAbortIoTid(tid) || pfsnetServerShouldAbortClientTid(tid)) ? 1 : 0;
-}
-
 err_t __wrap_netconn_recv_tcp_pbuf(void *conn, struct pbuf **new_buf)
 {
-    err_t err;
-    if (pfsnetShouldAbortMbox(GetThreadId()))
-        return (err_t)-13; /* ERR_ABRT */
-    err = __real_netconn_recv_tcp_pbuf(conn, new_buf);
-    if (err == 0 && new_buf != NULL && *new_buf != NULL) {
-        if (!pfsnetShouldAbortMbox(GetThreadId()))
-            (*new_buf)->flags &= (u8)~0x01u;
-        else
-            (*new_buf)->flags |= (u8)0x01u;
-    }
+    err_t err = __real_netconn_recv_tcp_pbuf(conn, new_buf);
+    if (err == 0 && new_buf != NULL && *new_buf != NULL)
+        (*new_buf)->flags &= (u8)~0x01u;
     return err;
 }
 
 /*
- * 解决 EE BIOS SIF1 DMA 与 DMAC_SIF0 的三类底层硬件/中断竞态：
+ * 解决 EE BIOS 32 槽 SIF1 DMA 队列在突发流量下瞬时满载导致
+ * fileXioWrite 的 _request_rdata (iSifSendCmd) 丢包永久死锁，以及
+ * SifSetDma 返回值在 dma_count >= 0x8000 (约 6~7GB 传输量) 时 bit 31 置 1：
  *
- * 1) 在 PS2 EE 上，BIOS 的 SifSetDma 与 SifDmaStat 系统调用在 Status.EXL=0、Status.EIE=1
- *    （开中断且允许线程抢占）下操作 BIOS 内部 SIF1 DMA 环（sif_curbuf / dmatag_index）。
- *    当 pfsnetNetManRxThread(0x59) 或 NETMAN_TxThread(0x56) 正在执行 __real_SifSetDma 或
- *    SifDmaStat 时，若被 DMAC_SIF0 的 _request_rdata (iSifSendCmd -> iSifSetDma) 中断抢占，
- *    或被中断唤醒的 clientThread(0x40 -> fileXioWrite -> SifSendCmd -> SifSetDma) 线程抢占，
- *    两处会并发改写 BIOS SIF1 DMA 环，导致 fileXioWrite 的 64KiB sceSifGetOtherData 丢包永卡。
- *    因此所有 __real_SifSetDma、__real_iSifSetDma、__real_SifDmaStat、__real_iSifSendCmd 调用
- *    一律包裹在 DIntr()/EIntr() 中（与 IOP 侧 sifman.c 的 CpuSuspendIntr 完全对称）。
- * 2) SifSetDma 维护 8 槽在途 DMA ID 环（仅等待 8 次前的 DMA 完成），将线程态 SIF1 占用严格限制
- *    在 <=16 个硬件 tag 以内，始终为中断态 _request_rdata 预留 >=16 个空闲硬件槽位。
- * 3) 通过 --wrap=_SifCmdIntHandler 接管 DMAC_SIF0 中断处理：去除 PS2SDK 原版 _SifCmdIntHandler
- *    开头错误的 EI()（防止 INTC_TIM1/VBLANK/TIM2 抢占 _SifCmdIntHandler 导致 i* 系统调用重入），
- *    并在同一个关中断 DMAC_SIF0 处理函数内统一完成 SIFCMD 分发、NETMAN RX 唤醒与尾部唯一一次
- *    iSifSetDChain() 重装，彻底杜绝提前重装覆盖未读 pktbuf 或双重 iSifSetDChain() 破坏 QWC。
+ * 切记：EE BIOS SifSetDma 返回 (dma_count << 16) | (index << 8) | count，其中 dma_count 为
+ * 16 位无符号计数。当 dma_count 累进到 0x8000 (32768) 时，返回值 >= 0x80000000u，若按有符号
+ * int 判断 (oldId > 0) 会在约 6~7GB 处变为负数从而跳过 SifDmaStat 等待！
+ * 因此必须使用无符号 unsigned int 并以 (oldId != 0) 判定。
  */
 extern unsigned int __real_SifSetDma(SifDmaTransfer_t *sdd, s32 len);
-extern unsigned int __real_iSifSetDma(SifDmaTransfer_t *sdd, s32 len);
-extern int __real_SifDmaStat(unsigned int id);
 extern unsigned int __real_SifSendCmd(int cmd, void *packet, int packet_size,
                                       void *src_extra, void *dest_extra, int size_extra);
 extern unsigned int __real_iSifSendCmd(int cmd, void *packet, int packet_size,
                                        void *src_extra, void *dest_extra, int size_extra);
 
-#define PFSNET_SIF_DMA_RING_DEPTH 8
-static volatile int g_sifDmaRing[PFSNET_SIF_DMA_RING_DEPTH];
+#define PFSNET_SIF_DMA_RING_DEPTH 12
+static volatile unsigned int g_sifDmaRing[PFSNET_SIF_DMA_RING_DEPTH];
 static volatile int g_sifDmaRingIdx;
-
-int __wrap_SifDmaStat(unsigned int id)
-{
-    int ret;
-    int old = DIntr();
-    ret = __real_SifDmaStat(id);
-    if (old)
-        EIntr();
-    return ret;
-}
-
-unsigned int __wrap_iSifSetDma(SifDmaTransfer_t *sdd, s32 len)
-{
-    unsigned int id;
-    int old = DIntr();
-    id = __real_iSifSetDma(sdd, len);
-    if (old)
-        EIntr();
-    return id;
-}
 
 unsigned int __wrap_SifSetDma(SifDmaTransfer_t *sdd, s32 len)
 {
     unsigned int id;
     int slot;
-    int oldId;
-    int stat;
+    unsigned int oldId;
     int oldIntr = DIntr();
 
     slot = g_sifDmaRingIdx;
     g_sifDmaRingIdx = (slot + 1) % PFSNET_SIF_DMA_RING_DEPTH;
     oldId = g_sifDmaRing[slot];
+    g_sifDmaRing[slot] = 0;
     if (oldIntr)
         EIntr();
 
-    if (oldId > 0) {
-        for (;;) {
-            oldIntr = DIntr();
-            stat = __real_SifDmaStat((unsigned int)oldId);
-            if (oldIntr)
-                EIntr();
-            if (stat < 0)
-                break;
+    if (oldId != 0) {
+        while (SifDmaStat((int)oldId) >= 0)
             nopdelay();
-        }
     }
 
-    for (;;) {
-        oldIntr = DIntr();
-        id = __real_SifSetDma(sdd, len);
-        if (id != 0)
-            g_sifDmaRing[slot] = (int)id;
-        if (oldIntr)
-            EIntr();
-        if (id != 0)
-            break;
+    while ((id = __real_SifSetDma(sdd, len)) == 0)
         nopdelay();
-    }
 
+    g_sifDmaRing[slot] = id;
     return id;
 }
 
@@ -329,77 +272,23 @@ unsigned int __wrap_SifSendCmd(int cmd, void *packet, int packet_size,
     return id;
 }
 
-typedef struct pfsnet_isif_retry {
-    u8 pkt[64] __attribute__((aligned(64)));
-    int cmd;
-    int packet_size;
-    void *src_extra;
-    void *dest_extra;
-    int size_extra;
-    volatile int active;
-} pfsnet_isif_retry_t;
-
-static pfsnet_isif_retry_t g_isifRetryPool[8];
-
-typedef struct pfsnet_wait_slot {
-    volatile s32 tid;
-    volatile u64 deadline;
-    volatile int active;
-} pfsnet_wait_slot_t;
-
-#define PFSNET_WAIT_SLOTS 8
-static pfsnet_wait_slot_t g_waitSlots[PFSNET_WAIT_SLOTS];
-static int g_hwTickVblankId = -1;
-static int g_hwTickTim1Id = -1;
-static int g_hwTickTim2Id = -1;
-static int g_delaySema = -1;
-
-static void pfsnetEnsureHwTickInstalled(void);
-static int waitSemaTimeoutMs(int sema, unsigned int msec);
-
 unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
                                 void *src_extra, void *dest_extra, int size_extra)
 {
     unsigned int id;
     int spin;
-    int old;
 
-    for (spin = 0; spin < 256; spin++) {
-        old = DIntr();
+    if ((_lw(0x1000c000) & 0x100) == 0)
+        iSifSetDChain();
+
+    for (spin = 0; spin < 2048; spin++) {
         id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra);
-        if (old)
-            EIntr();
         if (id != 0)
             return id;
+        if ((_lw(0x1000c000) & 0x100) == 0)
+            iSifSetDChain();
     }
-    if (packet != NULL && packet_size > 0 && packet_size <= 64) {
-        int i;
-        old = DIntr();
-        for (i = 0; i < 8; i++) {
-            if (!g_isifRetryPool[i].active) {
-                g_isifRetryPool[i].cmd = cmd;
-                memcpy(g_isifRetryPool[i].pkt, packet, (size_t)packet_size);
-                g_isifRetryPool[i].packet_size = packet_size;
-                g_isifRetryPool[i].src_extra = src_extra;
-                g_isifRetryPool[i].dest_extra = dest_extra;
-                g_isifRetryPool[i].size_extra = size_extra;
-                g_isifRetryPool[i].active = 1;
-                if (old)
-                    EIntr();
-                return 1;
-            }
-        }
-        if (old)
-            EIntr();
-    }
-    for (;;) {
-        old = DIntr();
-        id = __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra);
-        if (old)
-            EIntr();
-        if (id != 0)
-            return id;
-    }
+    return __real_iSifSendCmd(cmd, packet, packet_size, src_extra, dest_extra, size_extra);
 }
 
 static int g_nmRpcSvrThreadID = -1;
@@ -418,7 +307,7 @@ static SifRpcDataQueue_t g_nmCbQueue;
 static SifRpcServerData_t g_nmCbSrv;
 
 #define PFSNET_NM_CLEAR_RING_DEPTH 8
-static volatile int g_nmClearDmaRing[PFSNET_NM_CLEAR_RING_DEPTH];
+static volatile unsigned int g_nmClearDmaRing[PFSNET_NM_CLEAR_RING_DEPTH];
 static volatile int g_nmClearDmaIdx;
 
 static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
@@ -426,7 +315,7 @@ static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
     struct NetManBD *bd;
     SifDmaTransfer_t dmat;
     int slot;
-    int oldId;
+    unsigned int oldId;
     unsigned int id;
 
     bd = UNCACHED_SEG(&g_nmFrameBufferStatus[index]);
@@ -437,8 +326,9 @@ static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
     slot = g_nmClearDmaIdx;
     g_nmClearDmaIdx = (slot + 1) % PFSNET_NM_CLEAR_RING_DEPTH;
     oldId = g_nmClearDmaRing[slot];
-    if (oldId > 0) {
-        while (SifDmaStat(oldId) >= 0)
+    g_nmClearDmaRing[slot] = 0;
+    if (oldId != 0) {
+        while (SifDmaStat((int)oldId) >= 0)
             nopdelay();
     }
 
@@ -448,159 +338,25 @@ static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
     dmat.attr = 0;
     while ((id = __wrap_SifSetDma(&dmat, 1)) == 0)
         nopdelay();
-    g_nmClearDmaRing[slot] = (int)id;
+    g_nmClearDmaRing[slot] = id;
 }
 
-#define PFSNET_MBOX_WAIT_SLOTS 8
-static volatile int g_mboxWaitTids[PFSNET_MBOX_WAIT_SLOTS] = {
-    -1, -1, -1, -1, -1, -1, -1, -1
-};
-
-struct pfsnet_sif_cmd_data {
-    void *pktbuf;
-    void *unused;
-    void *iopbuf;
-    SifCmdHandlerData_t *sys_cmd_handlers;
-    u32 nr_sys_handlers;
-    SifCmdHandlerData_t *usr_cmd_handlers;
-    u32 nr_usr_handlers;
-    int *sregs;
-};
-extern struct pfsnet_sif_cmd_data _sif_cmd_data;
-
-static volatile int g_sif0StallTicks;
-
-static void pfsnetPollWaitSlotsInIsr(void)
-{
-    u64 now;
-    int i;
-
-    for (i = 0; i < 8; i++) {
-        if (g_isifRetryPool[i].active) {
-            if (__real_iSifSendCmd(g_isifRetryPool[i].cmd,
-                                   g_isifRetryPool[i].pkt,
-                                   g_isifRetryPool[i].packet_size,
-                                   g_isifRetryPool[i].src_extra,
-                                   g_isifRetryPool[i].dest_extra,
-                                   g_isifRetryPool[i].size_extra) != 0) {
-                g_isifRetryPool[i].active = 0;
-            }
-        }
-    }
-
-    now = iGetTimerSystemTime();
-    for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
-        if (g_waitSlots[i].active && (s64)(now - g_waitSlots[i].deadline) >= 0) {
-            s32 tid = g_waitSlots[i].tid;
-            if (tid >= 0)
-                iReleaseWaitThread(tid);
-        }
-    }
-
-    for (i = 0; i < PFSNET_MBOX_WAIT_SLOTS; i++) {
-        s32 tid = g_mboxWaitTids[i];
-        if (tid >= 0 && pfsnetShouldAbortMbox(tid))
-            iReleaseWaitThread(tid);
-    }
-}
-
-int __wrap__SifCmdIntHandler(int channel)
-{
-    u128 packet[8];
-    u128 *pktbuf;
-    struct pfsnet_sif_cmd_data *cmd_data = &_sif_cmd_data;
-    SifCmdHeader_t *header;
-    SifCmdHandlerData_t *cmd_handlers;
-    int size, pktquads, id, i = 0;
-
-    (void)channel;
-
-    /*
-     * 严禁像 PS2SDK 原版 _SifCmdIntHandler 那样在入口调用 EI()！
-     * 原版入口调用 EI() 会导致 INTC_TIM1/VBLANK/TIM2 抢占 _SifCmdIntHandler，
-     * 在读取 pktbuf 与调用 _request_end / _request_rdata / _request_call 期间发生重入竞态。
-     */
-    DI();
-    g_sif0StallTicks = 0;
-
-    header = (SifCmdHeader_t *)cmd_data->pktbuf;
-    size = (header != NULL) ? header->psize : 0;
-    if (size != 0) {
-        pktquads = (size + 30) >> 4;
-        header->psize = 0;
-        if (pktquads > 8)
-            pktquads = 8;
-        if (pktquads > 0) {
-            pktbuf = (u128 *)cmd_data->pktbuf;
-            while (pktquads--) {
-                packet[i] = pktbuf[i];
-                i++;
-            }
-        }
-
-        header = (SifCmdHeader_t *)packet;
-        id = header->cid & ~SIF_CMD_ID_SYSTEM;
-
-        if (header->cid & SIF_CMD_ID_SYSTEM) {
-            cmd_handlers = ((u32)id < cmd_data->nr_sys_handlers) ? cmd_data->sys_cmd_handlers : NULL;
-        } else {
-            cmd_handlers = ((u32)id < cmd_data->nr_usr_handlers) ? cmd_data->usr_cmd_handlers : NULL;
-        }
-
-        if (cmd_handlers != NULL && cmd_handlers[id].handler != NULL)
-            cmd_handlers[id].handler(packet, cmd_handlers[id].harg);
-    }
-
-    if (g_nmFrameBufferStatus != NULL) {
-        struct NetManBD *bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
-        struct NetManBD *bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-        if (bdRd->length > 0 || bdNext->length > 0 || size == 0) {
-            if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
-                g_nmIsProcessingRx = 1;
-                iWakeupThread(g_nmRxThreadID);
-            }
-        }
-    }
-
-    pfsnetPollWaitSlotsInIsr();
-
-    if ((_lw(0x1000c000) & 0x100) == 0)
-        iSifSetDChain();
-
-    ExitHandler();
-    return 0;
-}
-
-static s32 pfsnetHwTickIsr(s32 cause)
+static s32 pfsnetNetManHandleRxEvent(s32 channel)
 {
     struct NetManBD *bdRd;
     struct NetManBD *bdNext;
+    int dchainStopped;
 
-    DI();
+    (void)channel;
 
-    if (cause == INTC_TIM1)
-        *T1_MODE = (*T1_MODE) | (1 << 10) | (1 << 11);
-
-    /*
-     * 仅当 DMAC_SIF0_CHCR.STR 为 0、D_STAT 中无挂起的 DMAC_SIF0 中断 (bit 5)、
-     * 且 pktbuf 中无未读 SIFCMD 包持续满 20ms 时才兜底调用 iSifSetDChain()，
-     * 绝不在 DMAC_SIF0 中断尚未被 CPU 响应前抢先重装 DChain。
-     */
-    if ((_lw(0x1000c000) & 0x100) == 0 &&
-        (_lw(0x1000e010) & 0x20) == 0 &&
-        (_sif_cmd_data.pktbuf == NULL || ((SifCmdHeader_t *)_sif_cmd_data.pktbuf)->psize == 0)) {
-        if (++g_sif0StallTicks >= 20) {
-            g_sif0StallTicks = 0;
-            iSifSetDChain();
-        }
-    } else {
-        g_sif0StallTicks = 0;
-    }
+    dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
+    if (dchainStopped)
+        iSifSetDChain();
 
     if (g_nmFrameBufferStatus != NULL) {
         bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
         bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-        if (bdRd->length > 0 || bdNext->length > 0) {
+        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
             if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
                 g_nmIsProcessingRx = 1;
                 iWakeupThread(g_nmRxThreadID);
@@ -608,56 +364,18 @@ static s32 pfsnetHwTickIsr(s32 cause)
         }
     }
 
-    pfsnetPollWaitSlotsInIsr();
     ExitHandler();
     return 0;
-}
-
-static void pfsnetEnsureHwTickInstalled(void)
-{
-    int old;
-
-    if (g_hwTickVblankId >= 0 && g_hwTickTim1Id >= 0 && g_hwTickTim2Id >= 0)
-        return;
-
-    StartTimerSystemTime();
-
-    old = DIntr();
-    if (g_hwTickVblankId < 0) {
-        g_hwTickVblankId = AddIntcHandler(INTC_VBLANK_S, &pfsnetHwTickIsr, -1);
-        if (g_hwTickVblankId >= 0)
-            EnableIntc(INTC_VBLANK_S);
-    }
-    if (g_hwTickTim1Id < 0) {
-        /*
-         * 启用硬件 TIM1 1000Hz (1.000ms) 周期比较中断：
-         * CLKS=2 (BUSCLK/256 = 576kHz), COMP=576 (1.000ms), ZRET=1 (硬件自动归零),
-         * CUE=1, CMPE=1。完全由硬件自动重装载，无需软件动态改写 COMP，彻底消除
-         * SetTimerAlarm/SetNextComp 竞态，同时提供 1ms 级 lwIP TCP 定时器精度。
-         */
-        *T1_MODE = Tn_MODE(0, 0, 0, 0, 0, 0, 0, 0, 1, 1);
-        *T1_COUNT = 0;
-        *T1_COMP = 576;
-        g_hwTickTim1Id = AddIntcHandler(INTC_TIM1, &pfsnetHwTickIsr, -1);
-        if (g_hwTickTim1Id >= 0) {
-            *T1_MODE = Tn_MODE(2, 0, 0, 0, 1, 1, 1, 0, 1, 1);
-            EnableIntc(INTC_TIM1);
-        }
-    }
-    if (g_hwTickTim2Id < 0) {
-        g_hwTickTim2Id = AddIntcHandler(INTC_TIM2, &pfsnetHwTickIsr, -1);
-        if (g_hwTickTim2Id >= 0)
-            EnableIntc(INTC_TIM2);
-    }
-    if (old)
-        EIntr();
 }
 
 static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
 {
     u32 ihl, totLen, tcpOff, doff, dataOff, dataLen;
     u16 dstPort;
+    u8 flags;
 
+    if (!pfsnetFsIsTransferActive())
+        return;
     if (frame == NULL || len < 54u)
         return;
     if (frame[12] != 0x08u || frame[13] != 0x00u)
@@ -677,13 +395,19 @@ static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
 
     tcpOff = 14u + ihl;
     dstPort = (u16)(((u16)frame[tcpOff + 2u] << 8) | (u16)frame[tcpOff + 3u]);
+    flags = frame[tcpOff + 13u];
 
-    /*
-     * 仅检查发往控制口 45061 的 PfsNet 控制帧：
-     * 切勿对源端口 45062 的 TCP RST 无条件触发中断，否则上一次已关闭的数据口残余 FIN
-     * 触发对端内核回发的旧连接 RST 会误杀新建立的重试/续传数据连接。
-     */
+    if (dstPort == PFSNET_DATA_PORT) {
+        if ((flags & 0x04u) != 0)
+            pfsnetFsAbortActiveTransfer(0);
+        return;
+    }
+
     if (dstPort == PFSNET_COMMAND_PORT) {
+        if ((flags & 0x05u) != 0) {
+            pfsnetFsAbortActiveTransfer(0);
+            return;
+        }
         doff = (u32)(frame[tcpOff + 12u] >> 4) * 4u;
         if (doff < 20u || len < tcpOff + doff + PFSNET_HEADER_SIZE)
             return;
@@ -698,20 +422,8 @@ static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
                 | ((u32)frame[dataOff + 5u] << 8)
                 | ((u32)frame[dataOff + 6u] << 16)
                 | ((u32)frame[dataOff + 7u] << 24);
-            u32 res = (u32)frame[dataOff + 8u]
-                | ((u32)frame[dataOff + 9u] << 8)
-                | ((u32)frame[dataOff + 10u] << 16)
-                | ((u32)frame[dataOff + 11u] << 24);
-            if (res != 0u)
-                return;
-            if ((cmd == PFSNET_CMD_PUT_ABORT || cmd == PFSNET_CMD_GET_ABORT) &&
-                payLen == 0u && dataLen == PFSNET_HEADER_SIZE) {
+            if ((cmd == PFSNET_CMD_PUT_ABORT || cmd == PFSNET_CMD_GET_ABORT) && payLen == 0u)
                 pfsnetFsAbortActiveTransfer(1);
-            } else if (cmd == PFSNET_CMD_PING &&
-                       payLen == 0u && dataLen == PFSNET_HEADER_SIZE) {
-                /* 数据连接异常断开后客户端先发 PING 探活准备断点续传，立即唤醒旧阻塞数据口并保留临时文件 */
-                pfsnetFsAbortActiveTransfer(0);
-            }
         }
     }
 }
@@ -749,6 +461,8 @@ static void pfsnetNetManRxThread(void *arg)
 
         do {
             DI();
+            if ((_lw(0x1000c000) & 0x100) == 0)
+                iSifSetDChain();
             PacketLength = bd->length;
             if (PacketLength > 0) {
                 run = 1;
@@ -809,10 +523,8 @@ static void *pfsnetNetManEERpcHandler(int fnum, void *buffer, int NumBytes)
 
                 if ((g_nmRxThreadID = CreateThread(&thread)) >= 0) {
                     StartThread(g_nmRxThreadID, NULL);
-                    /* DMAC_SIF0 统一由 __wrap__SifCmdIntHandler 在关中断下处理，避免双 handler 重装 DChain 竞态 */
-                    g_nmSifHandlerID = -1;
-                    if ((_lw(0x1000c000) & 0x100) == 0)
-                        SifSetDChain();
+                    /* next = -1：挂在 _SifCmdIntHandler 之后，确保 SIF0 DChain 绝不漏开 */
+                    g_nmSifHandlerID = AddDmacHandler(DMAC_SIF0, &pfsnetNetManHandleRxEvent, -1);
                     EnableDmac(DMAC_SIF0);
                     ((struct NetManEEInitResult *)buffer)->result = 0;
                     ((struct NetManEEInitResult *)buffer)->FrameBufferStatus = g_nmFrameBufferStatus;
@@ -966,6 +678,102 @@ static void freeMsg(pfsnet_arch_message_t *msg)
     SignalSema(g_msgCountSema);
 }
 
+/*
+ * 单一常驻周期硬件定时器 + VBlank 兜底（零运行时 SetTimerAlarm / ReleaseTimerAlarm）：
+ *
+ * PS2SDK ee/kernel/src/timer.c 的 SetNextComp 存在 `*T2_MODE & ~(1 << 11)` 未屏蔽 bit 10 (EQUF)
+ * 的硬件竞态：当线程态高频调用 SetTimerAlarm / ReleaseTimerAlarm（数百万次/GB）时，若在 DIntr()
+ * 临界区内恰好发生 T2_COUNT == T2_COMP，SetNextComp 会把 bit 10 写 1 清零，导致 TimerHandler_callback
+ * 漏处理到期闹钟；且 iFreeTimerCounter 摘除链表头节点时未重算 T2_COMP。
+ *
+ * 解决方案：仅在启动时注册唯一一个返回 MSec2TimerBusClock(1) 自续期的常驻闹钟，运行期任何线程（含
+ * waitSemaTimeoutMs 与 DelayThread）均不再调用 SetTimerAlarm / ReleaseTimerAlarm。
+ * 同时 waitSemaTimeoutMs 严格以 WaitSema(sema) 的返回值 (ret == sema) 判定是否消费了信号量令牌，
+ * 杜绝 SignalSema 与超时同窗发生时误判超时导致信号量令牌丢失。
+ */
+typedef struct pfsnet_wait_slot {
+    volatile s32 tid;
+    volatile u64 deadlineTicks;
+    volatile int active;
+} pfsnet_wait_slot_t;
+
+#define PFSNET_WAIT_SLOTS 12
+static pfsnet_wait_slot_t g_waitSlots[PFSNET_WAIT_SLOTS];
+static volatile int g_timerInited;
+static s32 g_vblankHandlerId = -1;
+
+static void pfsnetCheckWaitSlotsIsr(void)
+{
+    u64 nowTicks = iGetTimerSystemTime();
+    int i;
+
+    for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
+        if (g_waitSlots[i].active && nowTicks >= g_waitSlots[i].deadlineTicks) {
+            s32 tid = g_waitSlots[i].tid;
+            if (tid >= 0 && iReleaseWaitThread(tid) >= 0)
+                g_waitSlots[i].active = 0;
+        }
+    }
+}
+
+static u64 pfsnetTimerTickAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
+{
+    (void)id;
+    (void)scheduled_time;
+    (void)actual_time;
+    (void)arg;
+    (void)pc_value;
+
+    pfsnetCheckWaitSlotsIsr();
+    return MSec2TimerBusClock(1);
+}
+
+static s32 pfsnetVblankBackupIsr(s32 cause)
+{
+    (void)cause;
+    pfsnetCheckWaitSlotsIsr();
+    ExitHandler();
+    return 0;
+}
+
+static void pfsnetEnsureTimerInit(void)
+{
+    int i;
+    if (g_timerInited)
+        return;
+
+    StartTimerSystemTime();
+    for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
+        g_waitSlots[i].tid = -1;
+        g_waitSlots[i].deadlineTicks = 0;
+        g_waitSlots[i].active = 0;
+    }
+    g_timerInited = 1;
+
+    SetTimerAlarm(MSec2TimerBusClock(1), &pfsnetTimerTickAlarmCb, NULL);
+    if (g_vblankHandlerId < 0) {
+        g_vblankHandlerId = AddIntcHandler(INTC_VBLANK_S, &pfsnetVblankBackupIsr, 0);
+        if (g_vblankHandlerId >= 0)
+            EnableIntc(INTC_VBLANK_S);
+    }
+}
+
+#define PFSNET_MBOX_WAIT_SLOTS 8
+static volatile int g_mboxWaitTids[PFSNET_MBOX_WAIT_SLOTS] = {
+    -1, -1, -1, -1, -1, -1, -1, -1
+};
+
+int pfsnetShouldAbortMbox(int tid)
+{
+    if (tid < 0)
+        return 0;
+    if (pfsnetFsShouldAbortIoTid(tid))
+        return 1;
+    if (pfsnetServerShouldAbortClientTid(tid))
+        return 1;
+    return 0;
+}
+
 static int pfsnetEnterMboxWait(int tid)
 {
     int i;
@@ -1016,114 +824,140 @@ void pfsnetWakeMboxWaiter(int tid)
         ReleaseWaitThread(tid);
 }
 
-static int pfsnetAllocWaitSlot(s32 tid, u64 deadline)
+static int waitSemaTimeoutClocks(int sema, u64 clocks)
 {
+    s32 tid;
+    int slot = -1;
     int i;
-    int old = DIntr();
+    int ret;
+    int old;
+    u64 deadline;
+
+    if (PollSema(sema) == sema)
+        return sema;
+    if (clocks == 0)
+        return -1;
+
+    pfsnetEnsureTimerInit();
+    if (clocks < 0x4000ull)
+        clocks = 0x4000ull;
+
+    tid = GetThreadId();
+    deadline = GetTimerSystemTime() + clocks;
+
+    old = DIntr();
     for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
         if (!g_waitSlots[i].active) {
+            slot = i;
             g_waitSlots[i].tid = tid;
-            g_waitSlots[i].deadline = deadline;
+            g_waitSlots[i].deadlineTicks = deadline;
             g_waitSlots[i].active = 1;
-            if (old)
-                EIntr();
-            return i;
+            break;
         }
     }
     if (old)
         EIntr();
-    return -1;
-}
 
-static void pfsnetFreeWaitSlot(int slot)
-{
-    int old;
-    if (slot < 0 || slot >= PFSNET_WAIT_SLOTS)
-        return;
+    if (slot < 0)
+        return (WaitSema(sema) == sema) ? sema : -1;
+
+    ret = WaitSema(sema);
+
     old = DIntr();
     g_waitSlots[slot].active = 0;
     g_waitSlots[slot].tid = -1;
     if (old)
         EIntr();
-}
 
-/*
- * 完全接管 DelayThread 与 waitSemaTimeoutMs：
- * 1. 彻底绕开 PS2SDK timer.c 的 SetTimerAlarm / ReleaseTimerAlarm；
- * 2. 短延迟 (<= 2000us，如 pfsnetNetManRxThread 的 DelayThread(200)) 直接在开中断下
- *    轮询 64 位硬件总线时钟，既保证精确的 200us 延迟（防止拉长至 16ms 导致 SMAP 16KiB RX FIFO 溢出），
- *    又完全不触碰线程的 SleepThread/iWakeupThread 状态机（避免与 g_nmIsProcessingRx 冲突）；
- * 3. 长延迟 (> 2000us) 走专用信号量 + waitSemaTimeoutMs（由 1ms 硬件 TIM1 + VBLANK + TIM2 + SIF0 唤醒）。
- */
-s32 __wrap_DelayThread(s32 usec)
-{
-    u64 clocks;
-    u64 start;
-
-    if (usec <= 0)
-        return 0;
-
-    pfsnetEnsureHwTickInstalled();
-
-    if (usec <= 2000) {
-        clocks = ((u64)(u32)usec * ((u64)kBUSCLK / 1000ULL)) / 1000ULL;
-        start = GetTimerSystemTime();
-        while ((GetTimerSystemTime() - start) < clocks) {
-        }
-        return 0;
-    }
-
-    if (g_delaySema < 0) {
-        ee_sema_t sem;
-        memset(&sem, 0, sizeof(sem));
-        sem.init_count = 0;
-        sem.max_count = 1;
-        g_delaySema = CreateSema(&sem);
-    }
-    if (g_delaySema >= 0) {
-        unsigned int msec = ((unsigned int)usec + 999u) / 1000u;
-        waitSemaTimeoutMs(g_delaySema, msec);
-        return 0;
-    }
-
-    clocks = ((u64)(u32)usec * ((u64)kBUSCLK / 1000ULL)) / 1000ULL;
-    start = GetTimerSystemTime();
-    while ((GetTimerSystemTime() - start) < clocks) {
-    }
-    return 0;
+    return (ret == sema) ? sema : -1;
 }
 
 static int waitSemaTimeoutMs(int sema, unsigned int msec)
 {
-    int slot;
-    int ret;
-    u64 clocks;
-    u64 deadline;
-
     if (PollSema(sema) == sema)
         return sema;
     if (msec == 0)
         return -1;
     if (msec == UINT32_MAX)
         return (WaitSema(sema) == sema) ? sema : -1;
+    return waitSemaTimeoutClocks(sema, MSec2TimerBusClock(msec));
+}
 
-    pfsnetEnsureHwTickInstalled();
+/*
+ * 接管 DelayThread：使用每线程专属信号量 + 常驻定时器槽位等待，
+ * 避免 padWatchThread (DelayThread(250000)) 与 pfsnetNetManRxThread (DelayThread(200))
+ * 在运行期调用内核 SetTimerAlarm 触发 T2_MODE EQUF 竞态。
+ */
+#define PFSNET_DELAY_SEM_SLOTS 16
+static volatile s32 g_delaySemTids[PFSNET_DELAY_SEM_SLOTS];
+static s32 g_delaySems[PFSNET_DELAY_SEM_SLOTS];
+static int g_delaySemsInited;
 
-    clocks = MSec2TimerBusClock(msec);
-    if (clocks < 0x4000)
-        clocks = 0x4000;
+static s32 getDelaySemaForThread(s32 tid)
+{
+    int i;
+    int slot = -1;
+    int old = DIntr();
 
-    deadline = GetTimerSystemTime() + clocks;
-    slot = pfsnetAllocWaitSlot(GetThreadId(), deadline);
+    if (!g_delaySemsInited) {
+        for (i = 0; i < PFSNET_DELAY_SEM_SLOTS; i++) {
+            g_delaySemTids[i] = -1;
+            g_delaySems[i] = -1;
+        }
+        g_delaySemsInited = 1;
+    }
+    for (i = 0; i < PFSNET_DELAY_SEM_SLOTS; i++) {
+        if (g_delaySemTids[i] == tid && g_delaySems[i] >= 0) {
+            if (old)
+                EIntr();
+            return g_delaySems[i];
+        }
+        if (slot < 0 && g_delaySemTids[i] < 0)
+            slot = i;
+    }
+    if (slot >= 0)
+        g_delaySemTids[slot] = tid;
+    if (old)
+        EIntr();
+
     if (slot < 0)
-        return (WaitSema(sema) == sema) ? sema : -1;
+        return -1;
+    if (g_delaySems[slot] < 0) {
+        ee_sema_t sem;
+        memset(&sem, 0, sizeof(sem));
+        sem.init_count = 0;
+        sem.max_count = 1;
+        g_delaySems[slot] = CreateSema(&sem);
+        if (g_delaySems[slot] < 0) {
+            g_delaySemTids[slot] = -1;
+            return -1;
+        }
+    }
+    return g_delaySems[slot];
+}
 
-    if ((s64)(GetTimerSystemTime() - deadline) < 0)
-        ret = WaitSema(sema);
-    else
-        ret = PollSema(sema);
-    pfsnetFreeWaitSlot(slot);
-    return (ret == sema) ? sema : -1;
+s32 __wrap_DelayThread(s32 usec)
+{
+    s32 tid;
+    s32 sem;
+    u64 clocks;
+
+    if (usec <= 0)
+        return 0;
+    tid = GetThreadId();
+    sem = getDelaySemaForThread(tid);
+    if (sem < 0) {
+        u64 start = GetTimerSystemTime();
+        clocks = USec2TimerBusClock((u32)usec);
+        while ((GetTimerSystemTime() - start) < clocks)
+            nopdelay();
+        return 0;
+    }
+    while (PollSema(sem) == sem) {
+    }
+    clocks = USec2TimerBusClock((u32)usec);
+    waitSemaTimeoutClocks(sem, clocks);
+    return 0;
 }
 
 static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **message)
@@ -1152,9 +986,6 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox,
 
     if (pMBox == NULL || (mBox = *pMBox) == NULL)
         return -1;
-    tid = GetThreadId();
-    if (pfsnetShouldAbortMbox(tid))
-        return -1;
     sema = mBox->MessageCountSema;
 
     if (PollSema(sema) == sema) {
@@ -1165,15 +996,19 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox,
         return -1;
     }
 
-    slot = pfsnetEnterMboxWait(tid);
-    if (pfsnetShouldAbortMbox(tid)) {
-        pfsnetLeaveMboxWait(slot);
+    tid = GetThreadId();
+    if (pfsnetShouldAbortMbox(tid))
         return -1;
-    }
-    if (timeout > 0)
+
+    slot = pfsnetEnterMboxWait(tid);
+    if (timeout > 0) {
         result = waitSemaTimeoutMs(sema, timeout);
-    else
+    } else if (pfsnetFsIsIoTid(tid)) {
+        /* 数据口收发线程：若因无线闪断/网线拔出超过 15 秒无任何报文，自动超时退出以便主控重连续传 */
+        result = waitSemaTimeoutMs(sema, 15000u);
+    } else {
         result = WaitSema(sema);
+    }
     pfsnetLeaveMboxWait(slot);
 
     if (result == sema && *pMBox == mBox) {
@@ -1219,7 +1054,7 @@ void __wrap_sys_init(void)
     unsigned int i;
     ee_sema_t sema;
 
-    pfsnetEnsureHwTickInstalled();
+    pfsnetEnsureTimerInit();
 
     sema.attr = 0;
     sema.option = (u32)"PS2IP";
@@ -1356,18 +1191,6 @@ u32 __wrap_sys_arch_sem_wait(pfsnet_sys_sem_t *sema, u32 timeout)
 
 #define ETH_TCPIP_PRIO 0x58 /* lwIP tcpip 线程，见 PS2SDK lwipopts.h */
 
-/*
- * 等链路/DHCP 时必须真正让出 CPU，否则主线程（通常优先级 0）会饿死
- * 优先级 0x58 的 tcpip/DHCP 定时器（362053534 ps2sdk lwipopts.h）。
- *
- * 362053534 OPL ethsupport.c 用 SetAlarm+WaitSema，但 OPL 会打内核补丁。
- * 本 ELF 使用 KERNEL_NOPATCH / DISABLE_PATCHED_FUNCTIONS()，InitAlarm()
- * 是空函数，H-SYNC SetAlarm 回调永不触发，WaitSema 会永久卡死。
- *
- * 因此等待走 362053534 ps2sdk 的 DelayThread（硬件 SetTimerAlarm），
- * 阻塞主线程同时允许 tcpip 运行。若 DelayThread 失败，把本线程降到
- * tcpip 之下再忙等。
- */
 static void sleepMs(unsigned int msec)
 {
     int tid;
@@ -1378,7 +1201,7 @@ static void sleepMs(unsigned int msec)
 
     if (msec == 0)
         return;
-    if (DelayThread((s32)msec * 1000) == 0)
+    if (__wrap_DelayThread((s32)msec * 1000) == 0)
         return;
 
     tid = GetThreadId();
@@ -1387,7 +1210,6 @@ static void sleepMs(unsigned int msec)
     if (ReferThreadStatus(tid, &status) >= 0 && status.current_priority > 0)
         oldPrio = status.current_priority;
 
-    /* 降到 tcpip 之下，否则主线程空转仍会饿死 DHCP */
     ChangeThreadPriority(tid, ETH_TCPIP_PRIO + 8);
 
     start = GetTimerSystemTime();
@@ -1517,7 +1339,7 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
     const struct ip4_addr *initGw = gw;
     int r;
 
-    StartTimerSystemTime();
+    pfsnetEnsureTimerInit();
 
     /* 与 HDL/OPL 一致：链路模式失败不在此中止（否则永远到不了 ps2ipInit） */
     ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO);
