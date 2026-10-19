@@ -156,6 +156,13 @@ void pfsnetFsAbortActiveSocket(void)
     }
 }
 
+void pfsnetFsClientCleanup(void)
+{
+    abortXferCleanup();
+    if (g_mounted)
+        fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
+}
+
 void pfsnetFsForceUmount(void)
 {
     abortXferCleanup();
@@ -769,9 +776,9 @@ static void tuneDataSocket(int sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
-    /* 数据口空闲超时设为 30 秒，避免 PFS 元数据刷盘或寻道停顿时误超时；
-     * 取消传输或控制口断开时由 pfsnetCheckRxAbortFrame / pfsnetFsAbortActiveSocket 毫秒级唤醒。 */
-    tv.tv_sec = 30;
+    /* 数据口空闲超时设为 90 秒，兼容无线 WiFi 中继重关联/重协商及 PFS 大文件元数据刷盘停顿；
+     * 取消传输或异常终止时由 pfsnetCheckRxAbortFrame / pfsnetFsAbortActiveSocket 毫秒级唤醒。 */
+    tv.tv_sec = 90;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));

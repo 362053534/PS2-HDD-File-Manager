@@ -18,6 +18,7 @@ EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=SifSetDma \
 	-Wl,--wrap=SifSendCmd \
 	-Wl,--wrap=iSifSendCmd \
+	-Wl,--wrap=DelayThread \
 	-Wl,--wrap=NetManInitRPCServer \
 	-Wl,--wrap=NetManDeinitRPCServer \
 	-Wl,--wrap=NetManRPCAllocRxBuffers \

@@ -47,6 +47,7 @@ void ethGetIpDisplay(char *out, int outLen);
 int ethReadCurrentConfig(struct ip4_addr *ip, struct ip4_addr *nm, struct ip4_addr *gw);
 
 int pfsnetFsInit(void);
+void pfsnetFsClientCleanup(void);
 void pfsnetFsForceUmount(void);
 void pfsnetFsAbortActiveSocket(void);
 void pfsnetWakeMboxWaiter(int tid);

@@ -158,7 +158,10 @@ static void closeClient(struct PfsNetClient *client)
     if (fd >= 0)
         close(fd);
     client->verified = 0;
-    pfsnetFsForceUmount();
+    if (g_serverStop)
+        pfsnetFsForceUmount();
+    else
+        pfsnetFsClientCleanup();
 }
 
 static void clientThread(void *arg)
@@ -259,7 +262,7 @@ static void serverThread(void *arg)
             int waitTicks;
             g_clientStop = 1;
             pfsnetFsAbortActiveSocket();
-            for (waitTicks = 0; waitTicks < 300 && g_client.running; waitTicks++) {
+            for (waitTicks = 0; waitTicks < 600 && g_client.running; waitTicks++) {
                 if (g_client.threadId >= 0)
                     pfsnetWakeMboxWaiter(g_client.threadId);
                 DelayThread(50000);

@@ -470,7 +470,7 @@ internal sealed class PfsNetClient : IDisposable
 
                 try
                 {
-                    writeTimeoutCts.CancelAfter(TimeSpan.FromSeconds(60));
+                    writeTimeoutCts.CancelAfter(TimeSpan.FromSeconds(120));
                     await dataStream.WriteAsync(bufA.AsMemory(0, currentLen), ct).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (writeTimedOut && !ct.IsCancellationRequested)
@@ -503,7 +503,9 @@ internal sealed class PfsNetClient : IDisposable
         {
             try
             {
-                var abortTimeoutSec = ct.IsCancellationRequested ? 8 : 15;
+                // 非取消的异常中断时，PS2 需要删除可能已达数 GB 的临时文件并同步 PFS 日志（耗时可达 20-35 秒）；
+                // 取消传输时则仅等待 8 秒以保证界面快速响应。
+                var abortTimeoutSec = ct.IsCancellationRequested ? 8 : 45;
                 using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(abortTimeoutSec));
                 await SendSimpleAsync(PfsNetProtocol.CmdPutAbort, ReadOnlyMemory<byte>.Empty, abortCts.Token).ConfigureAwait(false);
             }
@@ -530,14 +532,14 @@ internal sealed class PfsNetClient : IDisposable
     private static bool IsTransientTransferException(Exception ex) =>
         ex is IOException or SocketException or TimeoutException;
 
-    private async Task TryReconnectAndRemountUnlockedAsync(CancellationToken ct, int maxAttempts = 5, int timeoutSeconds = 10)
+    private async Task TryReconnectAndRemountUnlockedAsync(CancellationToken ct, int maxAttempts = 8, int timeoutSeconds = 15)
     {
         if (IsConnected && _mountedPartition is not null)
         {
             try
             {
                 using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                pingCts.CancelAfter(TimeSpan.FromSeconds(Math.Min(5, timeoutSeconds)));
+                pingCts.CancelAfter(TimeSpan.FromSeconds(Math.Min(10, timeoutSeconds)));
                 await SendSimpleAsync(PfsNetProtocol.CmdPing, ReadOnlyMemory<byte>.Empty, pingCts.Token).ConfigureAwait(false);
                 return;
             }
@@ -568,7 +570,7 @@ internal sealed class PfsNetClient : IDisposable
                 try { DisconnectUnlocked(); } catch { }
                 if (attempt < maxAttempts)
                 {
-                    try { await Task.Delay(TimeSpan.FromMilliseconds(1500 * attempt), ct).ConfigureAwait(false); }
+                    try { await Task.Delay(TimeSpan.FromMilliseconds(2000 * attempt), ct).ConfigureAwait(false); }
                     catch { return; }
                 }
             }
@@ -580,10 +582,11 @@ internal sealed class PfsNetClient : IDisposable
         try { socket.NoDelay = true; } catch { }
         try
         {
+            // 兼容无线 WiFi 中继在高负载下的短时拥塞/重协商，避免激进 KeepAlive 误杀空闲控制连接
             socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 15);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 4);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 60);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 15);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
         }
         catch
         {
@@ -603,11 +606,12 @@ internal sealed class PfsNetClient : IDisposable
 
         try
         {
+            // 数据口 KeepAlive 放宽至 60s + 15s*10，防止 WiFi 中继抖动或 PFS 刷盘期间被 XNU 判定 EPIPE (Broken pipe)
             var socket = dataClient.Client;
             socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 10);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 3);
-            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 60);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 15);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 10);
         }
         catch { /* 忽略 */ }
     }

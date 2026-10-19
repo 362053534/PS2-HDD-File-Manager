@@ -291,23 +291,19 @@ typedef struct pfsnet_isif_retry {
 
 static pfsnet_isif_retry_t g_isifRetryPool[8];
 
-static u64 pfsnetISifRetryAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
-{
-    pfsnet_isif_retry_t *r = (pfsnet_isif_retry_t *)arg;
-    (void)id;
-    (void)scheduled_time;
-    (void)actual_time;
-    (void)pc_value;
+typedef struct pfsnet_wait_slot {
+    volatile s32 tid;
+    volatile u64 deadline;
+    volatile int isSleep;
+    volatile int active;
+} pfsnet_wait_slot_t;
 
-    if ((_lw(0x1000c000) & 0x100) == 0)
-        iSifSetDChain();
+#define PFSNET_WAIT_SLOTS 8
+static pfsnet_wait_slot_t g_waitSlots[PFSNET_WAIT_SLOTS];
+static int g_hwTickVblankId = -1;
+static int g_hwTickTim2Id = -1;
 
-    if (__real_iSifSendCmd(r->cmd, r->pkt, r->packet_size, r->src_extra, r->dest_extra, r->size_extra) != 0) {
-        r->active = 0;
-        return 0;
-    }
-    return 0x4000;
-}
+static void pfsnetEnsureHwTickInstalled(void);
 
 unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
                                 void *src_extra, void *dest_extra, int size_extra)
@@ -329,20 +325,16 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
         old = DIntr();
         for (i = 0; i < 8; i++) {
             if (!g_isifRetryPool[i].active) {
-                g_isifRetryPool[i].active = 1;
                 g_isifRetryPool[i].cmd = cmd;
                 memcpy(g_isifRetryPool[i].pkt, packet, (size_t)packet_size);
                 g_isifRetryPool[i].packet_size = packet_size;
                 g_isifRetryPool[i].src_extra = src_extra;
                 g_isifRetryPool[i].dest_extra = dest_extra;
                 g_isifRetryPool[i].size_extra = size_extra;
-                if (iSetTimerAlarm(0x4000, &pfsnetISifRetryAlarmCb, &g_isifRetryPool[i]) >= 0) {
-                    if (old)
-                        EIntr();
-                    return 1;
-                }
-                g_isifRetryPool[i].active = 0;
-                break;
+                g_isifRetryPool[i].active = 1;
+                if (old)
+                    EIntr();
+                return 1;
             }
         }
         if (old)
@@ -407,6 +399,91 @@ static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
     g_nmClearDmaRing[slot] = (int)id;
 }
 
+static void pfsnetPollWaitSlotsInIsr(void)
+{
+    u64 now;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        if (g_isifRetryPool[i].active) {
+            if (__real_iSifSendCmd(g_isifRetryPool[i].cmd,
+                                   g_isifRetryPool[i].pkt,
+                                   g_isifRetryPool[i].packet_size,
+                                   g_isifRetryPool[i].src_extra,
+                                   g_isifRetryPool[i].dest_extra,
+                                   g_isifRetryPool[i].size_extra) != 0) {
+                g_isifRetryPool[i].active = 0;
+            }
+        }
+    }
+
+    now = iGetTimerSystemTime();
+    for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
+        if (g_waitSlots[i].active && (s64)(now - g_waitSlots[i].deadline) >= 0) {
+            s32 tid = g_waitSlots[i].tid;
+            if (g_waitSlots[i].isSleep) {
+                if (iWakeupThread(tid) >= 0)
+                    g_waitSlots[i].active = 0;
+            } else {
+                if (iReleaseWaitThread(tid) >= 0)
+                    g_waitSlots[i].active = 0;
+            }
+        }
+    }
+}
+
+static s32 pfsnetHwTickIsr(s32 cause)
+{
+    struct NetManBD *bdRd;
+    struct NetManBD *bdNext;
+    int dchainStopped;
+
+    (void)cause;
+
+    dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
+    if (dchainStopped)
+        iSifSetDChain();
+
+    if (g_nmFrameBufferStatus != NULL) {
+        bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
+        bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
+        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
+            if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
+                g_nmIsProcessingRx = 1;
+                iWakeupThread(g_nmRxThreadID);
+            }
+        }
+    }
+
+    pfsnetPollWaitSlotsInIsr();
+    ExitHandler();
+    return 0;
+}
+
+static void pfsnetEnsureHwTickInstalled(void)
+{
+    int old;
+
+    if (g_hwTickVblankId >= 0 && g_hwTickTim2Id >= 0)
+        return;
+
+    StartTimerSystemTime();
+
+    old = DIntr();
+    if (g_hwTickVblankId < 0) {
+        g_hwTickVblankId = AddIntcHandler(INTC_VBLANK_S, &pfsnetHwTickIsr, -1);
+        if (g_hwTickVblankId >= 0)
+            EnableIntc(INTC_VBLANK_S);
+    }
+    if (g_hwTickTim2Id < 0) {
+        g_hwTickTim2Id = AddIntcHandler(INTC_TIM2, &pfsnetHwTickIsr, -1);
+        if (g_hwTickTim2Id >= 0)
+            EnableIntc(INTC_TIM2);
+    }
+    if (old)
+        EIntr();
+}
+
 static s32 pfsnetNetManHandleRxEvent(s32 channel)
 {
     struct NetManBD *bdRd;
@@ -430,6 +507,7 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
         }
     }
 
+    pfsnetPollWaitSlotsInIsr();
     ExitHandler();
     return 0;
 }
@@ -437,7 +515,7 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
 static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
 {
     u32 ihl, totLen, tcpOff, doff, dataOff, dataLen;
-    u16 dstPort;
+    u16 srcPort, dstPort;
     u8 flags;
 
     if (frame == NULL || len < 54u)
@@ -458,20 +536,18 @@ static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
         len = 14u + totLen;
 
     tcpOff = 14u + ihl;
+    srcPort = (u16)(((u16)frame[tcpOff] << 8) | (u16)frame[tcpOff + 1u]);
     dstPort = (u16)(((u16)frame[tcpOff + 2u] << 8) | (u16)frame[tcpOff + 3u]);
     flags = frame[tcpOff + 13u];
 
-    if (dstPort == PFSNET_DATA_PORT) {
+    /* 数据连接由 PS2 主动连向 PC 的 45062 端口，因此 PC 发来的 RST 报文源端口为 45062 */
+    if (srcPort == PFSNET_DATA_PORT || dstPort == PFSNET_DATA_PORT) {
         if ((flags & 0x04u) != 0)
             pfsnetFsAbortActiveSocket();
         return;
     }
 
     if (dstPort == PFSNET_COMMAND_PORT) {
-        if ((flags & 0x05u) != 0) {
-            pfsnetFsAbortActiveSocket();
-            return;
-        }
         doff = (u32)(frame[tcpOff + 12u] >> 4) * 4u;
         if (doff < 20u || len < tcpOff + doff + PFSNET_HEADER_SIZE)
             return;
@@ -742,12 +818,6 @@ static void freeMsg(pfsnet_arch_message_t *msg)
     SignalSema(g_msgCountSema);
 }
 
-typedef struct pfsnet_wait_sema_ctx {
-    s32 tid;
-    volatile int fired;
-    volatile int done;
-} pfsnet_wait_sema_ctx_t;
-
 #define PFSNET_MBOX_WAIT_SLOTS 8
 static volatile int g_mboxWaitTids[PFSNET_MBOX_WAIT_SLOTS] = {
     -1, -1, -1, -1, -1, -1, -1, -1
@@ -803,32 +873,84 @@ void pfsnetWakeMboxWaiter(int tid)
         ReleaseWaitThread(tid);
 }
 
-static u64 pfsnetWaitSemaAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
+static int pfsnetAllocWaitSlot(s32 tid, u64 deadline, int isSleep)
 {
-    pfsnet_wait_sema_ctx_t *ctx = (pfsnet_wait_sema_ctx_t *)arg;
-    (void)id;
-    (void)scheduled_time;
-    (void)actual_time;
-    (void)pc_value;
-
-    if (ctx == NULL || ctx->done) {
-        if (ctx != NULL)
-            ctx->fired = 1;
-        return 0;
+    int i;
+    int old = DIntr();
+    for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
+        if (!g_waitSlots[i].active) {
+            g_waitSlots[i].tid = tid;
+            g_waitSlots[i].deadline = deadline;
+            g_waitSlots[i].isSleep = isSleep;
+            g_waitSlots[i].active = 1;
+            if (old)
+                EIntr();
+            return i;
+        }
     }
-    if (iReleaseWaitThread(ctx->tid) < 0)
-        return 0x4000;
-    ctx->fired = 1;
+    if (old)
+        EIntr();
+    return -1;
+}
+
+static void pfsnetFreeWaitSlot(int slot)
+{
+    int old;
+    if (slot < 0 || slot >= PFSNET_WAIT_SLOTS)
+        return;
+    old = DIntr();
+    g_waitSlots[slot].active = 0;
+    g_waitSlots[slot].tid = -1;
+    if (old)
+        EIntr();
+}
+
+/*
+ * 完全接管 DelayThread 与 waitSemaTimeoutMs：
+ * 彻底绕开 PS2SDK timer.c 的 SetTimerAlarm / ReleaseTimerAlarm（其内部 SetNextComp 在
+ * CLOCKS_GAP=2 ticks 下清 EQUF 竞态，以及 iFreeTimerCounter 漏调 SetNextComp，在百万次调用后
+ * 会永久丢失 EQUF 中断导致 tcpip_thread / DelayThread 死锁）。
+ * 改为由纯硬件 INTC_VBLANK_S (60Hz/50Hz) + INTC_TIM2 溢出 + DMAC_SIF0 共同巡检 g_waitSlots[]。
+ */
+s32 __wrap_DelayThread(s32 usec)
+{
+    s32 tid;
+    u64 clocks;
+    u64 deadline;
+    int slot;
+
+    if (usec <= 0)
+        return 0;
+
+    pfsnetEnsureHwTickInstalled();
+
+    clocks = ((u64)(u32)usec * ((u64)kBUSCLK / 1000ULL)) / 1000ULL;
+    if (clocks < 0x1000ULL)
+        clocks = 0x1000ULL;
+
+    tid = GetThreadId();
+    deadline = GetTimerSystemTime() + clocks;
+    slot = pfsnetAllocWaitSlot(tid, deadline, 1);
+    if (slot < 0)
+        return 0;
+
+    while ((s64)(GetTimerSystemTime() - deadline) < 0) {
+        int old = DIntr();
+        if (!g_waitSlots[slot].active)
+            g_waitSlots[slot].active = 1;
+        if (old)
+            EIntr();
+        SleepThread();
+    }
+
+    pfsnetFreeWaitSlot(slot);
     return 0;
 }
 
 static int waitSemaTimeoutMs(int sema, unsigned int msec)
 {
-    pfsnet_wait_sema_ctx_t ctx;
-    s32 timerid;
+    int slot;
     int ret;
-    int old;
-    int alreadyFired;
     u64 clocks;
 
     if (PollSema(sema) == sema)
@@ -838,28 +960,18 @@ static int waitSemaTimeoutMs(int sema, unsigned int msec)
     if (msec == UINT32_MAX)
         return (WaitSema(sema) == sema) ? sema : -1;
 
+    pfsnetEnsureHwTickInstalled();
+
     clocks = MSec2TimerBusClock(msec);
     if (clocks < 0x4000)
         clocks = 0x4000;
 
-    ctx.tid = GetThreadId();
-    ctx.fired = 0;
-    ctx.done = 0;
-
-    timerid = SetTimerAlarm(clocks, &pfsnetWaitSemaAlarmCb, &ctx);
-    if (timerid < 0)
+    slot = pfsnetAllocWaitSlot(GetThreadId(), GetTimerSystemTime() + clocks, 0);
+    if (slot < 0)
         return (WaitSema(sema) == sema) ? sema : -1;
 
     ret = WaitSema(sema);
-
-    old = DIntr();
-    ctx.done = 1;
-    alreadyFired = ctx.fired;
-    if (old)
-        EIntr();
-
-    if (!alreadyFired)
-        ReleaseTimerAlarm(timerid);
+    pfsnetFreeWaitSlot(slot);
     return (ret == sema) ? sema : -1;
 }
 
@@ -947,6 +1059,8 @@ void __wrap_sys_init(void)
 {
     unsigned int i;
     ee_sema_t sema;
+
+    pfsnetEnsureHwTickInstalled();
 
     sema.attr = 0;
     sema.option = (u32)"PS2IP";
