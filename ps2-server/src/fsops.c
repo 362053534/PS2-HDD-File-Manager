@@ -67,6 +67,7 @@ static int g_putFreeSem = -1;
 static int g_putFillSem = -1;
 static volatile int g_putStop;
 static volatile int g_putUserAbort;
+static volatile int g_xferActive;
 static uint64_t g_putTotalBytes;
 static volatile int g_ioMode;
 static uint32_t g_tempSeq;
@@ -129,6 +130,7 @@ static void savePartialPut(uint64_t totalBytes, uint64_t gotBytes, uint32_t flag
 
 static void abortXferCleanup(void)
 {
+    g_xferActive = 0;
     g_putStop = 1;
     if (g_xfer.dataSock >= 0) {
         close(g_xfer.dataSock);
@@ -185,6 +187,11 @@ void pfsnetFsAbortActiveTransfer(int userAbort)
 {
     int wasStopped;
     int old = DIntr();
+    if (!g_xferActive) {
+        if (old)
+            EIntr();
+        return;
+    }
     if (userAbort)
         g_putUserAbort = 1;
     wasStopped = g_putStop;
@@ -794,7 +801,6 @@ static int initIoWorker(void)
         g_ioAsync = 0;
         return -1;
     }
-    pfsnetSetIoWorkerTid(g_ioTid);
     StartThread(g_ioTid, NULL);
     g_ioAsync = 1;
     return 0;
@@ -977,6 +983,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     g_xfer.dataSock = dataSock;
     g_putStop = 0;
     g_putUserAbort = 0;
+    g_xferActive = 1;
 
     /* 多槽环形缓冲（16x512KiB = 8MiB）：ioWorker 连续排空 TCP 窗口，clientThread 连续写盘 */
     g_lastPutErr = 0;
@@ -1118,6 +1125,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         }
     }
 
+    g_xferActive = 0;
     g_xfer.dataSock = -1;
     close(dataSock);
     fileXioClose(fd);
@@ -1258,6 +1266,7 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
     }
     g_xfer.dataSock = dataSock;
     g_putStop = 0;
+    g_xferActive = 1;
 
     /* 双缓冲：与 Put 对称——先启动上一块 send，再读下一块（重叠）。
      * 旧顺序「先读满再等 send」在读快于 TCP 时会让磁盘空等。 */
@@ -1333,6 +1342,7 @@ static int handleGetBegin(struct PfsNetClient *client, const uint8_t *payload, u
         (void)failed;
     }
 
+    g_xferActive = 0;
     fileXioClose(fd);
 
     if (sent != toSend) {

@@ -51,7 +51,6 @@ void pfsnetFsClientCleanup(void);
 void pfsnetFsForceUmount(void);
 void pfsnetFsAbortActiveSocket(void);
 void pfsnetFsAbortActiveTransfer(int userAbort);
-void pfsnetSetIoWorkerTid(int tid);
 void pfsnetWakeMboxWaiter(int tid);
 int pfsnetIsMounted(void);
 const char *pfsnetMountedPartition(void);
