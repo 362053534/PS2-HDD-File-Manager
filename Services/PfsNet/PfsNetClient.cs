@@ -321,9 +321,12 @@ internal sealed class PfsNetClient : IDisposable
             var totalBytes = (ulong)new FileInfo(localFilePath).Length;
 
             Exception? lastException = null;
-            for (var attempt = 1; attempt <= MaxPutAttempts; attempt++)
+            var consecutiveNoProgressFailures = 0;
+            const int MaxTotalAttempts = 32;
+            for (var attempt = 1; attempt <= MaxTotalAttempts; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
+                long attemptBytesAdvanced = 0;
                 try
                 {
                     if (!IsConnected || _mountedPartition is null)
@@ -337,15 +340,13 @@ internal sealed class PfsNetClient : IDisposable
                     EnsureMounted();
                     EnsureDataChannel();
 
-                    if (attempt > 1 && progress is not null)
-                        await progress(0).ConfigureAwait(false);
-
-                    await PutFileOneAttemptUnlockedAsync(
+                    attemptBytesAdvanced = await PutFileOneAttemptUnlockedAsync(
                         remoteDirectory,
                         remoteFileName,
                         localFilePath,
                         totalBytes,
                         overwrite,
+                        allowResume: attempt > 1,
                         ct,
                         progress).ConfigureAwait(false);
                     return;
@@ -359,16 +360,22 @@ internal sealed class PfsNetClient : IDisposable
                 catch (Exception ex) when (!ct.IsCancellationRequested && IsTransientTransferException(ex))
                 {
                     lastException = ex;
-                    await TryReconnectAndRemountUnlockedAsync(ct).ConfigureAwait(false);
+                    if (ex.Data["AttemptBytesAdvanced"] is long advanced && advanced >= 4 * 1024 * 1024)
+                        consecutiveNoProgressFailures = 0;
+                    else
+                        consecutiveNoProgressFailures++;
+
+                    await TryReconnectAndRemountUnlockedAsync(ct, maxAttempts: 8, timeoutSeconds: 20).ConfigureAwait(false);
                     if (!IsConnected || _mountedPartition is null)
                     {
                         throw new IOException(
                             $"PfsNet 传输文件“{remoteFileName}”中断后无法重新连接 PS2（{_lastHost}）：{lastException.Message}",
                             lastException);
                     }
-                    if (attempt < MaxPutAttempts)
+                    if (consecutiveNoProgressFailures < MaxPutAttempts && attempt < MaxTotalAttempts)
                     {
-                        await Task.Delay(TimeSpan.FromMilliseconds(1500 * attempt), ct).ConfigureAwait(false);
+                        var delayMs = Math.Min(6000, 1500 * Math.Max(1, consecutiveNoProgressFailures));
+                        await Task.Delay(TimeSpan.FromMilliseconds(delayMs), ct).ConfigureAwait(false);
                         continue;
                     }
                 }
@@ -381,17 +388,29 @@ internal sealed class PfsNetClient : IDisposable
                 }
             }
 
+            try
+            {
+                using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                await SendSimpleAsync(PfsNetProtocol.CmdPutAbort, ReadOnlyMemory<byte>.Empty, abortCts.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                try { DisconnectUnlocked(); } catch { }
+                await TryReconnectAndRemountUnlockedAsync(CancellationToken.None, maxAttempts: 2, timeoutSeconds: 5).ConfigureAwait(false);
+            }
+
             throw new IOException(
                 $"PfsNet 传输文件“{remoteFileName}”中途数据连接断开（已自动重试 {MaxPutAttempts} 次仍失败）：{lastException?.Message}",
                 lastException);
         }, cancellationToken);
 
-    private async Task PutFileOneAttemptUnlockedAsync(
+    private async Task<long> PutFileOneAttemptUnlockedAsync(
         string remoteDirectory,
         string remoteFileName,
         string localFilePath,
         ulong totalBytes,
         bool overwrite,
+        bool allowResume,
         CancellationToken ct,
         Func<long, Task>? progress)
     {
@@ -399,9 +418,14 @@ internal sealed class PfsNetClient : IDisposable
         listener.Start();
         var acceptTask = AcceptDataAsync(listener, ct);
         var accepted = false;
+        long resumeOffset = 0;
         long sent = 0;
+        TcpClient? activeDataClient = null;
         try
         {
+            var putFlags = (overwrite ? PfsNetProtocol.PutFlagOverwrite : 0u)
+                | (allowResume ? PfsNetProtocol.PutFlagResume : 0u);
+
             // 先挂起 accept，再发 PUT_BEGIN，缩小 PS2 回连与 PC accept 之间的空窗
             using var ms = new MemoryStream();
             using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
@@ -409,12 +433,22 @@ internal sealed class PfsNetClient : IDisposable
                 PfsNetCodec.WriteString(writer, NormalizePath(remoteDirectory));
                 PfsNetCodec.WriteString(writer, remoteFileName);
                 writer.Write(totalBytes);
-                writer.Write(overwrite ? 1u : 0u);
+                writer.Write(putFlags);
             }
 
-            await SendSimpleAsync(PfsNetProtocol.CmdPutBegin, ms.ToArray(), ct).ConfigureAwait(false);
+            var beginResp = await SendAsync(PfsNetProtocol.CmdPutBegin, ms.ToArray(), ct).ConfigureAwait(false);
+            if (allowResume && beginResp.Length >= 8)
+            {
+                var resumedU64 = BinaryPrimitives.ReadUInt64LittleEndian(beginResp.AsSpan(0, 8));
+                if (resumedU64 <= totalBytes)
+                    resumeOffset = (long)resumedU64;
+            }
+            sent = resumeOffset;
+            if (progress is not null)
+                await progress(sent).ConfigureAwait(false);
 
             using var dataClient = await acceptTask.ConfigureAwait(false);
+            activeDataClient = dataClient;
             accepted = true;
             // 取消时立刻设 LingerState(true, 0) 发送 RST 并关闭数据口，丢弃内核发缓冲中未发完的字节，
             // 让 PS2 侧 ioWorker 立即从 recv() 退出并停止写盘。
@@ -433,16 +467,20 @@ internal sealed class PfsNetClient : IDisposable
                 FileShare.Read,
                 FileBufferSize,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
+            if (resumeOffset > 0)
+                file.Seek(resumeOffset, SeekOrigin.Begin);
+
             var bufA = new byte[FileBufferSize];
             var bufB = new byte[FileBufferSize];
-            var initialToRead = (int)Math.Min(bufA.Length, (long)totalBytes);
+            var remainingTotal = (long)totalBytes - resumeOffset;
+            var initialToRead = (int)Math.Min(bufA.Length, remainingTotal);
             var currentLen = initialToRead > 0
                 ? await file.ReadAsync(bufA.AsMemory(0, initialToRead), ct).ConfigureAwait(false)
                 : 0;
             if (initialToRead > 0 && currentLen <= 0)
                 throw new IOException("本地文件读取提前结束。");
 
-            long scheduledRead = currentLen;
+            long scheduledRead = resumeOffset + currentLen;
             var writeTimedOut = false;
             using var writeTimeoutCts = new CancellationTokenSource();
             using var writeTimeoutClose = writeTimeoutCts.Token.Register(() =>
@@ -498,20 +536,31 @@ internal sealed class PfsNetClient : IDisposable
             try { dataClient.Client.Shutdown(SocketShutdown.Send); } catch { }
             dataClient.Close();
             await SendSimpleAsync(PfsNetProtocol.CmdPutEnd, ReadOnlyMemory<byte>.Empty, ct).ConfigureAwait(false);
+            return sent - resumeOffset;
         }
         catch (Exception ex)
         {
-            try
+            ex.Data["AttemptBytesAdvanced"] = Math.Max(0L, sent - resumeOffset);
+            if (activeDataClient is not null)
             {
-                // 非取消的异常中断时，PS2 需要删除可能已达数 GB 的临时文件并同步 PFS 日志（耗时可达 20-35 秒）；
-                // 取消传输时则仅等待 8 秒以保证界面快速响应。
-                var abortTimeoutSec = ct.IsCancellationRequested ? 8 : 45;
-                using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(abortTimeoutSec));
-                await SendSimpleAsync(PfsNetProtocol.CmdPutAbort, ReadOnlyMemory<byte>.Empty, abortCts.Token).ConfigureAwait(false);
+                try { activeDataClient.Client.LingerState = new LingerOption(true, 0); } catch { }
+                try { activeDataClient.Close(); } catch { }
             }
-            catch
+
+            // 仅在用户主动取消或非瞬时网络异常时发送 PUT_ABORT 删除临时文件；
+            // 若为瞬时网络中断，保留 PS2 端已落盘临时文件供下一次重试断点续传。
+            if (ct.IsCancellationRequested || !IsTransientTransferException(ex))
             {
-                try { DisconnectUnlocked(); } catch { /* 尽力恢复 */ }
+                try
+                {
+                    var abortTimeoutSec = ct.IsCancellationRequested ? 8 : 45;
+                    using var abortCts = new CancellationTokenSource(TimeSpan.FromSeconds(abortTimeoutSec));
+                    await SendSimpleAsync(PfsNetProtocol.CmdPutAbort, ReadOnlyMemory<byte>.Empty, abortCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    try { DisconnectUnlocked(); } catch { /* 尽力恢复 */ }
+                }
             }
 
             if (ct.IsCancellationRequested)
@@ -539,7 +588,7 @@ internal sealed class PfsNetClient : IDisposable
             try
             {
                 using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                pingCts.CancelAfter(TimeSpan.FromSeconds(Math.Min(10, timeoutSeconds)));
+                pingCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
                 await SendSimpleAsync(PfsNetProtocol.CmdPing, ReadOnlyMemory<byte>.Empty, pingCts.Token).ConfigureAwait(false);
                 return;
             }

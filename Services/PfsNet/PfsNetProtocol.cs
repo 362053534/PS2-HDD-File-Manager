@@ -36,6 +36,9 @@ internal static class PfsNetProtocol
     public const uint CmdGetBegin = 0x0033;
     public const uint CmdGetEnd = 0x0034;
     public const uint CmdGetAbort = 0x0035;
+
+    public const uint PutFlagOverwrite = 1u << 0;
+    public const uint PutFlagResume = 1u << 1;
     public const uint CmdReadSectors = 0x0040;
     public const uint CmdApaCreatePfs = 0x0050;
     public const uint CmdApaRemove = 0x0051;

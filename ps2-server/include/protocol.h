@@ -17,6 +17,9 @@
 #define PFSNET_FEAT_APA_MUTATE (1u << 3)
 #define PFSNET_FEAT_STREAM_RING (1u << 4)
 
+#define PFSNET_PUT_OVERWRITE (1u << 0)
+#define PFSNET_PUT_RESUME (1u << 1)
+
 #define PFSNET_CMD_HELLO 0x0001u
 #define PFSNET_CMD_PING 0x0002u
 #define PFSNET_CMD_MOUNT 0x0003u

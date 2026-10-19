@@ -25,7 +25,6 @@
 #define PFSNET_XFER_BUF (512 * 1024)
 #define PFSNET_RING_MAX_BANKS 16 /* 16 * 512KiB = 8MiB EE 环形缓冲 */
 #define PFSNET_IO_STACK 0x2000
-#define PFSNET_PUT_OVERWRITE 1u
 
 #define PFSNET_IO_MODE_SINGLE 0
 #define PFSNET_IO_MODE_PUT_RING 1
@@ -48,6 +47,17 @@ static struct {
     char finalPath[768];
 } g_xfer;
 
+/* 网络闪断后保留的未完成 Put 临时文件状态，供自动重试时零损耗断点续传 */
+static struct {
+    int valid;
+    uint32_t flags;
+    uint64_t totalBytes;
+    uint64_t gotBytes;
+    char partition[APA_IDMAX];
+    char tempPath[768];
+    char finalPath[768];
+} g_partialPut;
+
 /* [0]/[1] 乒乓及多槽环形缓冲池：堆上分配，避免 BSS 拖慢 crt0 清零 / 撑大 ELF MemSiz */
 static uint8_t *g_xferBuf[2];
 static uint8_t *g_ringBase;
@@ -56,6 +66,7 @@ static volatile int g_ringBankLen[PFSNET_RING_MAX_BANKS];
 static int g_putFreeSem = -1;
 static int g_putFillSem = -1;
 static volatile int g_putStop;
+static volatile int g_putUserAbort;
 static uint64_t g_putTotalBytes;
 static volatile int g_ioMode;
 static uint32_t g_tempSeq;
@@ -82,6 +93,38 @@ static void clearXferState(void)
     g_xfer.totalBytes = 0;
     g_xfer.tempPath[0] = '\0';
     g_xfer.finalPath[0] = '\0';
+}
+
+static void clearPartialPut(void)
+{
+    if (g_partialPut.valid) {
+        if (g_partialPut.tempPath[0] != '\0') {
+            fileXioRemove(g_partialPut.tempPath);
+            if (g_mounted)
+                fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
+        }
+    }
+    g_partialPut.valid = 0;
+    g_partialPut.flags = 0;
+    g_partialPut.totalBytes = 0;
+    g_partialPut.gotBytes = 0;
+    g_partialPut.partition[0] = '\0';
+    g_partialPut.tempPath[0] = '\0';
+    g_partialPut.finalPath[0] = '\0';
+}
+
+static void savePartialPut(uint64_t totalBytes, uint64_t gotBytes, uint32_t flags)
+{
+    g_partialPut.valid = 1;
+    g_partialPut.flags = flags;
+    g_partialPut.totalBytes = totalBytes;
+    g_partialPut.gotBytes = gotBytes;
+    strncpy(g_partialPut.partition, g_mountedPartition, sizeof(g_partialPut.partition) - 1);
+    g_partialPut.partition[sizeof(g_partialPut.partition) - 1] = '\0';
+    strncpy(g_partialPut.tempPath, g_xfer.tempPath, sizeof(g_partialPut.tempPath) - 1);
+    g_partialPut.tempPath[sizeof(g_partialPut.tempPath) - 1] = '\0';
+    strncpy(g_partialPut.finalPath, g_xfer.finalPath, sizeof(g_partialPut.finalPath) - 1);
+    g_partialPut.finalPath[sizeof(g_partialPut.finalPath) - 1] = '\0';
 }
 
 static void abortXferCleanup(void)
@@ -113,6 +156,7 @@ int pfsnetFsInit(void)
     g_mountedPartition[0] = '\0';
     g_mountedTotalBytes = 0;
     clearXferState();
+    memset(&g_partialPut, 0, sizeof(g_partialPut));
 
     if (!g_ringBase) {
         static const int bankTry[] = { PFSNET_RING_MAX_BANKS, 8, 4, 2 };
@@ -137,10 +181,12 @@ int pfsnetFsInit(void)
     return 0;
 }
 
-void pfsnetFsAbortActiveSocket(void)
+void pfsnetFsAbortActiveTransfer(int userAbort)
 {
     int wasStopped;
     int old = DIntr();
+    if (userAbort)
+        g_putUserAbort = 1;
     wasStopped = g_putStop;
     g_putStop = 1;
     if (old)
@@ -156,6 +202,11 @@ void pfsnetFsAbortActiveSocket(void)
     }
 }
 
+void pfsnetFsAbortActiveSocket(void)
+{
+    pfsnetFsAbortActiveTransfer(0);
+}
+
 void pfsnetFsClientCleanup(void)
 {
     abortXferCleanup();
@@ -166,6 +217,7 @@ void pfsnetFsClientCleanup(void)
 void pfsnetFsForceUmount(void)
 {
     abortXferCleanup();
+    clearPartialPut();
     if (g_mounted) {
         fileXioUmount(PFSNET_MOUNT_POINT);
         g_mounted = 0;
@@ -282,6 +334,7 @@ static int doMount(const char *partition)
     if (g_mounted) {
         if (strcmp(g_mountedPartition, partition) == 0)
             return PFSNET_OK;
+        clearPartialPut();
         fileXioUmount(PFSNET_MOUNT_POINT);
         g_mounted = 0;
         g_mountedPartition[0] = '\0';
@@ -310,6 +363,7 @@ static int doUmount(void)
         return PFSNET_ERR_BUSY;
     if (!g_mounted)
         return PFSNET_OK;
+    clearPartialPut();
     fileXioUmount(PFSNET_MOUNT_POINT);
     g_mounted = 0;
     g_mountedPartition[0] = '\0';
@@ -740,6 +794,7 @@ static int initIoWorker(void)
         g_ioAsync = 0;
         return -1;
     }
+    pfsnetSetIoWorkerTid(g_ioTid);
     StartThread(g_ioTid, NULL);
     g_ioAsync = 1;
     return 0;
@@ -822,7 +877,8 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     uint64_t totalBytes = 0;
     uint32_t flags = 0;
     uint32_t off = 0, consumed = 0;
-    int rc, fd, dataSock;
+    int rc, fd = -1, dataSock;
+    int resumed = 0;
     uint64_t got = 0;
 
     if (!g_mounted)
@@ -849,19 +905,60 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     if (pathExists(g_xfer.finalPath) && (flags & PFSNET_PUT_OVERWRITE) == 0)
         return pfsnetSendResponse(client, PFSNET_ERR_EXIST, NULL, 0);
 
-    g_tempSeq++;
-    snprintf(tempName, sizeof(tempName), ".pfsnet_%08x", (unsigned)g_tempSeq);
-    joinPfsPath(g_xfer.tempPath, sizeof(g_xfer.tempPath), parent, tempName);
+    /*
+     * 断点续传：当无线中继/数据口闪断触发自动重试时，客户端携带 PFSNET_PUT_RESUME。
+     * 若 g_partialPut 记录的分区、目标路径、总字节数一致，且临时文件磁盘实际大小与
+     * gotBytes 严格吻合，则以 FIO_O_WRONLY | FIO_O_APPEND 直接打开继续追加，
+     * 既省去 15~30 秒删除数 GB 临时文件的开销，又避免从 0 重新传起。
+     */
+    if ((flags & PFSNET_PUT_RESUME) != 0 &&
+        g_partialPut.valid &&
+        strcmp(g_partialPut.partition, g_mountedPartition) == 0 &&
+        strcmp(g_partialPut.finalPath, g_xfer.finalPath) == 0 &&
+        g_partialPut.totalBytes == totalBytes &&
+        g_partialPut.gotBytes > 0 &&
+        g_partialPut.gotBytes < totalBytes) {
+        iox_stat_t st;
+        if (fileXioGetStat(g_partialPut.tempPath, &st) >= 0) {
+            uint64_t diskSize = (uint64_t)st.size | ((uint64_t)st.hisize << 32);
+            if (diskSize == g_partialPut.gotBytes) {
+                fd = fileXioOpen(g_partialPut.tempPath, FIO_O_WRONLY | FIO_O_APPEND, 0666);
+                if (fd >= 0) {
+                    strncpy(g_xfer.tempPath, g_partialPut.tempPath, sizeof(g_xfer.tempPath) - 1);
+                    g_xfer.tempPath[sizeof(g_xfer.tempPath) - 1] = '\0';
+                    got = diskSize;
+                    resumed = 1;
+                    g_partialPut.valid = 0;
+                    g_partialPut.tempPath[0] = '\0';
+                }
+            }
+        }
+    }
 
-    /* 必须用 FIO_O_*；newlib O_WRONLY(=1) 会被 IOP 当成 FIO_O_RDONLY */
-    fd = fileXioOpen(g_xfer.tempPath, FIO_O_WRONLY | FIO_O_CREAT | FIO_O_TRUNC, 0666);
-    if (fd < 0)
-        return pfsnetSendResponse(client, mapErrno(fd), NULL, 0);
+    if (!resumed) {
+        clearPartialPut();
+        g_tempSeq++;
+        snprintf(tempName, sizeof(tempName), ".pfsnet_%08x", (unsigned)g_tempSeq);
+        joinPfsPath(g_xfer.tempPath, sizeof(g_xfer.tempPath), parent, tempName);
 
-    /* 先回成功，再回连数据口（PROTOCOL §5.4） */
-    if (pfsnetSendResponse(client, PFSNET_OK, NULL, 0) < 0) {
+        /* 必须用 FIO_O_*；newlib O_WRONLY(=1) 会被 IOP 当成 FIO_O_RDONLY */
+        fd = fileXioOpen(g_xfer.tempPath, FIO_O_WRONLY | FIO_O_CREAT | FIO_O_TRUNC, 0666);
+        if (fd < 0)
+            return pfsnetSendResponse(client, mapErrno(fd), NULL, 0);
+    }
+
+    /* 先回成功（若请求带 PFSNET_PUT_RESUME 则返回 8 字节 uint64 续传起点偏移），再回连数据口（PROTOCOL §5.4） */
+    if ((flags & PFSNET_PUT_RESUME) != 0)
+        rc = pfsnetSendResponse(client, PFSNET_OK, &got, sizeof(got));
+    else
+        rc = pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
+    if (rc < 0) {
         fileXioClose(fd);
-        fileXioRemove(g_xfer.tempPath);
+        if (resumed && got > 0) {
+            savePartialPut(totalBytes, got, flags & ~PFSNET_PUT_RESUME);
+        } else {
+            fileXioRemove(g_xfer.tempPath);
+        }
         clearXferState();
         return -1;
     }
@@ -869,12 +966,17 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     dataSock = connectDataChannel(client);
     if (dataSock < 0) {
         fileXioClose(fd);
-        fileXioRemove(g_xfer.tempPath);
+        if (resumed && got > 0) {
+            savePartialPut(totalBytes, got, flags & ~PFSNET_PUT_RESUME);
+        } else {
+            fileXioRemove(g_xfer.tempPath);
+        }
         clearXferState();
         return 0;
     }
     g_xfer.dataSock = dataSock;
     g_putStop = 0;
+    g_putUserAbort = 0;
 
     /* 多槽环形缓冲（16x512KiB = 8MiB）：ioWorker 连续排空 TCP 窗口，clientThread 连续写盘 */
     g_lastPutErr = 0;
@@ -892,7 +994,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
             SignalSema(g_putFreeSem);
         }
 
-        g_putTotalBytes = totalBytes;
+        g_putTotalBytes = totalBytes - got;
         g_ioSock = dataSock;
         g_ioMode = PFSNET_IO_MODE_PUT_RING;
         SignalSema(g_ioSemStart);
@@ -1023,17 +1125,26 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     if (got != totalBytes) {
         if (g_lastPutErr == 0)
             g_lastPutErr = PFSNET_ERR_DATA_CONN;
-        fileXioRemove(g_xfer.tempPath);
-        if (g_mounted)
-            fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
+        if (!g_putUserAbort && got > 0 &&
+            (g_lastPutErr == 0 || g_lastPutErr == PFSNET_ERR_DATA_CONN)) {
+            if (g_mounted)
+                fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
+            savePartialPut(totalBytes, got, flags & ~PFSNET_PUT_RESUME);
+        } else {
+            fileXioRemove(g_xfer.tempPath);
+            if (g_mounted)
+                fileXioSync(PFSNET_MOUNT_POINT, FILEXIO_MOUNTFLAG_NORMAL);
+            clearPartialPut();
+        }
         clearXferState();
         return 0;
     }
 
+    clearPartialPut();
     g_xfer.kind = PFSNET_XFER_PUT;
     g_xfer.fileFd = -1;
     g_xfer.dataSock = -1;
-    g_xfer.flags = flags;
+    g_xfer.flags = flags & ~PFSNET_PUT_RESUME;
     g_xfer.totalBytes = totalBytes;
     return 0;
 }
@@ -1073,6 +1184,7 @@ static int handlePutEnd(struct PfsNetClient *client)
 static int handlePutAbort(struct PfsNetClient *client)
 {
     abortXferCleanup();
+    clearPartialPut();
     return pfsnetSendResponse(client, PFSNET_OK, NULL, 0);
 }
 

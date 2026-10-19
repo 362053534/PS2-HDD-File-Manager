@@ -34,11 +34,6 @@ extern void __ps2ipeeOpsInitializeImpl(void);
  */
 uint32_t __wrap_sys_now(void)
 {
-    int old = DIntr();
-    if ((_lw(0x1000c000) & 0x100) == 0)
-        iSifSetDChain();
-    if (old)
-        EIntr();
     return (uint32_t)(GetTimerSystemTime() / ((u64)kBUSCLK / 1000ULL));
 }
 
@@ -432,6 +427,8 @@ static void pfsnetPollWaitSlotsInIsr(void)
     }
 }
 
+static volatile int g_dchainStallTicks;
+
 static s32 pfsnetHwTickIsr(s32 cause)
 {
     struct NetManBD *bdRd;
@@ -439,15 +436,30 @@ static s32 pfsnetHwTickIsr(s32 cause)
     int dchainStopped;
 
     (void)cause;
+    DI();
 
+    /*
+     * 切勿在首次见到 CHCR.STR == 0 时立即调 iSifSetDChain()：
+     * _SifCmdIntHandler (sifcmd.c:132) 在读取 _sif_cmd_data.pktbuf 之前就执行了 EI()，
+     * 读完后才在 line 149 调 iSifSetDChain()。若在首次见到 STR==0 时立刻从 INTC 抢调
+     * iSifSetDChain()，会导致下一包 SIF0 DMA 覆盖正在读取的 pktbuf 或在 DMA 运行中二次重置。
+     * 仅当连续 >= 3 个硬件 tick (约 15ms+) STR 仍为 0 时才执行兜底恢复。
+     */
     dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
-    if (dchainStopped)
-        iSifSetDChain();
+    if (dchainStopped) {
+        g_dchainStallTicks++;
+        if (g_dchainStallTicks >= 3) {
+            iSifSetDChain();
+            g_dchainStallTicks = 0;
+        }
+    } else {
+        g_dchainStallTicks = 0;
+    }
 
     if (g_nmFrameBufferStatus != NULL) {
         bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
         bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
+        if (bdRd->length > 0 || bdNext->length > 0) {
             if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
                 g_nmIsProcessingRx = 1;
                 iWakeupThread(g_nmRxThreadID);
@@ -491,10 +503,13 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
     int dchainStopped;
 
     (void)channel;
+    /* _SifCmdIntHandler 在 sifcmd.c:132 会调用 EI()，此处必须先 DI() 防止中断嵌套竞争 */
+    DI();
 
     dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
     if (dchainStopped)
         iSifSetDChain();
+    g_dchainStallTicks = 0;
 
     if (g_nmFrameBufferStatus != NULL) {
         bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
@@ -515,8 +530,7 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
 static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
 {
     u32 ihl, totLen, tcpOff, doff, dataOff, dataLen;
-    u16 srcPort, dstPort;
-    u8 flags;
+    u16 dstPort;
 
     if (frame == NULL || len < 54u)
         return;
@@ -536,17 +550,13 @@ static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
         len = 14u + totLen;
 
     tcpOff = 14u + ihl;
-    srcPort = (u16)(((u16)frame[tcpOff] << 8) | (u16)frame[tcpOff + 1u]);
     dstPort = (u16)(((u16)frame[tcpOff + 2u] << 8) | (u16)frame[tcpOff + 3u]);
-    flags = frame[tcpOff + 13u];
 
-    /* 数据连接由 PS2 主动连向 PC 的 45062 端口，因此 PC 发来的 RST 报文源端口为 45062 */
-    if (srcPort == PFSNET_DATA_PORT || dstPort == PFSNET_DATA_PORT) {
-        if ((flags & 0x04u) != 0)
-            pfsnetFsAbortActiveSocket();
-        return;
-    }
-
+    /*
+     * 仅检查发往控制口 45061 的 PfsNet 控制帧：
+     * 切勿对源端口 45062 的 TCP RST 无条件触发中断，否则上一次已关闭的数据口残余 FIN
+     * 触发对端内核回发的旧连接 RST 会误杀新建立的重试/续传数据连接。
+     */
     if (dstPort == PFSNET_COMMAND_PORT) {
         doff = (u32)(frame[tcpOff + 12u] >> 4) * 4u;
         if (doff < 20u || len < tcpOff + doff + PFSNET_HEADER_SIZE)
@@ -562,8 +572,24 @@ static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
                 | ((u32)frame[dataOff + 5u] << 8)
                 | ((u32)frame[dataOff + 6u] << 16)
                 | ((u32)frame[dataOff + 7u] << 24);
-            if ((cmd == PFSNET_CMD_PUT_ABORT || cmd == PFSNET_CMD_GET_ABORT) && payLen == 0u)
-                pfsnetFsAbortActiveSocket();
+            u32 res = (u32)frame[dataOff + 8u]
+                | ((u32)frame[dataOff + 9u] << 8)
+                | ((u32)frame[dataOff + 10u] << 16)
+                | ((u32)frame[dataOff + 11u] << 24);
+            if (res != 0u)
+                return;
+            if ((cmd == PFSNET_CMD_PUT_ABORT || cmd == PFSNET_CMD_GET_ABORT) &&
+                payLen == 0u && dataLen == PFSNET_HEADER_SIZE) {
+                pfsnetFsAbortActiveTransfer(1);
+            } else if (cmd == PFSNET_CMD_PING &&
+                       payLen == 0u && dataLen == PFSNET_HEADER_SIZE) {
+                /* 数据连接异常断开后客户端先发 PING 探活准备断点续传，立即唤醒旧阻塞数据口并保留临时文件 */
+                pfsnetFsAbortActiveTransfer(0);
+            } else if (cmd == PFSNET_CMD_PUT_BEGIN &&
+                       payLen >= 16u && payLen <= 2048u &&
+                       dataLen == PFSNET_HEADER_SIZE + payLen) {
+                pfsnetFsAbortActiveTransfer(0);
+            }
         }
     }
 }
@@ -601,8 +627,6 @@ static void pfsnetNetManRxThread(void *arg)
 
         do {
             DI();
-            if ((_lw(0x1000c000) & 0x100) == 0)
-                iSifSetDChain();
             PacketLength = bd->length;
             if (PacketLength > 0) {
                 run = 1;
@@ -991,12 +1015,20 @@ static void retrieveMbxInternal(pfsnet_sys_mbox_t mBox, pfsnet_arch_message_t **
         EIntr();
 }
 
+static volatile int g_ioWorkerTid = -1;
+
+void pfsnetSetIoWorkerTid(int tid)
+{
+    g_ioWorkerTid = tid;
+}
+
 static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox, u32 timeout)
 {
     pfsnet_sys_mbox_t mBox;
     int sema;
     int result;
     int slot;
+    int tid;
 
     if (pMBox == NULL || (mBox = *pMBox) == NULL)
         return -1;
@@ -1010,7 +1042,13 @@ static int receiveMbx(pfsnet_arch_message_t **message, pfsnet_sys_mbox_t *pMBox,
         return -1;
     }
 
-    slot = pfsnetEnterMboxWait(GetThreadId());
+    tid = GetThreadId();
+    /* libps2ip.a 编译时 LWIP_SO_RCVTIMEO=0，setsockopt(SO_RCVTIMEO) 无效，recv() 固定传 timeout=0；
+     * 为 ioWorker 数据收发线程补齐 45s 真实硬件超时，防止对端静默掉线时永久卡在 recvmbox。 */
+    if (timeout == 0 && g_ioWorkerTid >= 0 && tid == g_ioWorkerTid)
+        timeout = 45000;
+
+    slot = pfsnetEnterMboxWait(tid);
     if (timeout > 0)
         result = waitSemaTimeoutMs(sema, timeout);
     else
