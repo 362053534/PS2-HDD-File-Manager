@@ -41,6 +41,7 @@ struct pfsnet_sif_cmd_data {
 };
 
 extern struct pfsnet_sif_cmd_data _sif_cmd_data;
+extern int _SifCmdIntHandler(int channel);
 
 /*
  * PS2SDK 默认 sys_now() 为 clock() / 1000，而 _times()/clock() 用 32 位微秒计数，
@@ -314,138 +315,73 @@ static SifRpcServerData_t g_nmCbSrv;
 #define PFSNET_NM_CLEAR_RING_DEPTH 8
 static volatile unsigned int g_nmClearDmaRing[PFSNET_NM_CLEAR_RING_DEPTH];
 static volatile int g_nmClearDmaIdx;
-static int g_nmPendingClearStart = -1;
-static int g_nmPendingClearCount;
 
-static void pfsnetNetManFlushClearBuffer(void)
+static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload)
 {
+    struct NetManBD *bd;
     SifDmaTransfer_t dmat;
     int slot;
     unsigned int oldId;
     unsigned int id;
-    int start = g_nmPendingClearStart;
-    int count = g_nmPendingClearCount;
-
-    if (start < 0 || count <= 0)
-        return;
-
-    g_nmPendingClearStart = -1;
-    g_nmPendingClearCount = 0;
-
-    slot = g_nmClearDmaIdx;
-    g_nmClearDmaIdx = (slot + 1) % PFSNET_NM_CLEAR_RING_DEPTH;
-    oldId = g_nmClearDmaRing[slot];
-    g_nmClearDmaRing[slot] = 0;
-    if (oldId != 0) {
-        while (SifDmaStat((int)oldId) >= 0)
-            nopdelay();
-    }
-
-    dmat.src = (void *)&g_nmFrameBufferStatus[start];
-    dmat.dest = &g_nmRxIOPFrameBufferStatus[start];
-    dmat.size = (int)(sizeof(struct NetManBD) * (size_t)count);
-    dmat.attr = 0;
-    while ((id = __wrap_SifSetDma(&dmat, 1)) == 0)
-        nopdelay();
-    g_nmClearDmaRing[slot] = id;
-}
-
-static void pfsnetNetManClearBufferLen(int index, void *packet, void *payload, int flushNow)
-{
-    struct NetManBD *bd;
 
     bd = UNCACHED_SEG(&g_nmFrameBufferStatus[index]);
     bd->length = 0;
     bd->packet = packet;
     bd->payload = payload;
 
-    if (g_nmPendingClearCount == 0) {
-        g_nmPendingClearStart = index;
-        g_nmPendingClearCount = 1;
-    } else if (index == g_nmPendingClearStart + g_nmPendingClearCount) {
-        g_nmPendingClearCount++;
-    } else {
-        pfsnetNetManFlushClearBuffer();
-        g_nmPendingClearStart = index;
-        g_nmPendingClearCount = 1;
+    slot = g_nmClearDmaIdx;
+    g_nmClearDmaIdx = (slot + 1) % PFSNET_NM_CLEAR_RING_DEPTH;
+    oldId = g_nmClearDmaRing[slot];
+    if (oldId != 0) {
+        while (SifDmaStat((int)oldId) >= 0)
+            nopdelay();
     }
 
-    if (flushNow || g_nmPendingClearCount >= 8 || index == (NETMAN_RPC_BLOCK_SIZE - 1))
-        pfsnetNetManFlushClearBuffer();
+    dmat.src = (void *)&g_nmFrameBufferStatus[index];
+    dmat.dest = &g_nmRxIOPFrameBufferStatus[index];
+    dmat.size = sizeof(struct NetManBD);
+    dmat.attr = 0;
+    while ((id = __wrap_SifSetDma(&dmat, 1)) == 0)
+        nopdelay();
+    g_nmClearDmaRing[slot] = id;
 }
 
 /*
- * 统一接管 DMAC_SIF0 中断处理（合并原 _SifCmdIntHandler 与 NetMan RX 唤醒）：
+ * 挂在 _SifCmdIntHandler 之后（next = -1）的 DMAC_SIF0 中断处理：
  *
  * PS2SDK 原版 _SifCmdIntHandler (ee/kernel/src/sifcmd.c:121-175) 在调用 cmd_handlers[id].handler
  * (_request_rdata / _request_end，耗时 ~15us) 之前就提前执行了 iSifSetDChain()；
  * 若 IOP SIF0 队列中紧跟第二个带 INT_O 的 SIFCMD tag（如 SIF_CMD_RPC_END 紧跟 SIF_CMD_RPC_RDATA），
  * 该 tag 会在 ~0.64us 内 DMA 到 _sif_cmd_data.pktbuf，而 _SifCmdIntHandler 退出时不循环复查
- * header->psize，且后挂的 NetMan handler 又无条件调用 iSifSetDChain()，导致第二个 SIFCMD 被后续
- * DMA 覆盖或永久滞留 pktbuf，引发 FILEXIO.IRX 与 clientThread 永久死锁。
- *
- * 修复后：保持 DMAC_SIF0 停机直至所有已到达的 pktbuf 命令派发完毕，再唤醒 NetMan RX 线程，
- * 最后才调用 iSifSetDChain()；若 SIF0 FIFO 中已有下一笔 tag 立即完成，外层循环继续排空。
+ * header->psize。此处在其返回后立即复查 pktbuf->psize 并递归调用 _SifCmdIntHandler 排空，
+ * 同时恢复 DChain 并唤醒 NetMan RX 线程。
  */
-int __wrap__SifCmdIntHandler(int channel)
+static s32 pfsnetNetManHandleRxEvent(s32 channel)
 {
-    u128 packet[8];
-    u128 *pktbuf;
-    SifCmdHeader_t *header;
-    SifCmdHandlerData_t *cmd_handlers;
-    u32 size, qwords, id, i;
+    SifCmdHeader_t *pktHdr = (SifCmdHeader_t *)_sif_cmd_data.pktbuf;
+    struct NetManBD *bdRd;
+    struct NetManBD *bdNext;
+    int dchainStopped;
 
-    (void)channel;
+    while (pktHdr != NULL && pktHdr->psize != 0)
+        _SifCmdIntHandler(channel);
 
-    for (;;) {
-        pktbuf = (u128 *)_sif_cmd_data.pktbuf;
-        header = (SifCmdHeader_t *)pktbuf;
+    dchainStopped = ((_lw(0x1000c000) & 0x100) == 0);
+    if (dchainStopped)
+        iSifSetDChain();
 
-        while (pktbuf != NULL && (size = header->psize) != 0) {
-            qwords = (size + 30) >> 4;
-            if (qwords > 8)
-                qwords = 8;
-            header->psize = 0;
+    while (pktHdr != NULL && pktHdr->psize != 0)
+        _SifCmdIntHandler(channel);
 
-            i = 0;
-            do {
-                packet[i] = pktbuf[i];
-                i++;
-            } while (--qwords);
-
-            id = (u32)((SifCmdHeader_t *)packet)->cid;
-            if ((id & (u32)SIF_CMD_ID_SYSTEM) != 0) {
-                id &= ~(u32)SIF_CMD_ID_SYSTEM;
-                if (id < _sif_cmd_data.nr_sys_handlers) {
-                    cmd_handlers = _sif_cmd_data.sys_cmd_handlers;
-                    if (cmd_handlers[id].handler)
-                        cmd_handlers[id].handler(packet, cmd_handlers[id].harg);
-                }
-            } else {
-                if (id < _sif_cmd_data.nr_usr_handlers) {
-                    cmd_handlers = _sif_cmd_data.usr_cmd_handlers;
-                    if (cmd_handlers[id].handler)
-                        cmd_handlers[id].handler(packet, cmd_handlers[id].harg);
-                }
+    if (g_nmFrameBufferStatus != NULL) {
+        bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
+        bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
+        if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
+            if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
+                g_nmIsProcessingRx = 1;
+                iWakeupThread(g_nmRxThreadID);
             }
         }
-
-        if (g_nmFrameBufferStatus != NULL) {
-            struct NetManBD *bdRd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
-            struct NetManBD *bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-            if (bdRd->length > 0 || bdNext->length > 0) {
-                if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
-                    g_nmIsProcessingRx = 1;
-                    iWakeupThread(g_nmRxThreadID);
-                }
-            }
-        }
-
-        if ((_lw(0x1000c000) & 0x100) == 0)
-            iSifSetDChain();
-
-        if (pktbuf == NULL || header->psize == 0)
-            break;
     }
 
     if (g_timerInited)
@@ -521,15 +457,12 @@ int __wrap_NetManRPCAllocRxBuffers(void)
 {
     int i;
 
-    g_nmPendingClearStart = -1;
-    g_nmPendingClearCount = 0;
-
     for (i = 0; i < NETMAN_RPC_BLOCK_SIZE; i++) {
         void *packet, *payload;
 
         if ((packet = NetManNetProtStackAllocRxPacket(NETMAN_NETIF_FRAME_SIZE, &payload)) != NULL) {
             SifWriteBackDCache(payload, (NETMAN_NETIF_FRAME_SIZE + 63) & ~63);
-            pfsnetNetManClearBufferLen(i, packet, payload, 1);
+            pfsnetNetManClearBufferLen(i, packet, payload);
         } else {
             return -ENOMEM;
         }
@@ -540,7 +473,6 @@ int __wrap_NetManRPCAllocRxBuffers(void)
 static void pfsnetNetManRxThread(void *arg)
 {
     volatile struct NetManBD *bd;
-    volatile struct NetManBD *bdNext;
     u32 PacketLength, PacketLengthAligned;
     u8 run;
 
@@ -549,7 +481,6 @@ static void pfsnetNetManRxThread(void *arg)
     while (1) {
         void *payload, *payloadNext;
         void *packet, *packetNext;
-        int flushNow;
 
         bd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
 
@@ -575,24 +506,19 @@ static void pfsnetNetManRxThread(void *arg)
             }
             EI();
 
-            if (!run) {
-                pfsnetNetManFlushClearBuffer();
+            if (!run)
                 SleepThread();
-            }
         } while (!run);
 
         payload = bd->payload;
         packet = bd->packet;
 
         while ((packetNext = NetManNetProtStackAllocRxPacket(NETMAN_NETIF_FRAME_SIZE, &payloadNext)) == NULL) {
-            pfsnetNetManFlushClearBuffer();
             DelayThread(200);
         }
         SifWriteBackDCache(payloadNext, (NETMAN_NETIF_FRAME_SIZE + 63) & ~63);
         g_nmRxBufferNextRdPtr = (g_nmRxBufferNextRdPtr + 1) % NETMAN_RPC_BLOCK_SIZE;
-        bdNext = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
-        flushNow = (bdNext->length == 0) ? 1 : 0;
-        pfsnetNetManClearBufferLen(g_nmRxBufferRdPtr, packetNext, payloadNext, flushNow);
+        pfsnetNetManClearBufferLen(g_nmRxBufferRdPtr, packetNext, payloadNext);
         g_nmRxBufferRdPtr = g_nmRxBufferNextRdPtr;
 
         PacketLengthAligned = (PacketLength + 63) & ~63;
@@ -621,8 +547,6 @@ static void *pfsnetNetManEERpcHandler(int fnum, void *buffer, int NumBytes)
                 g_nmRxBufferRdPtr = 0;
                 g_nmRxBufferNextRdPtr = 0;
                 g_nmIsProcessingRx = 0;
-                g_nmPendingClearStart = -1;
-                g_nmPendingClearCount = 0;
 
                 thread.func = &pfsnetNetManRxThread;
                 thread.stack = g_nmRxThreadStack;
@@ -633,6 +557,8 @@ static void *pfsnetNetManEERpcHandler(int fnum, void *buffer, int NumBytes)
 
                 if ((g_nmRxThreadID = CreateThread(&thread)) >= 0) {
                     StartThread(g_nmRxThreadID, NULL);
+                    /* next = -1：挂在 _SifCmdIntHandler 之后，补排空并发到达的 SIFCMD 并确保 SIF0 DChain 绝不漏开 */
+                    g_nmSifHandlerID = AddDmacHandler(DMAC_SIF0, &pfsnetNetManHandleRxEvent, -1);
                     EnableDmac(DMAC_SIF0);
                     ((struct NetManEEInitResult *)buffer)->result = 0;
                     ((struct NetManEEInitResult *)buffer)->FrameBufferStatus = g_nmFrameBufferStatus;
@@ -1253,50 +1179,12 @@ void __wrap_sys_mbox_post(pfsnet_sys_mbox_t *mbox, void *sys_msg)
         sendMbx(mbox, msg, sys_msg);
 }
 
-/*
- * 修复 lwIP 2.0.3 (ps2dev/lwip ps2-v2.0.3) 在 LWIP_TCPIP_CORE_LOCKING=1 下的核心锁漏洞：
- *
- * tcpip.c:96-100 在调用 sys_timeouts_mbox_fetch(&mbox, &msg) 前执行了 UNLOCK_TCPIP_CORE()，
- * 导致 timeouts.c 中 sys_timeouts_sleeptime() 与 sys_check_timeouts() (含 tcp_tmr / etharp_tmr /
- * sys_timeout / memp_free(MEMP_SYS_TIMEOUT)) 全程在未持有 lock_tcpip_core 的状态下运行！
- * 当高优先级的 pfsnetNetManRxThread / ioWorker / clientThread 抢占 tcpip_thread (0x58) 并获取
- * lock_tcpip_core 时，会与正在执行 tcp_tmr() 的 tcpip_thread 并发读写同一 tcp_pcb、unsent/unacked
- * 队列、next_timeout 链表与 memp 池，在数百万包后造成队列环路或内存池损坏。
- *
- * 通过接管 sys_timeouts_mbox_fetch：进入时立即获取 lock_tcpip_core，仅在 sys_arch_mbox_fetch
- * 真正阻塞等待 tcpip mbox 期间释放 lock_tcpip_core，唤醒返回前重新获取 lock_tcpip_core，
- * 确保 sys_timeouts_sleeptime() 与 sys_check_timeouts() (tcp_tmr 等) 100% 在核心锁保护下执行。
- */
-extern pfsnet_sys_sem_t lock_tcpip_core;
-extern void __real_sys_timeouts_mbox_fetch(pfsnet_sys_mbox_t *mbox, void **msg);
-static volatile pfsnet_sys_mbox_t *g_tcpipMboxPtr;
-
-void __wrap_sys_timeouts_mbox_fetch(pfsnet_sys_mbox_t *mbox, void **msg)
-{
-    g_tcpipMboxPtr = mbox;
-    if (lock_tcpip_core >= 0)
-        WaitSema(lock_tcpip_core);
-    __real_sys_timeouts_mbox_fetch(mbox, msg);
-    if (lock_tcpip_core >= 0)
-        SignalSema(lock_tcpip_core);
-}
-
 u32 __wrap_sys_arch_mbox_fetch(pfsnet_sys_mbox_t *pMBox, void **ppvMSG, u32 u32Timeout)
 {
     pfsnet_arch_message_t *pmsg = NULL;
     u32 start = __wrap_sys_now();
-    int isTcpipMbox = (pMBox != NULL && pMBox == (pfsnet_sys_mbox_t *)g_tcpipMboxPtr && lock_tcpip_core >= 0);
-    int r;
 
-    if (isTcpipMbox)
-        SignalSema(lock_tcpip_core);
-
-    r = receiveMbx(&pmsg, pMBox, u32Timeout);
-
-    if (isTcpipMbox)
-        WaitSema(lock_tcpip_core);
-
-    if (r == 0) {
+    if (receiveMbx(&pmsg, pMBox, u32Timeout) == 0) {
         u32 elapsed = __wrap_sys_now() - start;
         if (pmsg != NULL) {
             if (ppvMSG != NULL)
@@ -1516,27 +1404,6 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
     if (r != 0) {
         scr_printf("WARN: ps2ipInit failed (%d)\n", r);
         return -1;
-    }
-
-    /*
-     * 提升 NETMAN_TxThread (rpc_client.c:76 初始优先级 0x56) 到 0x38，高于所有调用
-     * SMapLowLevelOutput -> NetManNetIFXmit 的线程（clientThread 0x40 / ioWorker 0x42 /
-     * tcpip_thread 0x58 / pfsnetNetManRxThread 0x59），满足 rpc_client.c:76 的设计契约：
-     * 每次 WakeupThread(NETMAN_Tx_threadID) 立即在持锁上下文中同步排空并释放单包，
-     * 杜绝多包堆积在 TxTail..TxHead 改写 pbuf->next 引发 pbuf_clen 下溢或并发 pbuf_free。
-     */
-    {
-        int tid;
-        for (tid = 1; tid < 128; tid++) {
-            ee_thread_status_t st;
-            memset(&st, 0, sizeof(st));
-            if (ReferThreadStatus(tid, &st) >= 0 &&
-                st.status != THS_DORMANT &&
-                st.initial_priority == 0x56) {
-                ChangeThreadPriority(tid, 0x38);
-                break;
-            }
-        }
     }
 
     stackReady = 1;
