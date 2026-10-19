@@ -18,6 +18,7 @@ EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=SifSetDma \
 	-Wl,--wrap=SifSendCmd \
 	-Wl,--wrap=iSifSendCmd \
+	-Wl,--wrap=_SifCmdIntHandler \
 	-Wl,--wrap=DelayThread \
 	-Wl,--wrap=NetManInitRPCServer \
 	-Wl,--wrap=NetManDeinitRPCServer \
@@ -32,6 +33,7 @@ EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=sys_arch_mbox_fetch \
 	-Wl,--wrap=sys_arch_mbox_tryfetch \
 	-Wl,--wrap=sys_arch_sem_wait \
+	-Wl,--wrap=sys_timeouts_mbox_fetch \
 	-T$(PS2SDK)/ee/startup/linkfile
 EE_LIBS = -lpatches -lkernel -ldebug -lfileXio -lps2ip -lnetman -lpad
 
