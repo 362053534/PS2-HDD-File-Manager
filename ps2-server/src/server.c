@@ -155,6 +155,17 @@ void pfsnetPollTransferControl(void)
     if (g_controlHeaderUsed < PFSNET_HEADER_SIZE) {
         n = recv(g_client.socket, g_controlHeader + g_controlHeaderUsed,
                  PFSNET_HEADER_SIZE - g_controlHeaderUsed, MSG_DONTWAIT);
+        /* 指定 SDK 关闭 LWIP_SOCKET_SET_ERRNO；libcglue 可能将 -errno(0) 返回成 0。
+         * 必须先读取 lwIP 保存的 socket 错误，才能区分暂时无数据与真正 EOF。 */
+        if (n <= 0) {
+            int savedErrno = errno;
+            int socketError = 0;
+            socklen_t errorLen = sizeof(socketError);
+            if (getsockopt(g_client.socket, SOL_SOCKET, SO_ERROR, &socketError, &errorLen) == 0 &&
+                (socketError == EAGAIN || socketError == EWOULDBLOCK || socketError == EINTR))
+                return;
+            errno = savedErrno;
+        }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
             return;
         if (n <= 0) {

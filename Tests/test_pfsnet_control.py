@@ -35,16 +35,38 @@ static int recvAll(int s, void *buf, int len) {
     while(done<len) { int n=recv(s,(char*)buf+done,len-done,0); if(n<=0) return -1; done+=n; }
     return done;
 }
+static int emulate_empty_recv, pending_socket_error;
+static ssize_t probe_recv(int s, void *buf, size_t n, int flags) {
+    ssize_t result=recv(s,buf,n,flags);
+    if(emulate_empty_recv && result<0 && (errno==EAGAIN || errno==EWOULDBLOCK)) {
+        pending_socket_error=EWOULDBLOCK;
+        errno=0;
+        return 0;
+    }
+    return result;
+}
+static int __attribute__((unused)) probe_getsockopt(int s,int level,int option,void *value,socklen_t *len) {
+    if(pending_socket_error && level==SOL_SOCKET && option==SO_ERROR) {
+        *(int*)value=pending_socket_error; pending_socket_error=0; *len=sizeof(int); return 0;
+    }
+    return getsockopt(s,level,option,value,len);
+}
+#define recv probe_recv
+#define getsockopt probe_getsockopt
 '''
         cases = r'''
+#undef recv
+#undef getsockopt
 static int checks;
 #define CHECK(x) do { checks++; if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while(0)
 int main(void) {
     int s[2], other[2]; PfsNetPacketHdr h = {PFSNET_CMD_PING,0,0}, out;
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
     g_client = (struct Client){1,s[0],7};
+    emulate_empty_recv=1;
     pfsnetPollTransferControl();
     CHECK(!aborts && !g_clientStop);
+    emulate_empty_recv=0;
     CHECK(send(s[1], &h, 5, 0) == 5);
     pfsnetPollTransferControl();
     CHECK(!aborts && g_controlHeaderUsed == 5);
