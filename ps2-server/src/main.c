@@ -102,16 +102,11 @@ static void loadHddStack(void)
 /* 与 362053534 OPL 一致：一字节 0 关闭 ATA 自动待机计时器。
  * ATAD 初始化会恢复默认计时，因此每次启动都设置；退出时仍正常停盘。
  * 仅设置服务实际使用的 hdd0，不通过周期读写来保持硬盘唤醒。 */
-static void disableHddStandby(void)
+static int disableHddStandby(void)
 {
     unsigned char standbyTimer = 0;
-    int result = fileXioDevctl("hdd0:", HDIOC_IDLE, &standbyTimer,
-                              sizeof(standbyTimer), NULL, 0);
-
-    if (result == 0)
-        scr_printf("HDD automatic standby: disabled\n");
-    else
-        scr_printf("WARN: disable HDD standby failed (%d)\n", result);
+    return fileXioDevctl("hdd0:", HDIOC_IDLE, &standbyTimer,
+                         sizeof(standbyTimer), NULL, 0);
 }
 
 static void loadMcStack(void)
@@ -281,6 +276,7 @@ int main(int argc, char *argv[])
 {
     char ipText[32];
     PfsNetIpConfig cfg;
+    int hddStandbyResult;
 
     /* 先 init_scr 再 SifIopReset（与 HDDTester 一致），复位前挂死时仍有屏显。 */
     g_mainTid = GetThreadId();
@@ -308,7 +304,7 @@ int main(int argc, char *argv[])
     loadModuleBuffer(POWEROFF_irx, size_POWEROFF_irx, 0, NULL);
     loadModuleBuffer(DEV9_irx, size_DEV9_irx, 0, NULL);
     loadHddStack();
-    disableHddStandby();
+    hddStandbyResult = disableHddStandby();
     if (pfsnetFsInit() < 0) {
         scr_printf("FATAL: fs init failed\n");
         waitStartToExit();
@@ -359,6 +355,10 @@ int main(int argc, char *argv[])
     scr_clear();
     scr_printf("PfsNetServer\n");
     scr_printf("IP: %s (%s)\n", ipText, pfsnetIpSourceName(cfg.source));
+    if (hddStandbyResult == 0)
+        scr_printf("HDD automatic standby: disabled\n");
+    else
+        scr_printf("WARN: disable HDD standby failed (%d)\n", hddStandbyResult);
     scr_printf("NM: %u.%u.%u.%u  GW: %u.%u.%u.%u\n",
                (unsigned)ip4_addr1(&cfg.nm), (unsigned)ip4_addr2(&cfg.nm),
                (unsigned)ip4_addr3(&cfg.nm), (unsigned)ip4_addr4(&cfg.nm),
