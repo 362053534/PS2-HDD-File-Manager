@@ -58,9 +58,9 @@ PS2 端 PFS 网络服务 ELF：开机自动取 IP 并屏显，监听 **45061**�
 
 ## 编译
 
-`make all` 生成去符号的 `PfsNetServer.elf`，并在构建目录保留带调试信息的 `PfsNetServer-debug.elf`。在指定工具链中执行 `make release`，额外生成 `PfsNetServer-packed.elf`（PS2 自解压 ELF），处理顺序与 362053534 OPL 一致。CI 默认提供去符号版。
+`make all` / `make release` 默认生成压缩的 `PfsNetServer.elf`（PS2 自解压 ELF），处理顺序与 362053534 OPL 一致：链接 → 去符号 → `ps2-packer`。去符号文件仅为中间产物，构建后自动清理，不单独发布；构建目录的 `PfsNetServer-debug.elf` 用于调试。CI 仅发布压缩版。压缩 ELF 的非加载节 `.pfsnet.ident` 保留程序名称，供产物识别与 CI 校验使用。
 
-优先验证精简版：它不添加解压启动代码。压缩版可进一步节省存储空间，但需验证实际启动器兼容性；压缩不降低服务解压后的内存需求，也不提升网络传输速度。原始 ELF 应保留用于调试。
+压缩版需验证实际启动器兼容性；压缩不降低服务解压后的内存需求，也不提升网络传输速度。
 
 在已安装工具链的 WSL 中：
 

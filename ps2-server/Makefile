@@ -1,6 +1,6 @@
 EE_BIN = PfsNetServer-debug.elf
-EE_BIN_STRIPPED = PfsNetServer.elf
-EE_BIN_PACKED = PfsNetServer-packed.elf
+EE_BIN_STRIPPED = PfsNetServer-stripped.elf
+EE_BIN_PACKED = PfsNetServer.elf
 
 EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
 	IOMANX_irx.o FILEXIO_irx.o POWEROFF_irx.o DEV9_irx.o ATAD_irx.o HDD_irx.o PFS_irx.o \
@@ -53,16 +53,20 @@ VPATH = src
 $(EE_BIN) : $(EE_OBJS)
 	$(EE_CC) $(EE_CFLAGS) $(EE_LDFLAGS) -o $(EE_BIN) $(EE_OBJS) $(EE_LIBS)
 
-all: $(EE_BIN_STRIPPED)
+all: $(EE_BIN_PACKED)
 
 # 保留原始 ELF 供定位问题；发布产物使用与 362053534 OPL 相同的处理顺序。
 $(EE_BIN_STRIPPED): $(EE_BIN)
 	$(EE_STRIP) -o $@ $<
 
-$(EE_BIN_PACKED): $(EE_BIN_STRIPPED)
+$(EE_BIN_PACKED): $(EE_BIN_STRIPPED) elf-ident.txt
 	ps2-packer $< $@
+	# 非加载节保留程序标识，压缩后仍可用 strings 识别产物。
+	mips64r5900el-ps2-elf-objcopy --add-section .pfsnet.ident=elf-ident.txt $@
 
-release: $(EE_BIN_STRIPPED) $(EE_BIN_PACKED)
+release: $(EE_BIN_PACKED)
+
+.INTERMEDIATE: $(EE_BIN_STRIPPED)
 
 clean:
 	rm -f $(EE_BIN) $(EE_BIN_STRIPPED) $(EE_BIN_PACKED) $(EE_OBJS) $(EE_TEMP_FILES)
