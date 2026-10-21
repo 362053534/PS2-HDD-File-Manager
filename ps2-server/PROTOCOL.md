@@ -286,7 +286,7 @@ V1 可不支持断点续传；`offset` 字段预留为 0（PC 端 `PfsNetClient`
 - **accept 超时**：30 秒（`AcceptDataAsync`）。
 - **数据通道**：纯原始字节流，长度以 `PUT_BEGIN.total_bytes` / `GET_BEGIN` 响应的 `total_bytes` 为准。两端 socket 都设 512 KiB 收发缓冲 + `NoDelay`；PC 侧本地文件流按 512 KiB 读写，PS2 侧用两块 512 KiB `memalign` 缓冲 + `ioWorker` 线程双缓冲。
 - **临时文件（T1）**：`.pfsnet_<8 hex>`，`PUT_END` 时 rename 为最终名（overwrite 时先删旧文件）；`PUT_ABORT` 或控制连接断开时由 `abortXferCleanup()` 删除。
-- **取消 / 失败**：PC 先关数据口打断读写，再尝试发 `*_ABORT`（2 秒超时；若对端卡在 `*_BEGIN` 未应答则直接断开本地连接，不同步空等）。`GET` 失败时 PC 会删除写到一半的本地文件。
+- **取消 / 失败**：PC 先关数据口打断读写，再尝试发 `*_ABORT`（当前用户取消等待上限 8 秒）。控制命令串行分派，单独发送 `*_ABORT` 不保证立即打断仍在进行的数据读写。不要根据原始以太网帧中的 FIN/RST 或 PING 取消传输：旧连接的延迟报文、重传和未重组的数据都不能作为当前会话的取消依据。`GET` 失败时 PC 会删除写到一半的本地文件。
 - **状态**：传输进行中（`g_xfer.kind != NONE`）执行 MOUNT / UMOUNT / APA 变更会返回 `ERR_BUSY`。
 
 ### 5.5 APA 扇区只读（A1，分区校验）

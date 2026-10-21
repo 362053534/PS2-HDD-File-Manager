@@ -859,7 +859,7 @@ static void tuneDataSocket(int sock)
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
     /* 数据口空闲超时设为 90 秒，兼容无线 WiFi 中继重关联/重协商及 PFS 大文件元数据刷盘停顿；
-     * 取消传输或异常终止时由 pfsnetCheckRxAbortFrame / pfsnetFsAbortActiveSocket 毫秒级唤醒。 */
+     * 客户端取消时先关闭数据口；新控制连接通过 pfsnetFsAbortActiveSocket 协作唤醒旧传输。 */
     tv.tv_sec = 90;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

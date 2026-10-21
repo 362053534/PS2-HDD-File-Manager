@@ -75,9 +75,29 @@ make clean && make
 
 产物：`PfsNetServer.elf`。
 
-> 仓库里的 `.o` 与 `PfsNetServer.elf` 是**已提交的构建产物**。改了 `src/` 或 `include/` 之后必须重新编译并一并提交，否则 PC 端会对不上协议行为。
+> 仓库包含历史 `.o`，不要用它们作为增量构建缓存；必须先 `make clean`。构建脚本与 CI 均会执行清理。改了 `src/` 或 `include/` 后，提交的 ELF 必须来自对应源码的干净构建，不能把旧 ELF 当作新源码的测试结果。
 
 ## 与 HDLGameInstaller
 
 同端口 45061/45062，**不要同时运行**。握手魔数为 `PFSN`，误连会以 `ERR_MAGIC` 拒。
 PC 防火墙需放行入站 **TCP 45062**（Put/Get 数据回连）。
+
+## 传输与取消的实机回归
+
+在连接 PS2 的 Mac 上，从仓库根目录执行；需要 Python 3，先断开图形客户端，避免单客户端服务被另一条连接接管。以下命令会在 `+OPL` 中新建随机命名的测试目录，不覆盖已有文件，也不会自动删除测试目录。长测在本地终端运行，保持终端打开，避免远程执行工具的超时干扰。
+
+```sh
+# 只验证握手和 PING，不写文件
+python3 scripts/pfsnet-transfer-probe.py 192.168.1.10
+
+# 上传中排队一个 PING；上传完成后读其响应，再完整下载校验 SHA-256
+python3 scripts/pfsnet-transfer-probe.py 192.168.1.10 --put-mib 64 --ping-after-mib 16
+
+# 验证客户端现有的“数据口 RST → ABORT”、临时文件清理及重连
+python3 scripts/pfsnet-cancel-probe.py 192.168.1.10
+
+# 长传输；需要至少 6 GiB 空间，并完整回读校验
+python3 scripts/pfsnet-transfer-probe.py 192.168.1.10 --put-mib 6144
+```
+
+探针遇到第一次错误即失败，不自动重试掩盖断流。长传输探针设置与正式客户端相同的 TCP KeepAlive（60 秒、15 秒间隔、10 次重试）。日志为 JSON Lines，记录已完成发送的字节数、阶段与结果；Mac 还记录 TCP 窗口、重传、RTT 和上传期间的控制连接状态。发送完成不代表落盘完成，只有 `PUT_END` 成功且回读 SHA-256 一致才输出 `verified`。这类实机测试不能用主机上的 socket 模拟替代。
