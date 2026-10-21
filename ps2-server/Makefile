@@ -1,4 +1,6 @@
-EE_BIN = PfsNetServer.elf
+EE_BIN = PfsNetServer-debug.elf
+EE_BIN_STRIPPED = PfsNetServer.elf
+EE_BIN_PACKED = PfsNetServer-packed.elf
 
 EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
 	IOMANX_irx.o FILEXIO_irx.o POWEROFF_irx.o DEV9_irx.o ATAD_irx.o HDD_irx.o PFS_irx.o \
@@ -51,10 +53,19 @@ VPATH = src
 $(EE_BIN) : $(EE_OBJS)
 	$(EE_CC) $(EE_CFLAGS) $(EE_LDFLAGS) -o $(EE_BIN) $(EE_OBJS) $(EE_LIBS)
 
-all: $(EE_BIN)
+all: $(EE_BIN_STRIPPED)
+
+# 保留原始 ELF 供定位问题；发布产物使用与 362053534 OPL 相同的处理顺序。
+$(EE_BIN_STRIPPED): $(EE_BIN)
+	$(EE_STRIP) -o $@ $<
+
+$(EE_BIN_PACKED): $(EE_BIN_STRIPPED)
+	ps2-packer $< $@
+
+release: $(EE_BIN_STRIPPED) $(EE_BIN_PACKED)
 
 clean:
-	rm -f $(EE_BIN) $(EE_OBJS) $(EE_TEMP_FILES)
+	rm -f $(EE_BIN) $(EE_BIN_STRIPPED) $(EE_BIN_PACKED) $(EE_OBJS) $(EE_TEMP_FILES)
 
 IOMANX_irx.c:
 	bin2c $(PS2SDK)/iop/irx/iomanX.irx IOMANX_irx.c IOMANX_irx
@@ -109,4 +120,4 @@ PADMAN_irx.c:
 
 include $(PS2SDK)/samples/Makefile.pref
 
-.PHONY: all clean
+.PHONY: all clean release
