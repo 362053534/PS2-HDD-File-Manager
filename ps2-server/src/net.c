@@ -391,68 +391,6 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
     return 0;
 }
 
-static void pfsnetCheckRxAbortFrame(const u8 *frame, u32 len)
-{
-    u32 ihl, totLen, tcpOff, doff, dataOff, dataLen;
-    u16 dstPort;
-    u8 flags;
-
-    if (!pfsnetFsIsTransferActive())
-        return;
-    if (frame == NULL || len < 54u)
-        return;
-    if (frame[12] != 0x08u || frame[13] != 0x00u)
-        return;
-    if ((frame[14] >> 4) != 4u)
-        return;
-    ihl = (u32)(frame[14] & 0x0Fu) * 4u;
-    if (ihl < 20u || len < 14u + ihl + 20u)
-        return;
-    if (frame[23] != 6u)
-        return;
-    totLen = ((u32)frame[16] << 8) | (u32)frame[17];
-    if (totLen < ihl + 20u)
-        return;
-    if (14u + totLen < len)
-        len = 14u + totLen;
-
-    tcpOff = 14u + ihl;
-    dstPort = (u16)(((u16)frame[tcpOff + 2u] << 8) | (u16)frame[tcpOff + 3u]);
-    flags = frame[tcpOff + 13u];
-
-    if (dstPort == PFSNET_COMMAND_PORT) {
-        if ((flags & 0x05u) != 0) {
-            pfsnetFsAbortActiveTransfer(0);
-            return;
-        }
-        doff = (u32)(frame[tcpOff + 12u] >> 4) * 4u;
-        if (doff < 20u || len < tcpOff + doff + PFSNET_HEADER_SIZE)
-            return;
-        dataOff = tcpOff + doff;
-        dataLen = len - dataOff;
-        if (dataLen >= PFSNET_HEADER_SIZE) {
-            u32 cmd = (u32)frame[dataOff]
-                | ((u32)frame[dataOff + 1u] << 8)
-                | ((u32)frame[dataOff + 2u] << 16)
-                | ((u32)frame[dataOff + 3u] << 24);
-            u32 payLen = (u32)frame[dataOff + 4u]
-                | ((u32)frame[dataOff + 5u] << 8)
-                | ((u32)frame[dataOff + 6u] << 16)
-                | ((u32)frame[dataOff + 7u] << 24);
-            int32_t res = (int32_t)((u32)frame[dataOff + 8u]
-                | ((u32)frame[dataOff + 9u] << 8)
-                | ((u32)frame[dataOff + 10u] << 16)
-                | ((u32)frame[dataOff + 11u] << 24));
-            if (res == 0 && payLen == 0u) {
-                if (cmd == PFSNET_CMD_PUT_ABORT || cmd == PFSNET_CMD_GET_ABORT)
-                    pfsnetFsAbortActiveTransfer(1);
-                else if (cmd == PFSNET_CMD_PING)
-                    pfsnetFsAbortActiveTransfer(0);
-            }
-        }
-    }
-}
-
 int __wrap_NetManRPCAllocRxBuffers(void)
 {
     int i;
@@ -523,7 +461,6 @@ static void pfsnetNetManRxThread(void *arg)
 
         PacketLengthAligned = (PacketLength + 63) & ~63;
         SifWriteBackDCache(payload, PacketLengthAligned);
-        pfsnetCheckRxAbortFrame((const u8 *)payload, PacketLength);
         NetManNetProtStackReallocRxPacket(packet, PacketLength);
         NetManNetProtStackEnQRxPacket(packet);
     }

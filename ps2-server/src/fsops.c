@@ -10,6 +10,7 @@
 #include <netinet/tcp.h>
 #include <kernel.h>
 #include <debug.h>
+#include <delaythread.h>
 
 #include <fileXio_rpc.h>
 #include <hdd-ioctl.h>
@@ -84,6 +85,15 @@ static int g_ioLen;
 static int g_ioResult;
 static int g_ioIsSend;
 static int32_t g_lastPutErr;
+
+/* 等网络线程时仍需处理当前控制连接，避免取消请求只能靠未校验的原始报文唤醒。 */
+static void waitIoSema(int sema)
+{
+    while (PollSema(sema) != sema) {
+        pfsnetPollTransferControl();
+        DelayThread(1000);
+    }
+}
 
 static void clearXferState(void)
 {
@@ -689,6 +699,7 @@ static int xferSendAll(int sock, const void *buf, int len)
     pfsnetTrafficBegin();
     while (sent < len) {
         int n;
+        pfsnetPollTransferControl();
         if (g_putStop) {
             ok = 0;
             break;
@@ -713,6 +724,7 @@ static int xferRecvAll(int sock, void *buf, int len)
     pfsnetTrafficBegin();
     while (got < len) {
         int n;
+        pfsnetPollTransferControl();
         if (g_putStop) {
             ok = 0;
             break;
@@ -842,8 +854,9 @@ static void ioBegin(int isSend, int sock, void *buf, int len)
 
 static int ioEnd(void)
 {
+    pfsnetPollTransferControl();
     if (g_ioAsync)
-        WaitSema(g_ioSemDone);
+        waitIoSema(g_ioSemDone);
     return g_ioResult;
 }
 
@@ -859,7 +872,7 @@ static void tuneDataSocket(int sock)
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
     /* 数据口空闲超时设为 90 秒，兼容无线 WiFi 中继重关联/重协商及 PFS 大文件元数据刷盘停顿；
-     * 取消传输或异常终止时由 pfsnetCheckRxAbortFrame / pfsnetFsAbortActiveSocket 毫秒级唤醒。 */
+     * 取消传输由控制线程检查当前 TCP 字节流，再协作唤醒网络工作线程。 */
     tv.tv_sec = 90;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1032,7 +1045,8 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
             uint8_t *src;
             int written = 0;
 
-            WaitSema(g_putFillSem);
+            pfsnetPollTransferControl();
+            waitIoSema(g_putFillSem);
             bankLen = g_ringBankLen[rdIdx];
             if (bankLen <= 0 || g_putStop) {
                 if (g_lastPutErr == 0)
@@ -1077,7 +1091,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
             if (g_ioTid >= 0)
                 pfsnetWakeMboxWaiter(g_ioTid);
         }
-        WaitSema(g_ioSemDone);
+        waitIoSema(g_ioSemDone);
     } else {
         int idx = 0;
         int havePending = 0;
