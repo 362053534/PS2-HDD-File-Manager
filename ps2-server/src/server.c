@@ -6,6 +6,7 @@
 #include <timer.h>
 #include <ps2ip.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <debug.h>
 #include <delaythread.h>
@@ -153,6 +154,20 @@ void pfsnetPollTransferControl(void)
     }
 
     if (g_controlHeaderUsed < PFSNET_HEADER_SIZE) {
+        fd_set readable;
+        struct timeval immediate = {0, 0};
+        FD_ZERO(&readable);
+        FD_SET(g_client.socket, &readable);
+        /* 先确认可读：该 SDK 的空队列 recv 不能可靠地用 errno 与 EOF 区分。 */
+        n = select(g_client.socket + 1, &readable, NULL, NULL, &immediate);
+        if (n == 0)
+            return;
+        if (n < 0) {
+            scr_printf("[DEBUG-control] select rc=%d errno=%d\n", n, errno);
+            g_clientStop = 1;
+            pfsnetFsAbortActiveTransfer(0);
+            return;
+        }
         n = recv(g_client.socket, g_controlHeader + g_controlHeaderUsed,
                  PFSNET_HEADER_SIZE - g_controlHeaderUsed, MSG_DONTWAIT);
         /* 指定 SDK 关闭 LWIP_SOCKET_SET_ERRNO；libcglue 可能将 -errno(0) 返回成 0。
@@ -161,14 +176,20 @@ void pfsnetPollTransferControl(void)
             int savedErrno = errno;
             int socketError = 0;
             socklen_t errorLen = sizeof(socketError);
-            if (getsockopt(g_client.socket, SOL_SOCKET, SO_ERROR, &socketError, &errorLen) == 0 &&
-                (socketError == EAGAIN || socketError == EWOULDBLOCK || socketError == EINTR))
+            if (getsockopt(g_client.socket, SOL_SOCKET, SO_ERROR, &socketError, &errorLen) == 0 && socketError != 0) {
+                if (socketError == EAGAIN || socketError == EWOULDBLOCK || socketError == EINTR)
+                    return;
+                scr_printf("[DEBUG-control] recv rc=%d socket_error=%d\n", n, socketError);
+                g_clientStop = 1;
+                pfsnetFsAbortActiveTransfer(0);
                 return;
+            }
             errno = savedErrno;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
             return;
         if (n <= 0) {
+            scr_printf("[DEBUG-control] recv rc=%d errno=%d\n", n, errno);
             g_clientStop = 1;
             pfsnetFsAbortActiveTransfer(0);
             return;

@@ -22,9 +22,11 @@ class TransferControlTest(unittest.TestCase):
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include "protocol.h"
 #define PFSNET_RECV_MAX PFSNET_MAX_CONTROL_PAYLOAD
+#define scr_printf printf
 struct Client { int verified, socket, threadId; };
 static struct Client g_client;
 static int g_clientStop, g_serverStop, aborts, userAbort, tid = 7;
