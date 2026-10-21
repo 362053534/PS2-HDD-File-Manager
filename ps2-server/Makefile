@@ -61,8 +61,9 @@ $(EE_BIN_STRIPPED): $(EE_BIN)
 
 $(EE_BIN_PACKED): $(EE_BIN_STRIPPED) elf-ident.txt
 	ps2-packer $< $@
-	# 非加载节保留程序标识，压缩后仍可用 strings 识别产物。
-	mips64r5900el-ps2-elf-objcopy --add-section .pfsnet.ident=elf-ident.txt $@
+	# packer 不生成节表；在加载段以外的文件尾保留标识，供 strings/CI 识别。
+	printf '\n' >> $@
+	cat elf-ident.txt >> $@
 
 release: $(EE_BIN_PACKED)
 
