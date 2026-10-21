@@ -37,6 +37,7 @@ PS2 端 PFS 网络服务 ELF：开机自动取 IP 并屏显，监听 **45061**�
 
 ## 运行时行为
 
+- **硬盘不自动待机**：每次启动加载 HDD 栈后，对 `hdd0:` 执行 `HDIOC_IDLE`，传入一字节 `0`，关闭 ATA 自动待机计时器；屏显成功或失败码。不需要配置文件，不进行周期保活读写。此设置用于本次服务运行，不保证跨断电、IOP 重置或其他 ELF 持续生效，也不覆盖硬盘/转接器独立的节能策略。正常退出仍执行 `HDIOC_DEV9OFF`。避免空闲起转等待不等于修复传输断流或提高持续吞吐。
 - **取 IP 顺序**（`src/main.c`）：① DHCP → ② 失败则读 OPL `conf_network.cfg` 的静态地址 → ③ 再失败读 uLE `IPCONFIG.DAT` → ④ 仍无可用地址则屏显 `FATAL: failed to obtain an IP address`，按 START 退出（不写兜底 IP）。
 - 屏显最终状态：IP 与来源、NM/GW、Link UP/DOWN、`Control :45061  Data(PC listen):45062`。链路 DOWN 直接报错等 START。
 - **单客户端**：`serverThread` 中若 `g_client.running` 仍在，新连接**立即 close**（不排队）。

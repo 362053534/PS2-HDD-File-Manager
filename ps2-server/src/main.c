@@ -99,6 +99,21 @@ static void loadHddStack(void)
     loadModuleBuffer(PFS_irx, size_PFS_irx, sizeof(pfsArg), pfsArg);
 }
 
+/* 与 362053534 OPL 一致：一字节 0 关闭 ATA 自动待机计时器。
+ * ATAD 初始化会恢复默认计时，因此每次启动都设置；退出时仍正常停盘。
+ * 仅设置服务实际使用的 hdd0，不通过周期读写来保持硬盘唤醒。 */
+static void disableHddStandby(void)
+{
+    unsigned char standbyTimer = 0;
+    int result = fileXioDevctl("hdd0:", HDIOC_IDLE, &standbyTimer,
+                              sizeof(standbyTimer), NULL, 0);
+
+    if (result == 0)
+        scr_printf("HDD automatic standby: disabled\n");
+    else
+        scr_printf("WARN: disable HDD standby failed (%d)\n", result);
+}
+
 static void loadMcStack(void)
 {
     loadModuleBuffer(SIO2MAN_irx, size_SIO2MAN_irx, 0, NULL);
@@ -293,6 +308,7 @@ int main(int argc, char *argv[])
     loadModuleBuffer(POWEROFF_irx, size_POWEROFF_irx, 0, NULL);
     loadModuleBuffer(DEV9_irx, size_DEV9_irx, 0, NULL);
     loadHddStack();
+    disableHddStandby();
     if (pfsnetFsInit() < 0) {
         scr_printf("FATAL: fs init failed\n");
         waitStartToExit();
