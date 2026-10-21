@@ -6,7 +6,6 @@
 #include <timer.h>
 #include <ps2ip.h>
 #include <sys/socket.h>
-#include <sys/select.h>
 #include <netinet/in.h>
 #include <debug.h>
 #include <delaythread.h>
@@ -125,108 +124,6 @@ int pfsnetSendResponse(struct PfsNetClient *client, int result, const void *payl
     return 0;
 }
 
-/* 与正常命令分派共享半帧；lwIP 的 MSG_PEEK 不保证跨 pbuf 拼接，必须实际读取并保存。 */
-static uint8_t g_controlHeader[PFSNET_HEADER_SIZE];
-static int g_controlHeaderUsed;
-
-static int recvControlHeader(int sock, PfsNetPacketHdr *hdr)
-{
-    int remaining = PFSNET_HEADER_SIZE - g_controlHeaderUsed;
-    if (remaining > 0 && recvAll(sock, g_controlHeader + g_controlHeaderUsed, remaining) < 0)
-        return -1;
-    memcpy(hdr, g_controlHeader, sizeof(*hdr));
-    g_controlHeaderUsed = 0;
-    return 0;
-}
-
-/* 只由控制线程读取经过 TCP 校验和重组的当前连接，避免旧连接重传误取消新传输。 */
-void pfsnetPollTransferControl(void)
-{
-    PfsNetPacketHdr hdr;
-    int n;
-
-    if (!g_client.verified || g_client.socket < 0 ||
-        GetThreadId() != g_client.threadId)
-        return;
-    if (g_clientStop || g_serverStop) {
-        pfsnetFsAbortActiveTransfer(0);
-        return;
-    }
-
-    if (g_controlHeaderUsed < PFSNET_HEADER_SIZE) {
-        fd_set readable;
-        struct timeval immediate = {0, 0};
-        FD_ZERO(&readable);
-        FD_SET(g_client.socket, &readable);
-        /* 先确认可读：该 SDK 的空队列 recv 不能可靠地用 errno 与 EOF 区分。 */
-        n = select(g_client.socket + 1, &readable, NULL, NULL, &immediate);
-        if (n == 0)
-            return;
-        if (n < 0) {
-            scr_printf("[DEBUG-control] select rc=%d errno=%d\n", n, errno);
-            g_clientStop = 1;
-            pfsnetFsAbortActiveTransfer(0);
-            return;
-        }
-        n = recv(g_client.socket, g_controlHeader + g_controlHeaderUsed,
-                 PFSNET_HEADER_SIZE - g_controlHeaderUsed, MSG_DONTWAIT);
-        /* 指定 SDK 关闭 LWIP_SOCKET_SET_ERRNO；libcglue 可能将 -errno(0) 返回成 0。
-         * 必须先读取 lwIP 保存的 socket 错误，才能区分暂时无数据与真正 EOF。 */
-        if (n <= 0) {
-            int savedErrno = errno;
-            int socketError = 0;
-            socklen_t errorLen = sizeof(socketError);
-            if (getsockopt(g_client.socket, SOL_SOCKET, SO_ERROR, &socketError, &errorLen) == 0 && socketError != 0) {
-                if (socketError == EAGAIN || socketError == EWOULDBLOCK || socketError == EINTR)
-                    return;
-                scr_printf("[DEBUG-control] recv rc=%d socket_error=%d\n", n, socketError);
-                g_clientStop = 1;
-                pfsnetFsAbortActiveTransfer(0);
-                return;
-            }
-            errno = savedErrno;
-        }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-            return;
-        if (n <= 0) {
-            scr_printf("[DEBUG-control] recv rc=%d errno=%d\n", n, errno);
-            g_clientStop = 1;
-            pfsnetFsAbortActiveTransfer(0);
-            return;
-        }
-        g_controlHeaderUsed += n;
-    }
-    /* 半帧不能解释为命令；END 等正常命令保留给传输结束后的分派器。 */
-    if (g_controlHeaderUsed < PFSNET_HEADER_SIZE)
-        return;
-    memcpy(&hdr, g_controlHeader, sizeof(hdr));
-    if (hdr.payload_length > PFSNET_RECV_MAX) {
-        g_clientStop = 1;
-        pfsnetFsAbortActiveTransfer(0);
-        return;
-    }
-    if (hdr.payload_length != 0 || hdr.result != 0)
-        return;
-    if (hdr.command == PFSNET_CMD_PUT_ABORT || hdr.command == PFSNET_CMD_GET_ABORT) {
-        /* 保留帧，让原命令处理器在工作线程退出、临时文件清理后回复。 */
-        pfsnetFsAbortActiveTransfer(1);
-        return;
-    }
-    if (hdr.command == PFSNET_CMD_PING) {
-        PfsNetPacketHdr reply;
-        g_controlHeaderUsed = 0;
-        reply.command = PFSNET_CMD_HELLO;
-        reply.payload_length = 0;
-        reply.result = PFSNET_OK;
-        /* 心跳回复不可阻塞写盘线程；发送失败或短写时关闭会话，避免留下半帧继续复用。 */
-        n = send(g_client.socket, &reply, sizeof(reply), MSG_DONTWAIT);
-        if (n != (int)sizeof(reply)) {
-            g_clientStop = 1;
-            pfsnetFsAbortActiveTransfer(0);
-        }
-    }
-}
-
 static int handleHello(struct PfsNetClient *client, const uint8_t *payload, uint32_t payloadLen)
 {
     uint32_t magic = 0, version = 0;
@@ -279,10 +176,9 @@ static void clientThread(void *arg)
 
     client->running = 1;
     client->verified = 0;
-    g_controlHeaderUsed = 0;
 
     while (client->running && !g_clientStop && !g_serverStop) {
-        if (recvControlHeader(client->socket, &hdr) < 0)
+        if (recvAll(client->socket, &hdr, sizeof(hdr)) < 0)
             break;
         if (hdr.payload_length > PFSNET_RECV_MAX)
             break;

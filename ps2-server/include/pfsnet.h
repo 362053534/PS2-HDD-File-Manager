@@ -64,7 +64,6 @@ int pfsnetHandleCommand(struct PfsNetClient *client, uint32_t command, const uin
 
 int pfsnetStartServer(void);
 void pfsnetStopServer(void);
-void pfsnetPollTransferControl(void);
 
 /* 有收发时禁止手柄轮询；停传后满 2 秒才允许再轮询 */
 void pfsnetTrafficBegin(void);
