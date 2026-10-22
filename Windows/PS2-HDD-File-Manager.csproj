@@ -8,15 +8,15 @@
     <AssemblyName>PS2-HDD-File-Manager</AssemblyName>
     <RootNamespace>PfsExplorerLite</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <DefaultItemExcludes>$(DefaultItemExcludes);Tests/**;Mac/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="..\PFS-BatchKit-Manager\BAT\hdl_dump.exe" Link="tools\hdl_dump.exe" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\PFS-BatchKit-Manager\BAT\hdl_dump.exe" Link="tools\hdl_dump.exe" CopyToOutputDirectory="PreserveNewest" />
     <!-- pfsshell 使用源码编译产物，不从 BAT 拷贝；Release 打包脚本会确保其已生成。 -->
-    <None Include="..\..\pfsshell\build-local-win32\pfsshell.exe" Link="tools\pfsshell.exe" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\PFS-BatchKit-Manager\BAT\wnbd-client.exe" Link="tools\wnbd-client.exe" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\PFS-BatchKit-Manager\BAT\libwnbd.dll" Link="tools\libwnbd.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\..\pfsshell\build-local-win32\pfsshell.exe" Link="tools\pfsshell.exe" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\PFS-BatchKit-Manager\BAT\wnbd-client.exe" Link="tools\wnbd-client.exe" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\PFS-BatchKit-Manager\BAT\libwnbd.dll" Link="tools\libwnbd.dll" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- Release 构建完成后，在 bin\Release 下生成可分发 zip（不含 pdb）。 -->

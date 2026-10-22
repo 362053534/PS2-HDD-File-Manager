@@ -1,0 +1,55 @@
+# APA File Manager — macOS 原生客户端
+
+独立的 Swift / SwiftUI / AppKit 应用，最低 macOS 13。没有第三方 Swift 包，不依赖 .NET、Avalonia、Windows 工程或 Windows 工具。发布包只包含主程序、Info.plist 和 macOS 原生 pfsshell。Windows 源码、测试与发布位于 ../Windows，各自演进。
+
+## 构建与测试
+
+安装 Apple Command Line Tools。pfsshell 必须来自 `362053534/pfsshell` 并编译为当前 CPU 架构的 Mach-O；Actions 的统一 `build.yml` 中，独立的 `mac-release` job 会编译它。
+
+```sh
+PFSSHELL_TEST_BIN=/path/to/pfsshell ./test.sh
+PFSSHELL_BIN=/path/to/pfsshell ./build.sh
+```
+
+输出 `dist/APA-File-Manager-macOS.zip`，解压为 `APA File Manager.app`。本地构建使用 ad-hoc 签名，未包含 Apple Developer 公证。测试程序只使用系统 Swift/Foundation/Darwin，不要求安装完整 Xcode；未设置 PFSSHELL_TEST_BIN 时，本地镜像集成测试会明确标记 SKIP。Actions 必须提供该变量。
+
+## 功能
+
+- 连接 APANetServer，独立实现现有 PfsNet V1 线上协议；端口 45061/45062，UTF-8 名称，64 位文件长度。
+- 浏览 APA/PFS 分区、目录、总量和可用空间；网络与本地镜像均支持。
+- 原生文件选择、拖入、Cmd+V 导入、导出、Cmd+C 复制到 Finder。复制先将文件下载到本应用缓存后提供原生 URL 剪贴板，不使用 Windows 的虚拟文件剪贴板实现。
+- 递归目录导入/导出/删除；冲突与空间预检；覆盖及删除明确确认。
+- 创建、删除、重命名 PFS 分区。写前检查 APA 校验和、链循环、越界、重叠和子分区引用；写后检查预期结果，创建后验证挂载与根目录。复核失败不继续写入、不自动删除未明确确认的分区。
+- 网络取消先重置数据 socket，再发送 ABORT；TCP KeepAlive 为 60/15/10。数据口失败最多重试两次，检查源文件大小/修改时间/标识，使用服务端确认的偏移续传。PUT_END 状态不明时不自动重发提交。
+- 下载写入同目录唯一临时文件，成功后才原子重命名；失败不会破坏已有目标文件。
+- 本地通过原生 pfsshell 工作；覆盖先写临时文件并校验大小，再备份旧文件并提交。取消等待当前 pfsshell 文件操作完成及卸载，避免强杀写盘进程。
+- 外接整盘选择、安全弹出、操作日志；写入期间通过系统活动令牌防止空闲睡眠。
+
+## 平台边界
+
+- macOS 不包含 Windows WNBD；旧版本不可用的 NBD 按钮和未实现的 ART2 下载入口不保留。
+- 不提供格式化任意物理盘入口；集成测试仅初始化其自行创建的 UUID 临时镜像。
+- 物理盘须有当前用户的读写权限；应用不修改系统权限、不索取密码、不自动提权，拒绝内置系统盘。
+- 本地 pfsshell 命令格式无法安全表达含双引号/换行的路径，会明确拒绝，不静默改名。符号链接不递归导入。
+- 当前构建为构建机本机架构（Actions 使用 Apple Silicon）。真实 PS2 的长时间大文件传输、旧版本 macOS、Intel Mac、物理盘权限与热拔插仍需独立验证，模拟测试与镜像测试不替代这些验证。
+
+## 模块
+
+`Sources/APACore`：协议编解码、原生 socket、APA 校验、网络/本地存储。
+`Sources/APANative`：原生界面、操作队列、文件面板、剪贴板和系统电源管理。
+`Tests/APACoreTests`：截断帧、中文/大文件长度、APA 损坏、双通道传输、取消、续传、下载保护、本地镜像完整生命周期。
+`Tests/HardwareProbe.swift`：默认只读的实机探针，显式 `--transfer` 创建新 UUID 目录进行 64 MiB 上传与 SHA256 回读。
+
+## 本轮验证（2026-10-21）
+
+在用户的 Apple Silicon Mac（Swift 6.4 Command Line Tools）上完成 Release 编译、ad-hoc 签名校验、pfsshell 冒烟测试和 10 组核心/集成检查，均通过。临时镜像测试涵盖分区创建/改名/删除、中文文件导入/回读、覆盖替换、文件与目录操作。续传偏移的故意错误版本被测试检出。原生窗口成功启动并退出；屏幕截图权限不可用，PDF 导出无法完整反映 SwiftUI 图层，不作为视觉验收证据。
+
+当前包内文件共 598,258 字节，ZIP 211,541 字节。仅四个文件：主程序、pfsshell、Info.plist、签名资源清单；不包含第三方运行时。尺寸会随编译器和签名略变。
+
+PS2 实机探针未连接成功（SSH 内超时、本地 Terminal 返回 No route to host），因此未执行新客户端的实机写入和长传输。物理盘热拔插、完整人工界面操作、旧版 macOS/Intel 兼容性尚未验证。Windows 的 19 个 C# 源文件迁移前后逐字节一致，但迁移后的 Windows 构建仍需 Actions 验证。
+
+## 旧工作流适配
+
+根目录 `build-release-mac.sh` 设置 `LEGACY_CI=1`，仍调用本目录的 Swift 构建。为满足未修改的旧 yml，CI 使用 `PS2-HDD-File-Manager.app`、同名主程序和 `PS2-HDD-File-Manager-Release-macos.zip`，写入根目录 bin/Release。显示名称仍为 APA File Manager。直接运行本目录 build.sh 则保留新的原生命名。
+
+`--run-tests` 在 CI 工作区调用真实的 CoreChecks 二进制，并传入本次打包的原生 pfsshell，执行含本地镜像在内的全部测试；失败返回非零。CoreChecks 放在 app 外，不随 ZIP 发布，因此发行版的 --run-tests 会明确报告测试工具未分发，不会假报通过。

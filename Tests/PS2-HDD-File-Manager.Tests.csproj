@@ -9,6 +9,9 @@
     <AssemblyName>PS2-HDD-File-Manager.Tests</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\PS2-HDD-File-Manager.csproj" />
+    <!-- 旧 Actions 的入口适配：测试源码仍归 Windows 客户端所有。 -->
+    <Compile Include="..\Windows\Tests\Program.cs" Link="Program.cs" />
+    <ProjectReference Include="..\Windows\PS2-HDD-File-Manager.csproj"
+                      AdditionalProperties="BaseOutputPath=$(MSBuildProjectDirectory)\..\bin\;_ReleaseZipDir=$(MSBuildProjectDirectory)\..\bin\Release" />
   </ItemGroup>
 </Project>

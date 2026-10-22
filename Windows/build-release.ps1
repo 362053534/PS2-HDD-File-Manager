@@ -38,7 +38,7 @@ try {
     $outDir = Join-Path $root 'bin\Release\net8.0-windows'
     $zipDir = Join-Path $root 'bin\Release'
     $zipPath = Join-Path $zipDir 'PS2-HDD-File-Manager.zip'
-    $toolsSrc = Join-Path $root '..\PFS-BatchKit-Manager\BAT'
+    $toolsSrc = Join-Path $root '..\..\PFS-BatchKit-Manager\BAT'
     $toolsDst = Join-Path $outDir 'tools'
     $batToolNames = @('hdl_dump.exe', 'wnbd-client.exe', 'libwnbd.dll')
 
