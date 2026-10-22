@@ -11,7 +11,18 @@
   <ItemGroup>
     <!-- 旧 Actions 的入口适配：测试源码仍归 Windows 客户端所有。 -->
     <Compile Include="..\Windows\Tests\Program.cs" Link="Program.cs" />
-    <ProjectReference Include="..\Windows\PS2-HDD-File-Manager.csproj"
-                      AdditionalProperties="BaseOutputPath=$(MSBuildProjectDirectory)\..\bin\;_ReleaseZipDir=$(MSBuildProjectDirectory)\..\bin\Release" />
+    <ProjectReference Include="..\Windows\PS2-HDD-File-Manager.csproj" />
   </ItemGroup>
+  <Target Name="CopyLegacyReleaseArtifacts" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <PropertyGroup>
+      <_NativeOutput>$(MSBuildThisFileDirectory)..\Windows\bin\Release\</_NativeOutput>
+      <_LegacyOutput>$(MSBuildThisFileDirectory)..\bin\Release\</_LegacyOutput>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_NativeOutput)net8.0-windows\PS2-HDD-File-Manager.exe')" Text="Windows executable was not built." />
+    <Error Condition="!Exists('$(_NativeOutput)PS2-HDD-File-Manager.zip')" Text="Windows release archive was not built." />
+    <ItemGroup>
+      <_LegacyFiles Include="$(_NativeOutput)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_LegacyFiles)" DestinationFiles="@(_LegacyFiles->'$(_LegacyOutput)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+  </Target>
 </Project>
