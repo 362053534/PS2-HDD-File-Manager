@@ -32,7 +32,6 @@ internal sealed class MainForm : Form
         Margin = new Padding(12, 8, 4, 0)
     };
     private readonly Label _diskSpaceLabel = new() { AutoSize = true, Padding = new Padding(8, 3, 0, 0), Text = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—" };
-    private readonly Button _downloadArt2Button = new() { Text = "一键下载ART2图集", AutoSize = true, Margin = new Padding(4) };
     private readonly ListView _entries = new BrowserListView { View = View.Details, FullRowSelect = true, MultiSelect = true, LabelEdit = true, Dock = DockStyle.Fill };
     private readonly ContextMenuStrip _entryMenu = new();
     private readonly ToolStripMenuItem _copyMenuItem = new("复制");
@@ -297,10 +296,6 @@ internal sealed class MainForm : Form
         var ejectBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
         ejectBar.Controls.Add(MakeButton("安全弹出硬盘", async (_, _) => await SafeEjectSelectedAsync()));
 
-        var art2Bar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false };
-        art2Bar.Controls.Add(_downloadArt2Button);
-        _downloadArt2Button.Click += async (_, _) => await DownloadArt2Async();
-
         // NBD UI 暂时隐藏，代码保留待后续开发
         var nbdBar = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Visible = false };
         var ipBox = new TextBox { Width = 170, PlaceholderText = "PS2 NBD IP，例如 192.168.1.10" };
@@ -341,7 +336,6 @@ internal sealed class MainForm : Form
         top.Controls.Add(nbdBar);
         top.Controls.Add(pfsNetBar);
         top.Controls.Add(ejectBar);
-        top.Controls.Add(art2Bar);
         top.Controls.Add(diskSpaceBar);
         top.Controls.Add(actionBar);
 
@@ -361,14 +355,6 @@ internal sealed class MainForm : Form
     }
 
     private Button MakeButton(string text, EventHandler click) => new Button { Text = text, AutoSize = true, Margin = new Padding(4) }.Also(button => button.Click += click);
-
-    private Task DownloadArt2Async()
-    {
-        // 预留：之后将按游戏 ID 在线下载图集，并写入当前 PFS 分区下的 ART2/ 目录。
-        AppendLog("「一键下载ART2图集」尚未实现：后续将下载到当前分区的 ART2 文件夹。");
-        ShowWarning("该功能尚未实现。\n\n预留说明：图集将下载到当前 PFS 分区内的 ART2 文件夹。");
-        return Task.CompletedTask;
-    }
 
     private async Task RefreshDisksAsync()
     {
