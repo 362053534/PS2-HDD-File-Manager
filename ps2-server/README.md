@@ -1,6 +1,6 @@
 # ps2-server（PfsNet P3）
 
-PS2 端 PFS 网络服务 ELF：开机自动取 IP 并屏显，监听 **45061**，PC 用「PFS 网络」连接。产物为 `PfsNetServer.elf`。
+PS2 端 PFS 网络服务 ELF：开机自动取 IP 并屏显，监听 **45061**，PC 用「PFS 网络」连接。产物为 `ApaNetServer.ELF`。
 
 协议定义见 [`PROTOCOL.md`](PROTOCOL.md)；PC 侧对应实现在 `../Services/PfsNet/`。
 
@@ -73,11 +73,15 @@ make clean && make
 .\ps2-server\scripts\build.ps1 -Docker -Image "ghcr.io/362053534/ps2homebrew:main"
 ```
 
-产物：`PfsNetServer.elf`。
+产物：`ApaNetServer.ELF`。
 
-> 仓库里的 `.o` 与 `PfsNetServer.elf` 是**已提交的构建产物**。改了 `src/` 或 `include/` 之后必须重新编译并一并提交，否则 PC 端会对不上协议行为。
+> 仓库里的 `.o` 与 `ApaNetServer.ELF` 是**已提交的构建产物**。改了 `src/` 或 `include/` 之后必须重新编译并一并提交，否则 PC 端会对不上协议行为。
 
 ## 与 HDLGameInstaller
 
 同端口 45061/45062，**不要同时运行**。握手魔数为 `PFSN`，误连会以 `ERR_MAGIC` 拒。
 PC 防火墙需放行入站 **TCP 45062**（Put/Get 数据回连）。
+
+## Release ELF
+
+`make release`（`make all` 同样调用该目标）先链接 `ApaNetServer-unstripped.ELF`，再用工具链的 `strip` 去符号，最后用 `ps2-packer` 生成 `ApaNetServer.ELF`。处理顺序与 362053534 OPL 一致。屏幕标题为 `ApaNetServer`；通信协议和内部 PfsNet 接口名称保持兼容。Actions 只直传最终的单个 ELF（`archive: false`），下载无需解压 ZIP。未去符号的 ELF 仅用于构建校验与调试，不上传。

@@ -7,7 +7,7 @@ PS2 PFS 图形文件管理器（窗口标题：`PS2 HDD File Manager v1.0 — �
 | 来源 | 后端 | 关键行为 |
 |------|------|----------|
 | 本地 PS2 硬盘（`\\.\PhysicalDriveN`）或硬盘镜像文件 | `tools\pfsshell.exe` 子进程 | 每次操作开一个短生命周期会话：`device` → `mount` → `cd…` → 命令 → `umount` → `exit`。分区命令（`mkpart` / `rmpart` / `rename`）不挂载分区，因此不发 `umount`。批量导入会尽量把多个文件塞进**同一个会话**（`PfsShellClient.ImportBatchAsync`），共享会话失败时自动回退为逐文件导入。 |
-| PS2 主机上的 `PfsNetServer.elf`（PFS 网络） | 自研 PfsNet 协议，见 [`ps2-server/PROTOCOL.md`](ps2-server/PROTOCOL.md) | 控制口 TCP **45061**；Put/Get 载荷由 PS2 **回连** PC 监听的 **45062**。PC 防火墙需放行入站 45062。与 HDLGameInstaller 同端口，**不要同时运行**。 |
+| PS2 主机上的 `ApaNetServer.ELF`（PFS 网络） | 自研 PfsNet 协议，见 [`ps2-server/PROTOCOL.md`](ps2-server/PROTOCOL.md) | 控制口 TCP **45061**；Put/Get 载荷由 PS2 **回连** PC 监听的 **45062**。PC 防火墙需放行入站 45062。与 HDLGameInstaller 同端口，**不要同时运行**。 |
 
 物理盘列表由 `tools\hdl_dump.exe query` 识别：只保留输出中含 `Playstation 2 HDD` 的行，并把 `hddN:` 映射为 `\\.\PhysicalDriveN`。也可用「加载硬盘镜像」直接打开镜像文件。
 
@@ -123,9 +123,9 @@ dotnet run --project Tests\PS2-HDD-File-Manager.Tests.csproj
 | Job | Runner | 产物 |
 |-----|--------|------|
 | `PC Release (net8.0-windows)` | `windows-latest` | `PS2-HDD-File-Manager-Release-windows.zip`（即 `bin\Release\PS2-HDD-File-Manager.zip`，已含 `tools\`） |
-| `PS2 ELF (PfsNetServer)` | `ubuntu-latest` + `ghcr.io/362053534/ps2homebrew:main` | `PfsNetServer-elf` |
+| `PS2 ELF (ApaNetServer)` | `ubuntu-latest` + `ghcr.io/362053534/ps2homebrew:main` | `ApaNetServer.ELF` |
 
-PC 端 zip 用 `actions/upload-artifact@v7` + `archive: false` **直传**（不再套一层 artifact zip），下载即得可分发 zip 本身，解压一次就能用；`archive: false` 只支持单个文件、且 artifact 名取文件名（`name` 被忽略）。`PfsNetServer-elf` 保留默认打包：ELF 没被压过，那层 artifact zip 是有效压缩（约 2.7 MB → 1.0 MB），不属于重复压缩。
+PC 端 zip 用 `actions/upload-artifact@v7` + `archive: false` **直传**（不再套一层 artifact zip），下载即得可分发 zip 本身，解压一次就能用；`archive: false` 只支持单个文件、且 artifact 名取文件名（`name` 被忽略）。`ApaNetServer.ELF` 经过 Release 去符号和 ps2-packer 压缩，使用 `archive: false` 直接下载 ELF，不再封装 ZIP。
 
 pfsshell 不再单独出 artifact：meson 编出的 `pfsshell.exe` 经 csproj 的 `Link="tools\pfsshell.exe"` 直接进输出的 `tools\`，随发行 zip 一起走。作为替换，CI 的「校验产物」步骤会断言 zip 内确实有 `PS2-HDD-File-Manager.exe` + `tools\{pfsshell.exe,hdl_dump.exe,wnbd-client.exe,libwnbd.dll}` 且不含 `*.pdb`。
 
@@ -178,7 +178,7 @@ Services/                    pfsshell 会话、进程执行、盘符发现、安
                              APA/PFS 空间与分区表解析、剪贴板与虚拟文件
 Services/PfsNet/             PfsNet 协议常量、编解码、客户端、APA 扇区源
 Tests/                       断言式回归测试（见上）
-ps2-server/                  PS2 端 ELF 源码、协议文档与已构建的 PfsNetServer.elf
+ps2-server/                  PS2 端 ELF 源码、协议文档与已构建的 ApaNetServer.ELF
 build-release.ps1/.cmd       Windows 发布脚本
 ```
 

@@ -1,4 +1,8 @@
-EE_BIN = PfsNetServer.elf
+.DEFAULT_GOAL := all
+
+EE_BIN = ApaNetServer-unstripped.ELF
+EE_STRIPPED = ApaNetServer-stripped.ELF
+EE_RELEASE = ApaNetServer.ELF
 
 EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
 	IOMANX_irx.o FILEXIO_irx.o POWEROFF_irx.o DEV9_irx.o ATAD_irx.o HDD_irx.o PFS_irx.o \
@@ -29,10 +33,21 @@ VPATH = src
 $(EE_BIN) : $(EE_OBJS)
 	$(EE_CC) $(EE_CFLAGS) $(EE_LDFLAGS) -o $(EE_BIN) $(EE_OBJS) $(EE_LIBS)
 
-all: $(EE_BIN)
+all: release
+
+# 先去符号，再使用与 362053534 OPL 相同的 ps2-packer 生成自解压 ELF。
+$(EE_STRIPPED): $(EE_BIN)
+	$(EE_STRIP) -o $@ $<
+
+$(EE_RELEASE): $(EE_STRIPPED)
+	ps2-packer $< $@
+
+release: $(EE_RELEASE)
+
+.INTERMEDIATE: $(EE_STRIPPED)
 
 clean:
-	rm -f $(EE_BIN) $(EE_OBJS) $(EE_TEMP_FILES)
+	rm -f $(EE_BIN) $(EE_STRIPPED) $(EE_RELEASE) $(EE_OBJS) $(EE_TEMP_FILES)
 
 IOMANX_irx.c:
 	bin2c $(PS2SDK)/iop/irx/iomanX.irx IOMANX_irx.c IOMANX_irx
@@ -87,4 +102,4 @@ PADMAN_irx.c:
 
 include $(PS2SDK)/samples/Makefile.pref
 
-.PHONY: all clean
+.PHONY: all release clean

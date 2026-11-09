@@ -271,7 +271,7 @@ int main(int argc, char *argv[])
     g_mainTid = GetThreadId();
     init_scr();
     scr_clear();
-    scr_printf("PfsNetServer\n");
+    scr_printf("ApaNetServer\n");
     FlushCache(0);
 
     while (!SifIopReset("", 0)) {
@@ -344,7 +344,7 @@ int main(int argc, char *argv[])
     /* 清屏后只保留最终状态；链路用 DHCP 阶段缓存，不再 NetManIoctl */
     ethGetIpDisplay(ipText, sizeof(ipText));
     scr_clear();
-    scr_printf("PfsNetServer\n");
+    scr_printf("ApaNetServer\n");
     scr_printf("IP: %s (%s)\n", ipText, pfsnetIpSourceName(cfg.source));
     scr_printf("NM: %u.%u.%u.%u  GW: %u.%u.%u.%u\n",
                (unsigned)ip4_addr1(&cfg.nm), (unsigned)ip4_addr2(&cfg.nm),
