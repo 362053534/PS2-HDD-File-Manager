@@ -126,7 +126,7 @@ final class AppModel: ObservableObject {
         let ip = host.trimmingCharacters(in:.whitespacesAndNewlines)
         guard !ip.isEmpty else { failure = "请先填写 PS2 IP。"; return }
         UserDefaults.standard.set(ip,forKey:"PfsNetIP")
-        operation("正在连接 PfsNet…") { c in
+        operation("正在连接 ApaNetServer…") { c in
             let oldIDs = self.backends.keys.filter { $0.hasPrefix("pfsnet:") }
             for id in oldIDs {
                 if let old = self.backends.removeValue(forKey:id) { if self.storage === old { self.storage = nil }; old.disconnect() }
@@ -136,7 +136,7 @@ final class AppModel: ObservableObject {
                 if self.sourceID?.hasPrefix("pfsnet:") == true { self.sourceID = nil; self.source = "未连接"; self.entries = []; self.selected = []; self.partition = nil; self.capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—" }
             }
             let next = try NetworkStorage(host:ip,cancel:c)
-            try self.activate(SourceChoice(id:"pfsnet:"+ip,display:"PS2 PfsNet · \(ip)"),storage:next,c)
+            try self.activate(SourceChoice(id:"pfsnet:"+ip,display:"PS2 ApaNetServer · \(ip)"),storage:next,c)
         }
     }
     func open(_ url: URL) {
@@ -204,7 +204,7 @@ final class AppModel: ObservableObject {
     func eject() {
         guard !busy, let choice = sources.first(where: { $0.id == sourceID }) else { return }
         if choice.network {
-            if confirm("安全弹出硬盘", "当前来源是 PFS 网络连接，无法硬件弹出。是否断开 PfsNet？") { removeSource(choice) }
+            if confirm("安全弹出硬盘", "当前来源是 ApaNetServer连接，无法硬件弹出。是否断开 ApaNetServer？") { removeSource(choice) }
         } else if choice.id.hasPrefix("/dev/") {
             if confirm("安全弹出硬盘", "确定要安全弹出吗？\n\n\(choice.display)\n\n弹出前请确认没有其它程序正在访问该硬盘。") { removeSource(choice,eject:true) }
         } else if confirm("移除镜像", "“\(choice.display)”是镜像文件，无法执行硬件弹出。是否仅从列表中移除？") { removeSource(choice) }

@@ -14,6 +14,6 @@ macOS 不引用或编译 Windows 的 Models、Services、Tests，不使用 .NET�
 
 ## 旧 Actions 兼容入口
 
-保留远端原有 `.github/workflows/build.yml` 不变，仍由三个 job 分别构建和上传。根目录 `Tests/PS2-HDD-File-Manager.Tests.csproj` 只转接 Windows 测试；根目录 `build-release-mac.sh` 只转接 Swift 构建。平台源码和依赖仍完全分离。
+继续使用单个 `.github/workflows/build.yml`，由三个 job 分别构建和上传。根目录 `Tests/PS2-HDD-File-Manager.Tests.csproj` 只转接 Windows 测试；根目录 `build-release-mac.sh` 只转接 Swift 构建。平台源码和依赖仍完全分离。
 
-Actions 下载名暂时沿用 `PS2-HDD-File-Manager-Release-windows.zip`、`PS2-HDD-File-Manager-Release-macos.zip` 和 `PfsNetServer-elf`（内含 `PfsNetServer.elf`）。PS2 屏显为 APANetServer，Makefile 同时生成正式名称 `APANetServer.ELF`。旧 Mac job 安装 .NET SDK 的步骤仍存在，但原生客户端不使用该 SDK，产物不包含 .NET。
+Actions 分别提供 `PS2-HDD-File-Manager-Release-windows.zip`、`PS2-HDD-File-Manager-Release-macos.zip` 和 `ApaNetServer.ELF`。PS2 产物通过 release 目标去符号并由 ps2-packer 压缩，直接下载 ELF，不再额外包装 ZIP；PS2 屏显和 ELF 识别名称统一为 `ApaNetServer`。

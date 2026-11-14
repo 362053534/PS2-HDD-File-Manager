@@ -3,7 +3,7 @@ name: Build
 # push 时自动编译三条链：
 #   1) PC 端 Release（windows-latest，含 pfsshell 源码编译 + tools 打包 + 测试）
 #   2) Mac 端 Release（macos-latest，Avalonia UI + macOS pfsshell 源码编译 + .app 打包 + 测试）
-#   3) PS2 端 PfsNetServer.elf（ubuntu-latest + 362053534 的 Docker 编译镜像）
+#   3) PS2 端 ApaNetServer.ELF（ubuntu-latest + 362053534 的 Docker 编译镜像）
 # 产物统一用 upload-artifact 提供下载。
 #
 # 提速（PC job 实测 200s → 缓存命中 93s）：
@@ -19,7 +19,7 @@ name: Build
 # 所以 PC 端与 Mac 端的 zip 均用 @v7 + `archive: false`「直传」，下载即得可用的 zip。
 #   注意：archive: false 只允许单个文件，且 `name` 输入被忽略，
 #         artifact 名 = 文件名（所以先把 zip 复制成带 -windows / -macos 后缀的名字）。
-#   ELF 仍走默认打包：它没被压过，外层 zip 是有效压缩，不算重复。
+#   ELF 已由 ps2-packer 压缩，同样使用 archive: false 直接提供 .ELF 下载。
 #
 # pfsshell 不需要单独出 artifact：meson 编出的 pfsshell 二进制直接打进各自平台的 tools/，随发行 zip 一起分发。
 #
@@ -352,7 +352,7 @@ jobs:
 
   # -------------------------------------------------------------- PS2 端
   ps2-elf:
-    name: PS2 ELF (PfsNetServer)
+    name: PS2 ELF (ApaNetServer)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -373,14 +373,14 @@ jobs:
 
       # 与 ps2-server/scripts/build.ps1 -Docker 等价：
       # make clean 会删掉仓库内已提交的 *_irx.c/.o，再由 bin2c 从 SDK 的 IRX 重新生成
-      - name: 编译 PfsNetServer.elf
+      - name: 编译 ApaNetServer.ELF
         run: |
           docker run --rm \
             -e PS2SDK="$PS2SDK_IN_IMAGE" \
             -v "$GITHUB_WORKSPACE/ps2-server:/src" \
             -w /src \
             "$PS2_IMAGE" \
-            sh -c 'set -e; command -v mips64r5900el-ps2-elf-gcc; command -v bin2c; make clean || true; make all; ls -la PfsNetServer.elf'
+            sh -c 'set -e; command -v mips64r5900el-ps2-elf-gcc; command -v bin2c; make clean || true; make release; ls -la ApaNetServer.ELF'
 
       - name: 归还文件属主
         run: sudo chown -R "$(id -u):$(id -g)" ps2-server
@@ -388,14 +388,14 @@ jobs:
       - name: 校验 ELF
         run: |
           set -e
-          test -s ps2-server/PfsNetServer.elf
-          printf 'magic: '; head -c 4 ps2-server/PfsNetServer.elf | od -An -c | tr -s ' '
-          strings ps2-server/PfsNetServer.elf | grep -m1 '^PfsNetServer$'
+          test -s ps2-server/ApaNetServer.ELF
+          printf 'magic: '; head -c 4 ps2-server/ApaNetServer.ELF | od -An -c | tr -s ' '
+          strings ps2-server/ApaNetServer.ELF | grep -m1 '^ApaNetServer$'
 
-      # 这里刻意不用 archive: false：ELF 未被压缩过，artifact 的那层 zip 是有效的
-      # （约 2.7 MB → 1.0 MB），不存在「zip 套 zip」的重复压缩问题。
+      # ELF 已通过 release 目标完成去符号及 ps2-packer 压缩，直接提供单个 .ELF 文件。
       - uses: actions/upload-artifact@v7
         with:
-          name: PfsNetServer-elf
-          path: ps2-server/PfsNetServer.elf
+          name: ApaNetServer.ELF
+          path: ps2-server/ApaNetServer.ELF
+          archive: false
           if-no-files-found: error

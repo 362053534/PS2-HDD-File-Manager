@@ -45,7 +45,7 @@ Docker 未安装或不在 PATH。
 "@
     }
 
-    Write-Host "Building APANetServer.ELF via Docker"
+    Write-Host "Building ApaNetServer.ELF via Docker"
     Write-Host "  image=$Image"
     Write-Host "  PS2SDK(in container)=$DockerPs2Sdk"
     Write-Host "  dir=$root"
@@ -67,13 +67,13 @@ Docker 未安装或不在 PATH。
         -v "${root}:/src" `
         -w /src `
         $Image `
-        sh -c 'make clean || true; make all; ls -la APANetServer.ELF'
+        sh -c 'make clean || true; make release; ls -la ApaNetServer.ELF'
 
     if ($LASTEXITCODE -ne 0) {
         throw "Docker build failed (exit $LASTEXITCODE)"
     }
 
-    $elf = Join-Path $root "APANetServer.ELF"
+    $elf = Join-Path $root "ApaNetServer.ELF"
     if (-not (Test-Path $elf)) {
         throw "Build finished but ELF not found: $elf"
     }
@@ -101,11 +101,11 @@ PS2SDK IRX missing: $irxProbe
 $wslSdk = ($Ps2Sdk -replace '\\', '/' -replace '^C:', '/mnt/c' -replace '^c:', '/mnt/c')
 $wslDir = ($root -replace '\\', '/' -replace '^C:', '/mnt/c' -replace '^c:', '/mnt/c')
 
-Write-Host "Building APANetServer.ELF"
+Write-Host "Building ApaNetServer.ELF"
 Write-Host "  PS2SDK=$Ps2Sdk"
 Write-Host "  PS2DEV=$Ps2Dev"
 Write-Host "  dir=$root"
 
 # 用 LF 单行，避免 CRLF；变量用单引号交给 bash 展开
-$bash = "set -e; export PS2SDK='$wslSdk'; export PS2DEV='$Ps2Dev'; export PATH=`"`$PS2DEV/bin:`$PS2DEV/ee/bin:`$PS2DEV/iop/bin:`$PS2SDK/bin:`$PATH`"; command -v mips64r5900el-ps2-elf-gcc >/dev/null; command -v bin2c >/dev/null; cd '$wslDir'; make clean || true; make all PS2SDK='$wslSdk'; ls -la APANetServer.ELF"
+$bash = "set -e; export PS2SDK='$wslSdk'; export PS2DEV='$Ps2Dev'; export PATH=`"`$PS2DEV/bin:`$PS2DEV/ee/bin:`$PS2DEV/iop/bin:`$PS2SDK/bin:`$PATH`"; command -v mips64r5900el-ps2-elf-gcc >/dev/null; command -v bin2c >/dev/null; cd '$wslDir'; make clean || true; make release PS2SDK='$wslSdk'; ls -la ApaNetServer.ELF"
 wsl -e bash -lc $bash

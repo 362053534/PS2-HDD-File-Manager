@@ -214,7 +214,7 @@ internal sealed class PfsNetClient : IDisposable
         {
             EnsureConnected();
             if ((_features & PfsNetProtocol.FeatApaSector) == 0)
-                throw new InvalidOperationException("PS2 未声明 FEAT_APA_SECTOR。请更新 APANetServer.ELF。");
+                throw new InvalidOperationException("PS2 未声明 FEAT_APA_SECTOR。请更新 ApaNetServer.ELF。");
             if (count == 0 || count > 256)
                 throw new ArgumentOutOfRangeException(nameof(count), "单次最多读取 256 扇区。");
 
@@ -822,13 +822,13 @@ internal sealed class PfsNetClient : IDisposable
     private void EnsureDataChannel()
     {
         if ((_features & PfsNetProtocol.FeatDataChannel) == 0)
-            throw new InvalidOperationException("PS2 未声明 FEAT_DATA_CHANNEL，无法 Put/Get。请更新并运行新版 APANetServer.ELF。");
+            throw new InvalidOperationException("PS2 未声明 FEAT_DATA_CHANNEL，无法 Put/Get。请更新并运行新版 ApaNetServer.ELF。");
     }
 
     private void EnsureApaMutate()
     {
         if ((_features & PfsNetProtocol.FeatApaMutate) == 0)
-            throw new InvalidOperationException("PS2 未声明 FEAT_APA_MUTATE。请更新并运行新版 APANetServer.ELF。");
+            throw new InvalidOperationException("PS2 未声明 FEAT_APA_MUTATE。请更新并运行新版 ApaNetServer.ELF。");
     }
 
     private static TcpListener CreateDataListener()

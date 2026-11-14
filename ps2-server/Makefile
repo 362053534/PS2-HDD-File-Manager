@@ -1,6 +1,7 @@
-EE_BIN = APANetServer-debug.ELF
-EE_BIN_STRIPPED = APANetServer-stripped.ELF
-EE_BIN_PACKED = APANetServer.ELF
+.DEFAULT_GOAL := all
+EE_BIN = ApaNetServer-debug.ELF
+EE_BIN_STRIPPED = ApaNetServer-stripped.ELF
+EE_BIN_PACKED = ApaNetServer.ELF
 
 EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
 	IOMANX_irx.o FILEXIO_irx.o POWEROFF_irx.o DEV9_irx.o ATAD_irx.o HDD_irx.o PFS_irx.o \
@@ -53,11 +54,8 @@ VPATH = src
 $(EE_BIN) : $(EE_OBJS)
 	$(EE_CC) $(EE_CFLAGS) $(EE_LDFLAGS) -o $(EE_BIN) $(EE_OBJS) $(EE_LIBS)
 
-# 旧工作流固定上传此名称；主体仍为 APANetServer 压缩 ELF。
-all: PfsNetServer.elf
-
-PfsNetServer.elf: $(EE_BIN_PACKED)
-	cp $< $@
+# 默认构建与 release 均产出同一个压缩 ELF。
+all: release
 
 # 保留原始 ELF 供定位问题；发布产物使用与 362053534 OPL 相同的处理顺序。
 $(EE_BIN_STRIPPED): $(EE_BIN)
@@ -74,7 +72,7 @@ release: $(EE_BIN_PACKED)
 .INTERMEDIATE: $(EE_BIN_STRIPPED)
 
 clean:
-	rm -f PfsNetServer.elf $(EE_BIN) $(EE_BIN_STRIPPED) $(EE_BIN_PACKED) $(EE_OBJS) $(EE_TEMP_FILES)
+	rm -f $(EE_BIN) $(EE_BIN_STRIPPED) $(EE_BIN_PACKED) $(EE_OBJS) $(EE_TEMP_FILES)
 
 IOMANX_irx.c:
 	bin2c $(PS2SDK)/iop/irx/iomanX.irx IOMANX_irx.c IOMANX_irx

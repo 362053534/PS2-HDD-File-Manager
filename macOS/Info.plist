@@ -10,5 +10,5 @@
 <key>CFBundleExecutable</key><string>APAFileManager</string>
 <key>LSMinimumSystemVersion</key><string>12.0</string>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSLocalNetworkUsageDescription</key><string>连接局域网中的 PS2 APANetServer 并传输文件。</string>
+<key>NSLocalNetworkUsageDescription</key><string>连接局域网中的 PS2 ApaNetServer 并传输文件。</string>
 </dict></plist>

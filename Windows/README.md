@@ -9,7 +9,7 @@ PS2 PFS 图形文件管理器（窗口标题：`PS2 HDD File Manager v1.0 — �
 | 来源 | 后端 | 关键行为 |
 |------|------|----------|
 | 本地 PS2 硬盘（`\\.\PhysicalDriveN`）或硬盘镜像文件 | `tools\pfsshell.exe` 子进程 | 每次操作开一个短生命周期会话：`device` → `mount` → `cd…` → 命令 → `umount` → `exit`。分区命令（`mkpart` / `rmpart` / `rename`）不挂载分区，因此不发 `umount`。批量导入会尽量把多个文件塞进**同一个会话**（`PfsShellClient.ImportBatchAsync`），共享会话失败时自动回退为逐文件导入。 |
-| PS2 主机上的 `APANetServer.ELF`（PFS 网络） | 自研 PfsNet 协议，见 [`PS2 协议`](../ps2-server/PROTOCOL.md) | 控制口 TCP **45061**；Put/Get 载荷由 PS2 **回连** PC 监听的 **45062**。PC 防火墙需放行入站 45062。与 HDLGameInstaller 同端口，**不要同时运行**。 |
+| PS2 主机上的 `ApaNetServer.ELF`（PFS 网络） | 自研 PfsNet 协议，见 [`PS2 协议`](../ps2-server/PROTOCOL.md) | 控制口 TCP **45061**；Put/Get 载荷由 PS2 **回连** PC 监听的 **45062**。PC 防火墙需放行入站 45062。与 HDLGameInstaller 同端口，**不要同时运行**。 |
 
 物理盘列表由 `tools\hdl_dump.exe query` 识别：只保留输出中含 `Playstation 2 HDD` 的行，并把 `hddN:` 映射为 `\\.\PhysicalDriveN`。也可用「加载硬盘镜像」直接打开镜像文件。
 

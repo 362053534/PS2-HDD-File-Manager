@@ -1,6 +1,6 @@
 # ps2-server（PfsNet P3）
 
-PS2 端 PFS 网络服务 ELF：开机自动取 IP 并屏显，监听 **45061**，PC 用「PFS 网络」连接。产物为 `APANetServer.ELF`。
+PS2 端 PFS 网络服务 ELF：开机自动取 IP 并屏显，监听 **45061**，PC 用「PFS 网络」连接。产物为 `ApaNetServer.ELF`。
 
 协议定义见 [`PROTOCOL.md`](PROTOCOL.md)；PC 侧对应实现在 `../Windows/Services/PfsNet/`；macOS 独立实现在 `../macOS/Sources/APACore/`。
 
@@ -58,7 +58,7 @@ PS2 端 PFS 网络服务 ELF：开机自动取 IP 并屏显，监听 **45061**�
 
 ## 编译
 
-`make all` / `make release` 默认生成压缩的 `APANetServer.ELF`（PS2 自解压 ELF），处理顺序与 362053534 OPL 一致：链接 → 去符号 → `ps2-packer`。去符号文件仅为中间产物，构建后自动清理，不单独发布；构建目录的 `APANetServer-debug.ELF` 用于调试。CI 仅发布压缩版。压缩 ELF 在所有加载段之外的文件尾保留程序名称，供产物识别与 CI 校验使用，不改变解压代码或加载内容。
+`make all` / `make release` 默认生成压缩的 `ApaNetServer.ELF`（PS2 自解压 ELF），处理顺序与 362053534 OPL 一致：链接 → 去符号 → `ps2-packer`。去符号文件仅为中间产物，构建后自动清理，不单独发布；构建目录的 `ApaNetServer-debug.ELF` 用于调试。CI 仅发布压缩版。压缩 ELF 在所有加载段之外的文件尾保留程序名称，供产物识别与 CI 校验使用，不改变解压代码或加载内容。
 
 压缩版需验证实际启动器兼容性；压缩不降低服务解压后的内存需求，也不提升网络传输速度。
 
@@ -78,7 +78,7 @@ make clean && make
 .\ps2-server\scripts\build.ps1 -Docker -Image "ghcr.io/362053534/ps2homebrew:main"
 ```
 
-产物：`APANetServer.ELF`。
+产物：`ApaNetServer.ELF`。
 
 > 仓库包含历史 `.o`，不要用它们作为增量构建缓存；必须先 `make clean`。构建脚本与 CI 均会执行清理。改了 `src/` 或 `include/` 后，提交的 ELF 必须来自对应源码的干净构建，不能把旧 ELF 当作新源码的测试结果。
 
@@ -107,6 +107,8 @@ python3 scripts/pfsnet-transfer-probe.py 192.168.1.10 --put-mib 6144
 
 探针遇到第一次错误即失败，不自动重试掩盖断流。长传输探针设置与正式客户端相同的 TCP KeepAlive（60 秒、15 秒间隔、10 次重试）。日志为 JSON Lines，记录已完成发送的字节数、阶段与结果；Mac 还记录 TCP 窗口、重传、RTT 和上传期间的控制连接状态。发送完成不代表落盘完成，只有 `PUT_END` 成功且回读 SHA-256 一致才输出 `verified`。这类实机测试不能用主机上的 socket 模拟替代。
 
-### 旧工作流文件名兼容
+### 统一产物名称
 
-`make all` 额外把压缩后的 `APANetServer.ELF` 复制为旧 yml 固定上传的 `PfsNetServer.elf`，两者内容相同；文件尾包含新旧程序标识供旧 CI 校验，屏幕标题仅为 APANetServer。Actions artifact 暂时沿用 PfsNetServer-elf。`make release` 仍以正式名称为目标。
+`make`、`make all`、`make release` 均生成压缩版 `ApaNetServer.ELF`；处理顺序为链接、去符号、ps2-packer 压缩。PS2 屏显和 ELF 尾部识别名称均为 `ApaNetServer`。旧名称的兼容副本不再生成。
+
+统一工作流中的 PS2 job 执行 `make release`，校验并上传 `ps2-server/ApaNetServer.ELF`，使用 `archive: false` 直接提供 ELF 下载，不再额外包装 ZIP。Windows 和 macOS 客户端保持独立的发布文件名。

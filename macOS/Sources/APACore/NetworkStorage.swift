@@ -13,12 +13,12 @@ public final class NetworkStorage: Storage {
         control = try TCPSocket.connect(host, port: port, cancel: cancel)
         var hello = Wire(); hello.put(UInt32(0x4E534650)); hello.put(UInt32(1))
         var reply = Wire(try rpc(1,hello.bytes,cancel))
-        guard try reply.get(UInt32.self) == 0x4E534650, try reply.get(UInt32.self) == 1 else { throw APAError.message("APANetServer 协议不匹配") }
+        guard try reply.get(UInt32.self) == 0x4E534650, try reply.get(UInt32.self) == 1 else { throw APAError.message("ApaNetServer 协议不匹配") }
         features = try reply.get(); try reply.finish()
     }
     public func disconnect() { control?.close(); control = nil }
     private func require(_ flags: UInt32) throws {
-        guard features & flags == flags else { throw APAError.message("PS2 服务缺少所需功能，请更新 APANetServer.ELF") }
+        guard features & flags == flags else { throw APAError.message("PS2 服务缺少所需功能，请更新 ApaNetServer.ELF") }
     }
     @discardableResult
     func rpc(_ command: UInt32, _ payload: Data = Data(), _ cancel: Cancellation?, timeout: TimeInterval = 30) throws -> Data {

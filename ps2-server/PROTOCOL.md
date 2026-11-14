@@ -47,7 +47,7 @@
 ## 2. 网络拓扑
 
 ```
-PC                                      PS2 (APANetServer.ELF)
+PC                                      PS2 (ApaNetServer.ELF)
  |                                         |
  |  TCP connect ---------------------------->|  listen :45061  (控制)
  |  握手 / RPC 命令                         |
@@ -315,7 +315,7 @@ PC 侧：
 
 - PS2 端（`fsops.c:handleReadSectors`）硬性校验 `count` 在 **1–256**、`lba ≤ 0xFFFFFFFF`（底层 `HDIOC_READSECTOR` 用 32 位 LBA），否则 `ERR_INVAL`。载荷不足 12 字节同样 `ERR_INVAL`。
 - PC 端（`PfsNetClient.ReadSectorsAsync`）同样限制 256 扇区，并校验返回长度 == `count * 512`。超过 256 扇区的请求由 `PfsNetApaSectorSource` 自动切块串行拉取。
-- PC 端在调用前检查 `FEAT_APA_SECTOR`，未声明则提示「请更新 APANetServer.ELF」。
+- PC 端在调用前检查 `FEAT_APA_SECTOR`，未声明则提示「请更新 ApaNetServer.ELF」。
 
 ### 5.6 分区变更（A + FEAT_APA_MUTATE）
 

@@ -142,9 +142,9 @@ final class BrowserController: NSViewController, NSTableViewDataSource, NSTableV
         source.setContentHuggingPriority(.defaultLow,for:.horizontal)
         source.widthAnchor.constraint(equalToConstant:549).isActive = true
         let sourceRow = row([NSTextField(labelWithString:"来源："),source,button("刷新",#selector(scan)),button("加载硬盘镜像",#selector(image)),spacer()])
-        ip.placeholderString = "PS2 PfsNet IP，例如 192.168.1.10"; ip.stringValue = model.host
+        ip.placeholderString = "PS2 ApaNetServer IP，例如 192.168.1.10"; ip.stringValue = model.host
         ip.widthAnchor.constraint(equalToConstant:170).isActive = true
-        let networkRow = row([NSTextField(labelWithString:"PFS 网络："),ip,button("连接 PFS 网络",#selector(connect)),button("断开 PFS 网络",#selector(disconnect)),spacer()])
+        let networkRow = row([NSTextField(labelWithString:"ApaNetServer："),ip,button("连接 ApaNetServer",#selector(connect)),button("断开 ApaNetServer",#selector(disconnect)),spacer()])
         let ejectRow = row([button("安全弹出硬盘",#selector(eject)),spacer()])
         capacity.font = .systemFont(ofSize:12); capacity.lineBreakMode = .byTruncatingTail
         system.target = self; system.action = #selector(toggleSystem)
@@ -203,7 +203,7 @@ final class BrowserController: NSViewController, NSTableViewDataSource, NSTableV
         if table.selectedRowIndexes != selection { table.selectRowIndexes(selection,byExtendingSelection:false) }
         source.isEnabled = !model.busy && !model.sources.isEmpty; ip.isEnabled = !model.busy
         for b in buttons.values { b.isEnabled = !model.busy }
-        buttons["断开 PFS 网络"]?.isEnabled = !model.busy && model.networkConnected
+        buttons["断开 ApaNetServer"]?.isEnabled = !model.busy && model.networkConnected
         buttons["安全弹出硬盘"]?.isEnabled = !model.busy && model.hasSource
         buttons["上级目录"]?.isEnabled = !model.busy && model.partition != nil
         system.isEnabled = !model.busy; system.state = model.showSystem ? .on:.off
