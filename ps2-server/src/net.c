@@ -19,6 +19,7 @@
 #include <ps2ip.h>
 
 #include "pfsnet.h"
+#include "diagnostics.h"
 
 extern void *_gp;
 extern void NetManToggleGlobalNetIFLinkState(unsigned char state);
@@ -52,6 +53,7 @@ extern int _SifCmdIntHandler(int channel);
  */
 uint32_t __wrap_sys_now(void)
 {
+    g_apaDiag.clockCalls++;
     return (uint32_t)(GetTimerSystemTime() / ((u64)kBUSCLK / 1000ULL));
 }
 
@@ -194,6 +196,7 @@ struct pbuf *__wrap_pbuf_alloc(pbuf_layer l, u16 size, pbuf_type type)
     if (p != NULL)
         return p;
 
+    g_apaDiag.pbufMisses++;
     if (type == PBUF_POOL && g_dynamicPbufCount < 1024) {
         u32 stride = memp_PBUF_POOL.size;
         void *extra;
@@ -363,6 +366,8 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
     struct NetManBD *bdNext;
     int dchainStopped;
 
+    g_apaDiag.sifIrqs++;
+
     while (pktHdr != NULL && pktHdr->psize != 0)
         _SifCmdIntHandler(channel);
 
@@ -444,25 +449,50 @@ static void pfsnetNetManRxThread(void *arg)
             }
             EI();
 
-            if (!run)
+            if (!run) {
+                g_apaDiag.rxStage = APA_RX_SLEEP;
                 SleepThread();
+            }
         } while (!run);
 
         payload = bd->payload;
         packet = bd->packet;
 
+        g_apaDiag.rxStage = APA_RX_ALLOC;
         while ((packetNext = NetManNetProtStackAllocRxPacket(NETMAN_NETIF_FRAME_SIZE, &payloadNext)) == NULL) {
+            g_apaDiag.rxAllocRetries++;
             DelayThread(200);
         }
         SifWriteBackDCache(payloadNext, (NETMAN_NETIF_FRAME_SIZE + 63) & ~63);
         g_nmRxBufferNextRdPtr = (g_nmRxBufferNextRdPtr + 1) % NETMAN_RPC_BLOCK_SIZE;
+        g_apaDiag.rxStage = APA_RX_DMA;
         pfsnetNetManClearBufferLen(g_nmRxBufferRdPtr, packetNext, payloadNext);
         g_nmRxBufferRdPtr = g_nmRxBufferNextRdPtr;
 
         PacketLengthAligned = (PacketLength + 63) & ~63;
         SifWriteBackDCache(payload, PacketLengthAligned);
         NetManNetProtStackReallocRxPacket(packet, PacketLength);
+        g_apaDiag.rxStage = APA_RX_ENQUEUE;
         NetManNetProtStackEnQRxPacket(packet);
+        g_apaDiag.rxPackets++;
+    }
+}
+
+/* EE-local reads only; caller snapshots with interrupts briefly disabled.
+ * Do not query NETMAN via IOP RPC here: that could hang the monitor too. */
+void apaDiagNetSnapshot(ApaDiagnostics *s)
+{
+    SifCmdHeader_t *header = (SifCmdHeader_t *)_sif_cmd_data.pktbuf;
+    s->sif0 = _lw(0x1000c000);
+    s->dstat = _lw(0x1000e010);
+    s->rxIndex = g_nmRxBufferRdPtr;
+    s->rxBusy = g_nmIsProcessingRx;
+    s->cmdSize = header != NULL ? header->psize : 0;
+    if (g_nmFrameBufferStatus != NULL) {
+        volatile struct NetManBD *bd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
+        volatile struct NetManBD *next = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
+        s->rxLen = bd->length;
+        s->rxNextLen = next->length;
     }
 }
 
@@ -610,8 +640,11 @@ static pfsnet_arch_message_t *tryAllocMsg(void)
     if (PollSema(g_msgCountSema) == g_msgCountSema) {
         int old = DIntr();
         message = g_freeHead;
-        if (message != NULL)
+        if (message != NULL) {
             g_freeHead = message->next;
+            if (++g_apaDiag.msgUsed > g_apaDiag.msgPeak)
+                g_apaDiag.msgPeak = g_apaDiag.msgUsed;
+        }
         if (old)
             EIntr();
     } else {
@@ -625,11 +658,19 @@ static pfsnet_arch_message_t *allocMsg(void)
     pfsnet_arch_message_t *message;
     int old;
 
+    old = DIntr();
+    g_apaDiag.msgWaits++;
+    g_apaDiag.msgWaiting++;
+    if (old) EIntr();
     WaitSema(g_msgCountSema);
     old = DIntr();
+    g_apaDiag.msgWaiting--;
     message = g_freeHead;
-    if (message != NULL)
+    if (message != NULL) {
         g_freeHead = message->next;
+        if (++g_apaDiag.msgUsed > g_apaDiag.msgPeak)
+            g_apaDiag.msgPeak = g_apaDiag.msgUsed;
+    }
     if (old)
         EIntr();
     return message;
@@ -644,6 +685,7 @@ static void freeMsg(pfsnet_arch_message_t *msg)
     old = DIntr();
     msg->next = g_freeHead;
     g_freeHead = msg;
+    if (g_apaDiag.msgUsed > 0) g_apaDiag.msgUsed--;
     if (old)
         EIntr();
     SignalSema(g_msgCountSema);

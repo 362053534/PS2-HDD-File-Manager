@@ -3,7 +3,7 @@ EE_BIN = ApaNetServer-debug.ELF
 EE_BIN_STRIPPED = ApaNetServer-stripped.ELF
 EE_BIN_PACKED = ApaNetServer.ELF
 
-EE_OBJS = main.o net.o netcfg.o server.o fsops.o \
+EE_OBJS = main.o net.o netcfg.o server.o fsops.o diagnostics.o \
 	IOMANX_irx.o FILEXIO_irx.o POWEROFF_irx.o DEV9_irx.o ATAD_irx.o HDD_irx.o PFS_irx.o \
 	SIO2MAN_irx.o MCMAN_irx.o MCSERV_irx.o \
 	BDM_irx.o BDMFS_FATFS_irx.o USBD_irx.o USBMASS_BD_irx.o \

@@ -17,6 +17,7 @@
 #include <iox_stat.h>
 
 #include "pfsnet.h"
+#include "diagnostics.h"
 
 #define PFSNET_XFER_NONE 0
 #define PFSNET_XFER_PUT 1
@@ -717,7 +718,9 @@ static int xferRecvAll(int sock, void *buf, int len)
             ok = 0;
             break;
         }
+        g_apaDiag.recvStage = APA_IO_RECV;
         n = recv(sock, ptr + got, len - got, 0);
+        apaDiagRecvResult(n, n < 0 ? errno : 0);
         if (n <= 0) {
             ok = 0;
             break;
@@ -742,6 +745,7 @@ static void ioWorker(void *arg)
                 uint8_t *dst = g_ringBase + ((size_t)wrIdx * (size_t)PFSNET_XFER_BUF);
                 int r;
 
+                g_apaDiag.recvStage = APA_IO_FREE;
                 WaitSema(g_putFreeSem);
                 if (g_putStop) {
                     g_ringBankLen[wrIdx] = -1;
@@ -756,6 +760,7 @@ static void ioWorker(void *arg)
                     SignalSema(g_putFillSem);
                     break;
                 }
+                g_apaDiag.recvStage = APA_IO_READY;
                 g_ringBankLen[wrIdx] = r;
                 SignalSema(g_putFillSem);
                 netRem -= (uint64_t)r;
@@ -1005,6 +1010,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
     g_putStop = 0;
     g_putUserAbort = 0;
     g_xferActive = 1;
+    apaDiagPutBegin(totalBytes, got, (unsigned)g_ringBanks);
 
     /* 多槽环形缓冲（16x512KiB = 8MiB）：ioWorker 连续排空 TCP 窗口，clientThread 连续写盘 */
     g_lastPutErr = 0;
@@ -1032,6 +1038,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
             uint8_t *src;
             int written = 0;
 
+            g_apaDiag.diskStage = APA_IO_FILL;
             WaitSema(g_putFillSem);
             bankLen = g_ringBankLen[rdIdx];
             if (bankLen <= 0 || g_putStop) {
@@ -1051,7 +1058,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
                     failed = 1;
                     break;
                 }
-                wr = fileXioWrite(fd, src + written, bankLen - written);
+                wr = apaDiagWrite(fd, src + written, bankLen - written);
                 if (wr <= 0) {
                     g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                     failed = 1;
@@ -1102,7 +1109,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
                         failed = 1;
                         break;
                     }
-                    wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
+                    wr = apaDiagWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
                     if (wr <= 0) {
                         g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                         failed = 1;
@@ -1133,7 +1140,7 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
         if (!failed && havePending) {
             int written = 0;
             while (written < pendingLen) {
-                int wr = fileXioWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
+                int wr = apaDiagWrite(fd, g_xferBuf[pendingIdx] + written, pendingLen - written);
                 if (wr <= 0) {
                     g_lastPutErr = wr < 0 ? mapErrno(wr) : PFSNET_ERR_IO;
                     failed = 1;
@@ -1148,8 +1155,11 @@ static int handlePutBegin(struct PfsNetClient *client, const uint8_t *payload, u
 
     g_xferActive = 0;
     g_xfer.dataSock = -1;
+    g_apaDiag.diskStage = APA_IO_CLOSE;
     close(dataSock);
     fileXioClose(fd);
+    g_apaDiag.diskStage = got == totalBytes ? APA_IO_DONE : APA_IO_ERROR;
+    g_apaDiag.active = 0;
 
     if (got != totalBytes) {
         if (g_lastPutErr == 0)

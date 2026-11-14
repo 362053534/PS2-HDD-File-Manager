@@ -17,6 +17,7 @@
 #include <hdd-ioctl.h>
 
 #include "pfsnet.h"
+#include "diagnostics.h"
 
 /* 对齐 PS2HDDTester：跳过 libkernel 运行时补丁与完整 libcglue，避免真机黑屏。 */
 DISABLE_PATCHED_FUNCTIONS();
@@ -379,6 +380,8 @@ int main(int argc, char *argv[])
     }
 
     scr_printf("Press START to exit\n");
+    if (apaDiagStart() < 0)
+        scr_printf("WARN: DIAG-1 monitor failed to start\n");
     startPadWatch();
     SleepThread();
     safeExitElf();
