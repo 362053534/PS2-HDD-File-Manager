@@ -156,8 +156,13 @@ final class CoreTests: CheckSuite {
             XCTAssertEqual(try resumed.read(bytes.count-offset,cancel:nil),Data(bytes.dropFirst(offset))); resumed.close()
             XCTAssertEqual(try self.request(peer).0,0x31); try self.reply(peer)
         }
-        let client = try NetworkStorage(host:"127.0.0.1",port:port,cancel:Cancellation())
+        var events = [String]()
+        let client = try NetworkStorage(host:"127.0.0.1",port:port,cancel:Cancellation(),log:{ events.append($0) })
         try client.upload(file,parent:"/",overwrite:false,cancel:Cancellation()) { _,_ in }
+        XCTAssertTrue(events.contains { $0.contains("准备第 2/3 次尝试") })
+        XCTAssertTrue(events.contains { $0.contains("续传起点 65536/") })
+        XCTAssertTrue(events.contains { $0.contains("等待 PUT_END") })
+        XCTAssertTrue(events.contains { $0.contains("PS2 已确认上传提交成功") })
         client.disconnect(); wait(for:[done],timeout:10)
     }
     func testLocalImageEndToEnd() throws {

@@ -137,7 +137,9 @@ final class AppModel: ObservableObject {
                 self.sources.removeAll { $0.network }
                 if self.sourceID?.hasPrefix("pfsnet:") == true { self.sourceID = nil; self.source = "未连接"; self.entries = []; self.selected = []; self.partition = nil; self.capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—" }
             }
-            let next = try NetworkStorage(host:ip,cancel:c)
+            let next = try NetworkStorage(host:ip,cancel:c) { [weak self] message in
+                DispatchQueue.main.async { self?.append(message) }
+            }
             try self.activate(SourceChoice(id:"pfsnet:"+ip,display:"PS2 ApaNetServer · \(ip)"),storage:next,c)
         }
     }

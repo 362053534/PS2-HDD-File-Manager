@@ -5,16 +5,24 @@ public final class NetworkStorage: Storage {
     private var control: TCPSocket?
     private let host: String
     private let port: UInt16
+    private let log: ((String)->Void)?
     private var mounted: String?
     private struct RetryUpload: Error { let underlying: Error }
     private var features: UInt32 = 0
-    public init(host: String, port: UInt16 = 45061, cancel: Cancellation) throws {
-        self.host = host; self.port = port
-        control = try TCPSocket.connect(host, port: port, cancel: cancel)
+    public init(host: String, port: UInt16 = 45061, cancel: Cancellation, log: ((String)->Void)? = nil) throws {
+        self.host = host; self.port = port; self.log = log
+        log?("正在建立 TCP 连接：\(host):\(port)")
+        do { control = try TCPSocket.connect(host, port: port, cancel: cancel) }
+        catch {
+            log?("TCP 连接失败（\(host):\(port)）：\(error.localizedDescription)")
+            throw error
+        }
+        log?("TCP 已连接，正在等待 HELLO 握手回复")
         var hello = Wire(); hello.put(UInt32(0x4E534650)); hello.put(UInt32(1))
         var reply = Wire(try rpc(1,hello.bytes,cancel))
         guard try reply.get(UInt32.self) == 0x4E534650, try reply.get(UInt32.self) == 1 else { throw APAError.message("ApaNetServer 协议不匹配") }
         features = try reply.get(); try reply.finish()
+        log?("已连接 ApaNetServer（\(host):\(port)），features=0x\(String(features,radix:16))；本机数据口 TCP 45062")
     }
     public func disconnect() { control?.close(); control = nil }
     private func require(_ flags: UInt32) throws {
@@ -28,14 +36,23 @@ public final class NetworkStorage: Storage {
         var data = frame.bytes; data.append(payload)
         let response: Data
         let result: Int32
+        var phase = "发送请求"
         do {
             try c.write(data,cancel:cancel,timeout:timeout)
+            phase = "等待响应头"
             var header = Wire(try c.read(12,cancel:cancel,timeout:timeout))
             _ = try header.get(UInt32.self)
             let length = try header.get(UInt32.self); result = try header.get()
             guard length <= 131072 else { throw APAError.message("控制响应过大") }
+            phase = "读取响应内容（\(length) 字节）"
             response = try c.read(Int(length),cancel:cancel,timeout:timeout)
-        } catch { disconnect(); throw error }
+        } catch {
+            disconnect()
+            if case APAError.network(let detail) = error {
+                throw APAError.network("APANet 命令 0x\(String(command,radix:16))，\(phase)：\(detail)")
+            }
+            throw error
+        }
         if result != 0 {
             let names: [Int32:String] = [-2:"I/O 错误",-3:"不存在",-4:"已存在",-5:"目录非空",-6:"空间不足",-7:"参数或操作被拒绝",-8:"未挂载",-9:"设备忙",-10:"不支持",-13:"数据连接失败"]
             throw APAError.message("APANet 命令 \(String(command,radix:16))：\(names[result] ?? "失败")（\(result)）")
@@ -81,6 +98,7 @@ public final class NetworkStorage: Storage {
                 try uploadAttempt(local,parent:parent,overwrite:overwrite,cancel:cancel,attempt:attempt,progress:progress)
                 return
             } catch let retry as RetryUpload {
+                log?("上传数据通道中断，准备第 \(attempt+2)/3 次尝试；将使用 PS2 确认的偏移续传")
                 try cancel.check()
                 let now = try local.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey,.fileResourceIdentifierKey])
                 guard now.fileSize == identity.fileSize, now.contentModificationDate == identity.contentModificationDate,
@@ -89,11 +107,12 @@ public final class NetworkStorage: Storage {
                     throw APAError.message("本地文件已变化，已停止续传")
                 }
                 do {
-                    if control != nil { _ = try rpc(2,Data(),cancel) }
+                    if control != nil { log?("正在检查现有控制连接（PING）"); _ = try rpc(2,Data(),cancel) }
                     else { throw retry.underlying }
                 } catch {
                     let part = mounted
-                    let next = try NetworkStorage(host:host,port:port,cancel:cancel)
+                    log?("控制连接不可用，正在重新连接 \(host):\(port)：\(error.localizedDescription)")
+                    let next = try NetworkStorage(host:host,port:port,cancel:cancel,log:log)
                     control = next.control; next.control = nil; features = next.features
                     if let part { try mount(part,cancel) }
                 }
@@ -107,6 +126,9 @@ public final class NetworkStorage: Storage {
         let listener = try TCPSocket.listener(); defer { listener.close() }
         var data: TCPSocket?
         var began = false; var committing = false
+        var sent: UInt64 = 0
+        var phase = "发送 PUT_BEGIN"
+        log?("开始上传“\(local.lastPathComponent)”：\(total) 字节，第 \(attempt+1)/3 次尝试")
         do {
             var w = Wire(); try w.putString(parent); try w.putString(local.lastPathComponent); w.put(total); w.put(UInt32(overwrite ? 1 : 0) | (attempt > 0 ? 2 : 0))
             let beginResponse = try rpc(0x30,w.bytes,cancel); began = true
@@ -116,19 +138,32 @@ public final class NetworkStorage: Storage {
                 guard offset <= total else { throw APAError.message("续传起点越界") }
                 try file.seek(toOffset:offset)
             }
+            sent = offset
+            log?("PUT_BEGIN 已确认，续传起点 \(offset)/\(total) 字节；等待 PS2 回连 TCP 45062")
+            phase = "等待 PS2 回连数据口 45062"
             data = try listener.accept(peer:host,cancel:cancel)
-            var sent: UInt64 = offset
+            phase = "发送文件数据"
+            log?("数据通道已连接，开始发送文件数据")
+            var nextReport = Date().addingTimeInterval(15)
             progress(sent,total)
             while sent < total {
                 try cancel.check()
                 guard let b = try file.read(upToCount:Int(min(512*1024,total-sent))), !b.isEmpty else { throw APAError.message("本地文件提前结束") }
                 try data!.write(b,cancel:cancel); sent += UInt64(b.count); progress(sent,total)
+                if Date() >= nextReport {
+                    log?("上传“\(local.lastPathComponent)”第 \(attempt+1)/3 次：客户端已发送 \(sent)/\(total) 字节")
+                    nextReport = Date().addingTimeInterval(15)
+                }
             }
             _ = shutdown(data!.fd,SHUT_WR); data?.close(); data = nil
             committing = true
+            phase = "等待 PUT_END 落盘及提交确认"
+            log?("文件数据发送完毕，正在等待 PUT_END 落盘及提交确认")
             try rpc(0x31,Data(),cancel,timeout:120); progress(total,total)
+            log?("PS2 已确认上传提交成功：“\(local.lastPathComponent)”")
         } catch {
             data?.close(reset:true)
+            log?("上传“\(local.lastPathComponent)”第 \(attempt+1)/3 次失败：\(phase)；客户端已发送 \(sent)/\(total) 字节；\(error.localizedDescription)")
             if began, !committing, !cancel.isCancelled, attempt < 2, case APAError.network = error {
                 throw RetryUpload(underlying:error)
             }
