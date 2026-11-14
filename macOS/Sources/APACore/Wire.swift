@@ -59,8 +59,9 @@ public struct Entry: Identifiable, Hashable {
     public let name: String
     public let directory: Bool
     public let size: UInt64
-    public init(_ name: String, directory: Bool, size: UInt64 = 0) {
-        self.name = name; self.directory = directory; self.size = size
+    public let details: String
+    public init(_ name: String, directory: Bool, size: UInt64 = 0, details: String = "") {
+        self.name = name; self.directory = directory; self.size = size; self.details = details
     }
 }
 public struct Space {

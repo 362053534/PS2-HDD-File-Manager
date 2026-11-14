@@ -59,8 +59,8 @@ public final class NetworkStorage: Storage {
         var entries = [Entry]()
         for _ in 0..<count {
             let name = try w.string(); try Names.component(name)
-            let directory = try w.get(UInt8.self) != 0; let size = try w.get(UInt64.self); _ = try w.string()
-            entries.append(Entry(name,directory:directory,size:size))
+            let directory = try w.get(UInt8.self) != 0; let size = try w.get(UInt64.self); let details = try w.string()
+            entries.append(Entry(name,directory:directory,size:size,details:details))
         }
         try w.finish(); return entries
     }

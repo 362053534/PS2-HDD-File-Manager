@@ -90,7 +90,10 @@ public final class LocalStorage: Storage {
             if name.hasSuffix("/") { name.removeLast() }
             if name == "." || name == ".." { return nil }
             try Names.component(name)
-            return Entry(name,directory:part(1).hasPrefix("d"),size:UInt64(part(2)) ?? 0)
+            let start = match.range(at:1).location
+            let detailRange = NSRange(location:start,length:NSMaxRange(match.range)-start)
+            let details = String(text[Range(detailRange,in:text)!]).replacingOccurrences(of:"\r",with:"")
+            return Entry(name,directory:part(1).hasPrefix("d"),size:UInt64(part(2)) ?? 0,details:details)
         }
     }
     public func list(_ path: String, _ cancel: Cancellation) throws -> [Entry] {

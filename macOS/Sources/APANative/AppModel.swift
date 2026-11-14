@@ -1,22 +1,44 @@
 import AppKit
-import SwiftUI
+import Combine
+import UniformTypeIdentifiers
 import APACore
 
+struct SourceChoice: Equatable {
+    let id: String
+    let display: String
+    var network: Bool { id.hasPrefix("pfsnet:") }
+}
 final class AppModel: ObservableObject {
-    @Published var host = "192.168.100.111"
+    @Published var host = UserDefaults.standard.string(forKey:"PfsNetIP") ?? "192.168.100.111"
+    @Published var sources = [SourceChoice]()
+    @Published var sourceID: String?
+    @Published var showSystem = false
+    @Published var transfer = false
+    @Published var cancelling = false
+    @Published var speed = ""
     @Published var entries = [Entry]()
     @Published var selected = Set<String>()
     @Published var partition: String?
     @Published var path = "/"
     @Published var source = "未连接"
-    @Published var status = "连接 PS2 或打开 APA 硬盘镜像"
+    @Published var status = "就绪"
     @Published var log = ""
     @Published var busy = false
     @Published var fraction: Double = 0
-    @Published var capacity = ""
+    @Published var capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—"
     @Published var failure: String?
     private let queue = DispatchQueue(label:"com.fengge.apa.storage",qos:.userInitiated)
     private var storage: Storage?
+    private var backends = [String:Storage]()
+    private var diskTotal: UInt64 = 0
+    private var diskFree: UInt64 = 0
+    private var transferExpected: UInt64 = 0
+    private var transferFiles = 0
+    private var fileIndex = 0
+    private var transferred: UInt64 = 0
+    private var lastFileDone: UInt64 = 0
+    private var pendingPromises = [(run: () -> Void, cancel: () -> Void)]()
+    private var promising = false
     private var token = Cancellation()
     private var activity: NSObjectProtocol?
     private var progressAt = Date.distantPast
@@ -26,9 +48,9 @@ final class AppModel: ObservableObject {
         log += "[\(Date().formatted(date:.omitted,time:.standard))] \(text)\n"
         if log.count > 60000 { log = String(log.suffix(50000)) }
     }
-    func operation(_ title: String, _ work: @escaping (Cancellation) throws -> Void) {
+    func operation(_ title: String, transfer: Bool = false, _ work: @escaping (Cancellation) throws -> Void) {
         guard !busy else { return }
-        busy = true; status = title; fraction = 0; token = Cancellation(); started = Date()
+        busy = true; cancelling = false; self.transfer = transfer; speed = ""; transferExpected = 0; transferFiles = 0; fileIndex = 0; transferred = 0; lastFileDone = 0; status = title; fraction = 0; token = Cancellation(); started = Date()
         let current = token
         activity = ProcessInfo.processInfo.beginActivity(options:[.userInitiated,.idleSystemSleepDisabled],reason:"APA 文件传输或磁盘操作")
         append(title)
@@ -36,95 +58,165 @@ final class AppModel: ObservableObject {
             var errorText: String?
             do { try work(current) } catch { errorText = error.localizedDescription }
             DispatchQueue.main.async {
-                self.busy = false
+                self.busy = false; self.transfer = false
                 if let a = self.activity { ProcessInfo.processInfo.endActivity(a); self.activity = nil }
                 if let text = errorText {
                     self.status = text; self.append(text)
                     if !current.isCancelled { self.failure = text }
                 } else { self.status = "操作完成"; self.append("操作完成") }
+                self.nextPromise()
             }
         }
     }
     func cancel() {
-        token.cancel(); status = "正在取消（本地写入需完成当前文件并卸载）…"
+        let pending = pendingPromises; pendingPromises.removeAll(); promising = false
+        pending.forEach { $0.cancel() }
+        cancelling = true; token.cancel(); status = "正在取消（本地写入需完成当前文件并卸载）…"
     }
     private func backend() throws -> Storage {
         guard let storage else { throw APAError.message("请先连接 PS2 或打开本地硬盘") }; return storage
     }
     private func publish(_ entries: [Entry], partition: String?, path: String, space: Space) {
+        let total = diskTotal, free = diskFree
         DispatchQueue.main.async {
             self.entries = entries.sorted { a,b in a.directory == b.directory ? a.name.localizedStandardCompare(b.name) == .orderedAscending : a.directory }
             self.partition = partition; self.path = path; self.selected = []
-            self.capacity = "总量 \(Self.bytes(space.total)) · 可用 \(Self.bytes(space.free))"
+            self.capacity = "硬盘总计：\(Self.bytes(total))　未分配：\(Self.bytes(free))　当前分区：\(partition == nil ? "—" : Self.bytes(space.total))　当前分区剩余：\(partition == nil ? "—" : Self.bytes(space.free))"
         }
     }
     private func showPartitions(_ c: Cancellation) throws {
         let s = try backend(); try s.unmount(c); let layout = try s.layout(c)
-        publish(layout.browsable,partition:nil,path:"/",space:Space(total:layout.total,free:layout.free))
+        diskTotal = layout.total; diskFree = layout.free
+        publish(layout.browsable.filter { self.showSystem || !BrowserPolicy.protected($0.name) },partition:nil,path:"/",space:Space(total:layout.total,free:layout.free))
     }
     private func showDirectory(_ part: String, _ path: String, _ c: Cancellation) throws {
         let s = try backend(); try s.mount(part,c)
         let entries = try s.list(path,c); let space = try s.space(c)
         publish(entries,partition:part,path:path,space:space)
     }
+    var hasSource: Bool { sourceID != nil }
+    var networkConnected: Bool { sources.contains { $0.network } }
+    var displayPath: String { partition.map { $0+":"+path } ?? "PFS 分区（双击查看）" }
+    private var tool: URL { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/tools/pfsshell") }
+    private func activate(_ choice: SourceChoice, storage next: Storage, _ c: Cancellation) throws {
+        try c.check()
+        do { try storage?.unmount(c) }
+        catch {
+            try c.check()
+            DispatchQueue.main.async { self.append("原来源卸载失败，切换来源后请重新连接：\(error.localizedDescription)") }
+        }
+        storage = next; backends[choice.id] = next
+        DispatchQueue.main.async {
+            if !self.sources.contains(where: { $0.id == choice.id }) { self.sources.append(choice) }
+            self.sourceID = choice.id; self.source = choice.display
+            self.entries = []; self.selected = []; self.partition = nil; self.path = "/"
+            self.capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—"
+        }
+        try showPartitions(c)
+    }
+    func selectSource(_ id: String) {
+        guard !busy, id != sourceID, let choice = sources.first(where: { $0.id == id }) else { return }
+        operation("正在读取分区表…") { c in
+            guard let next = self.backends[id] else { throw APAError.message("来源已断开，请刷新后重试") }
+            try self.activate(choice,storage:next,c)
+        }
+    }
     func connect() {
+        guard !busy else { return }
         let ip = host.trimmingCharacters(in:.whitespacesAndNewlines)
-        entries = []; selected = []; partition = nil; path = "/"; capacity = ""
-        operation("正在连接 APANetServer…") { c in
-            self.storage?.disconnect(); self.storage = nil
-            self.storage = try NetworkStorage(host:ip,cancel:c)
-            DispatchQueue.main.async { self.source = "PS2 · \(ip)" }
-            try self.showPartitions(c)
+        guard !ip.isEmpty else { failure = "请先填写 PS2 IP。"; return }
+        UserDefaults.standard.set(ip,forKey:"PfsNetIP")
+        operation("正在连接 PfsNet…") { c in
+            let oldIDs = self.backends.keys.filter { $0.hasPrefix("pfsnet:") }
+            for id in oldIDs {
+                if let old = self.backends.removeValue(forKey:id) { if self.storage === old { self.storage = nil }; old.disconnect() }
+            }
+            DispatchQueue.main.async {
+                self.sources.removeAll { $0.network }
+                if self.sourceID?.hasPrefix("pfsnet:") == true { self.sourceID = nil; self.source = "未连接"; self.entries = []; self.selected = []; self.partition = nil; self.capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—" }
+            }
+            let next = try NetworkStorage(host:ip,cancel:c)
+            try self.activate(SourceChoice(id:"pfsnet:"+ip,display:"PS2 PfsNet · \(ip)"),storage:next,c)
         }
     }
     func open(_ url: URL) {
-        let tool = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/tools/pfsshell")
-        operation("正在打开 \(url.lastPathComponent)…") { c in
-            let next = try LocalStorage(device:url,tool:tool)
-            self.storage?.disconnect(); self.storage = next
-            DispatchQueue.main.async { self.source = url.path }
-            try self.showPartitions(c)
+        operation("正在读取分区表…") { c in
+            let next = try LocalStorage(device:url,tool:self.tool)
+            try self.activate(SourceChoice(id:url.path,display:(url.path.hasPrefix("/dev/") ? "硬盘 · " : "镜像 · ")+url.path),storage:next,c)
         }
     }
     func chooseImage() {
+        guard !busy else { return }
         let p = NSOpenPanel(); p.canChooseDirectories = false; p.allowsMultipleSelection = false
-        p.message = "选择完整的 PS2 APA 硬盘镜像（不会格式化）"
+        p.title = "选择 PS2 HDD 原始镜像"; p.allowedContentTypes = ["img","bin","raw"].compactMap { UTType(filenameExtension:$0) }; p.allowsOtherFileTypes = true
         if p.runModal() == .OK, let url = p.url { open(url) }
     }
-    func chooseDisk() {
-        operation("正在枚举外接硬盘…") { _ in
-            let disks = try NativeProcess.disks()
+    func scanDisks() {
+        let previous = sourceID, remaining = sources.filter { !$0.id.hasPrefix("/dev/") }
+        operation("正在扫描 PS2 APA 硬盘…") { c in
+            var found = [SourceChoice]()
+            for (path,display) in try NativeProcess.disks() {
+                try c.check()
+                do {
+                    let local = try LocalStorage(device:URL(fileURLWithPath:path),tool:self.tool)
+                    self.backends[path] = local; found.append(SourceChoice(id:path,display:display))
+                } catch {
+                    DispatchQueue.main.async { self.append("跳过 \(path)：\(error.localizedDescription)") }
+                }
+            }
+            let choices = found
             DispatchQueue.main.async {
-                let alert = NSAlert(); alert.messageText = "打开 PS2 APA 硬盘"
-                alert.informativeText = "只接受外接 APA 整盘。需要当前用户具有设备读写权限；程序不会更改系统权限。"
-                let menu = NSPopUpButton(frame:NSRect(x:0,y:0,width:420,height:26))
-                for d in disks { menu.addItem(withTitle:d.1) }
-                alert.accessoryView = menu; alert.addButton(withTitle:"打开"); alert.addButton(withTitle:"取消")
-                // 枚举操作的完成回调先结束 busy，再打开所选设备。
-                DispatchQueue.main.async {
-                    if alert.runModal() == .alertFirstButtonReturn, disks.indices.contains(menu.indexOfSelectedItem) {
-                        self.open(URL(fileURLWithPath:disks[menu.indexOfSelectedItem].0))
+                self.sources.removeAll { $0.id.hasPrefix("/dev/") }; self.sources.insert(contentsOf:choices,at:0)
+                self.append(choices.isEmpty ? "未检测到 PS2 APA 硬盘。" : "发现 \(choices.count) 个 PS2 APA 硬盘。")
+            }
+            if let choice = choices.first, let next = self.backends[choice.id] { try self.activate(choice,storage:next,c) }
+            else if let previous, previous.hasPrefix("/dev/") {
+                self.storage = nil
+                if let choice = remaining.first, let next = self.backends[choice.id] { try self.activate(choice,storage:next,c) }
+                else { DispatchQueue.main.async { self.sourceID = nil; self.entries = []; self.selected = []; self.partition = nil; self.capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—" } }
+            }
+        }
+    }
+    func disconnect() {
+        guard !busy, let choice = sources.first(where: { $0.network }) else { return }
+        removeSource(choice)
+    }
+    private func removeSource(_ choice: SourceChoice, eject: Bool = false) {
+        let active = choice.id == sourceID
+        let nextChoice = sources.first { $0.id != choice.id }
+        operation(eject ? "正在安全弹出硬盘…" : "正在移除来源…") { c in
+            if let removed = self.backends[choice.id] { try removed.unmount(c); removed.disconnect() }
+            if eject { _ = try NativeProcess.run(URL(fileURLWithPath:"/usr/sbin/diskutil"),["eject",choice.id]) }
+            self.backends.removeValue(forKey:choice.id)
+            DispatchQueue.main.async { self.sources.removeAll { $0.id == choice.id } }
+            if active {
+                self.storage = nil
+                if let nextChoice, let next = self.backends[nextChoice.id] { try self.activate(nextChoice,storage:next,c) }
+                else {
+                    DispatchQueue.main.async {
+                        self.sourceID = nil; self.source = "未连接"; self.entries = []; self.selected = []; self.partition = nil; self.path = "/"
+                        self.capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—"
                     }
                 }
             }
         }
     }
-    func disconnect() {
-        operation("断开连接") { _ in
-            self.storage?.disconnect(); self.storage = nil
-            DispatchQueue.main.async { self.source = "未连接"; self.entries = []; self.selected = []; self.partition = nil; self.capacity = "" }
-        }
-    }
     func eject() {
-        let device = source
-        guard device.hasPrefix("/dev/disk") else { failure = "只有本地外接硬盘可以弹出"; return }
-        operation("正在安全弹出…") { _ in
-            self.storage?.disconnect(); self.storage = nil
-            _ = try NativeProcess.run(URL(fileURLWithPath:"/usr/sbin/diskutil"),["eject",device])
-            DispatchQueue.main.async { self.source = "未连接"; self.entries = []; self.partition = nil }
-        }
+        guard !busy, let choice = sources.first(where: { $0.id == sourceID }) else { return }
+        if choice.network {
+            if confirm("安全弹出硬盘", "当前来源是 PFS 网络连接，无法硬件弹出。是否断开 PfsNet？") { removeSource(choice) }
+        } else if choice.id.hasPrefix("/dev/") {
+            if confirm("安全弹出硬盘", "确定要安全弹出吗？\n\n\(choice.display)\n\n弹出前请确认没有其它程序正在访问该硬盘。") { removeSource(choice,eject:true) }
+        } else if confirm("移除镜像", "“\(choice.display)”是镜像文件，无法执行硬件弹出。是否仅从列表中移除？") { removeSource(choice) }
+    }
+    func setShowSystem(_ value: Bool) {
+        guard !busy else { return }
+        if value && !confirm("显示系统分区", "即将显示系统保留分区（如 __system、__common 等）。\n\n确认后可以浏览并自由读写这些分区内的文件，但禁止删除或重命名系统分区本身。\n误操作可能导致 PS2 无法正常启动。\n\n是否继续？") { return }
+        showSystem = value
+        if hasSource && partition == nil { refresh() }
     }
     func refresh() {
+        guard hasSource, !busy else { return }
         let p = partition, folder = path
         operation("刷新") { c in
             if let p { try self.showDirectory(p,folder,c) } else { try self.showPartitions(c) }
@@ -160,6 +252,7 @@ final class AppModel: ObservableObject {
         return alert.runModal() == .alertFirstButtonReturn
     }
     func createDirectory() {
+        guard !busy else { return }
         guard let p = partition, let name = prompt("新建目录") else { return }
         let folder = path
         operation("新建目录 \(name)") { c in
@@ -168,24 +261,41 @@ final class AppModel: ObservableObject {
         }
     }
     func rename() {
-        guard selected.count == 1, let name = selected.first, let newName = prompt("重命名",initial:name), newName != name else { return }
+        guard !busy, selected.count == 1, let name = selected.first,
+              partition != nil || !BrowserPolicy.protected(name),
+              let newName = prompt(partition == nil ? "重命名分区" : "重命名",initial:name) else { return }
+        rename(name,to:newName)
+    }
+    func rename(_ name: String, to newName: String) {
+        guard !busy, newName != name, partition != nil || (!BrowserPolicy.protected(name) && !BrowserPolicy.protected(newName)) else { return }
         let p = partition, folder = path
-        operation("重命名 \(name)") { c in
+        operation("正在重命名…") { c in
             try Names.component(newName); let s = try self.backend()
             if let p { try s.mount(p,c); try s.mutate(0x24,[folder,name,newName],c); try self.showDirectory(p,folder,c) }
             else { try PartitionOperations.apply(0x52,values:[name,newName],storage:s,cancel:c); try self.showPartitions(c) }
         }
     }
     func createPartition() {
-        guard let name = prompt("新建 PFS 分区名称",initial:"+"), let size = prompt("容量（128 MiB 的整数倍，例如 1G）") else { return }
-        guard confirm("创建 PFS 分区", "将在 APA 未分配区域创建并格式化 \(name)，容量 \(size)。") else { return }
+        guard !busy, hasSource, partition == nil else { return }
+        guard let (name,size) = NativeDialogs.createPartition(free:diskFree) else { return }
+        do {
+            try Names.partition(name)
+            guard !BrowserPolicy.protected(name) else { throw APAError.message("不能使用系统保留分区名") }
+            let bytes = try Names.size(size)
+            guard bytes <= diskFree else { throw APAError.message("APA 未分配空间不足。未执行任何写入。") }
+            guard NativeDialogs.confirmPartition(source:source,name:name,bytes:bytes) else { return }
+        } catch { failure = error.localizedDescription; return }
         operation("创建分区 \(name)") { c in
             try PartitionOperations.apply(0x50,values:[name,size],storage:self.backend(),cancel:c); try self.showPartitions(c)
         }
     }
     func deleteSelected() {
         let items = entries.filter { selected.contains($0.name) }, p = partition, folder = path
-        guard !items.isEmpty, confirm("永久删除 \(items.count) 项？",items.map(\.name).joined(separator:"\n")+"\n此操作无法撤销，目录将递归删除。") else { return }
+        guard !busy, !items.isEmpty, p != nil || (items.count == 1 && !BrowserPolicy.protected(items[0].name)) else { return }
+        if p == nil {
+            guard confirm("第一次确认：删除 PFS 分区", "将永久删除 PFS 分区“\(items[0].name)”（\(Self.bytes(items[0].size))）及其全部文件。\n\n来源：\(source)\n\n此操作会修改 APA 分区表，删除后无法恢复。确定继续？"),
+                  confirm("第二次确认：永久删除", "最后确认：立即删除“\(items[0].name)”？\n\n程序将在删除后重新校验 APA 分区表。") else { return }
+        } else if !confirm("删除", "确定要删除选中的 \(items.count) 个项目吗？\n"+items.map(\.name).joined(separator:"\n")+"\n目录将递归删除，此操作无法撤销。") { return }
         operation("删除所选项目") { c in
             let s = try self.backend()
             if let p {
@@ -208,69 +318,94 @@ final class AppModel: ObservableObject {
     }
     static func bytes(_ n: UInt64) -> String { ByteCountFormatter.string(fromByteCount:Int64(clamping:n),countStyle:.binary) }
     private func progress(_ name: String, _ done: UInt64, _ total: UInt64) {
+        transferred += done >= lastFileDone ? done-lastFileDone : done; lastFileDone = done
         guard Date().timeIntervalSince(progressAt) > 0.15 || done == total else { return }
         progressAt = Date()
+        let rate = Double(transferred)/max(0.001,Date().timeIntervalSince(started))
+        let elapsed = Int(Date().timeIntervalSince(started))
+        let fraction = transferExpected > 0 ? min(1,Double(transferred)/Double(transferExpected)) : (total == 0 ? 1 : Double(done)/Double(total))
+        let index = fileIndex, count = max(1,transferFiles)
         DispatchQueue.main.async {
-            self.fraction = total == 0 ? 1 : Double(done)/Double(total)
-            self.status = "\(name) · \(Self.bytes(done)) / \(Self.bytes(total))"
+            self.speed = "\(Self.bytes(UInt64(rate)))/s · \(elapsed/60):\(String(format:"%02d",elapsed%60))"
+            self.fraction = fraction
+            self.status = "[\(index)/\(count)] \(name) · \(Self.bytes(done)) / \(Self.bytes(total))"
         }
     }
     func chooseImport() {
         let p = NSOpenPanel(); p.canChooseFiles = true; p.canChooseDirectories = true; p.allowsMultipleSelection = true
         if p.runModal() == .OK { importURLs(p.urls) }
     }
-    func paste() {
-        if let urls = NSPasteboard.general.readObjects(forClasses:[NSURL.self],options:[.urlReadingFileURLsOnly:true]) as? [URL] { importURLs(urls) }
+    static func clipboardURLs() -> [URL] {
+        let urls = NSPasteboard.general.readObjects(forClasses:[NSURL.self],options:[.urlReadingFileURLsOnly:true]) as? [URL] ?? []
+        return urls.filter { $0.isFileURL && FileManager.default.fileExists(atPath:$0.path) }
     }
+    func paste() { importURLs(Self.clipboardURLs()) }
     func importURLs(_ urls: [URL]) {
-        guard !busy, let part = partition, !urls.isEmpty else { return }
+        guard !busy, !urls.isEmpty else { return }
+        guard let part = partition else { failure = "请先双击打开一个 PFS 分区，再拖入文件。"; return }
         let folder = path
-        // 默认拒绝同名覆盖；用户可明确选择替换网络模式中的同名文件。
-        let alert = NSAlert(); alert.messageText = "导入 \(urls.count) 项"
-        alert.informativeText = "目录会合并。同名文件如何处理？选择替换将覆盖旧内容。"
-        alert.addButton(withTitle:"遇到同名停止"); alert.addButton(withTitle:"替换同名文件"); alert.addButton(withTitle:"取消")
-        let answer = alert.runModal(); if answer == .alertThirdButtonReturn { return }
-        let overwrite = answer == .alertSecondButtonReturn
-        operation("导入文件") { c in
+        operation("正在扫描导入冲突…",transfer:true) { c in
             let s = try self.backend(); try s.mount(part,c)
-            var plan = [(URL,String,Bool,UInt64)](); var needed: UInt64 = 0
+            var plan = [(url:URL,parent:String,directory:Bool,size:UInt64,existing:Entry?)]()
+            var cache = [String:[Entry]](), freshFolders = Set<String>()
             func scan(_ url: URL, _ parent: String, _ depth: Int) throws {
                 try c.check(); guard depth < 128 else { throw APAError.message("目录嵌套过深") }
                 let v = try url.resourceValues(forKeys:[.isSymbolicLinkKey,.isDirectoryKey,.isRegularFileKey,.fileSizeKey])
                 guard v.isSymbolicLink != true else { throw APAError.message("不导入符号链接：\(url.lastPathComponent)") }
                 try Names.component(url.lastPathComponent)
-                if v.isDirectory == true {
-                    plan.append((url,parent,true,0))
+                let directory = v.isDirectory == true
+                guard directory || v.isRegularFile == true else { throw APAError.message("仅支持普通文件和目录") }
+                if cache[parent] == nil { cache[parent] = freshFolders.contains(parent) ? [] : try s.list(parent,c) }
+                let existing = cache[parent]!.first { $0.name == url.lastPathComponent }
+                plan.append((url,parent,directory,UInt64(v.fileSize ?? 0),existing))
+                cache[parent]!.removeAll { $0.name == url.lastPathComponent }
+                cache[parent]!.append(Entry(url.lastPathComponent,directory:directory,size:UInt64(v.fileSize ?? 0)))
+                if directory {
                     let remote = try Names.path(parent,url.lastPathComponent)
+                    if existing?.directory != true { freshFolders.insert(remote) }
                     for child in try FileManager.default.contentsOfDirectory(at:url,includingPropertiesForKeys:nil).sorted(by: { $0.path < $1.path }) { try scan(child,remote,depth+1) }
-                } else {
-                    guard v.isRegularFile == true else { throw APAError.message("仅支持普通文件") }
-                    let size = UInt64(v.fileSize ?? 0); plan.append((url,parent,false,size))
                 }
             }
             for url in urls { try scan(url,folder,0) }
-            let space = try s.space(c)
-            let zone = UInt64(space.zone)
-            for item in plan { needed += item.2 ? zone : ((item.3+zone-1)/zone)*zone }
-            guard needed <= space.free else { throw APAError.message("可用空间不足：保守预检需要 \(Self.bytes(needed))") }
-            var known = [String:[Entry]](); var newFolders = Set<String>()
-            for (url,parent,directory,_) in plan {
-                if known[parent] == nil { known[parent] = newFolders.contains(parent) ? [] : try s.list(parent,c) }
-                let existing = known[parent]!.first { $0.name == url.lastPathComponent }
-                if let existing {
-                    guard existing.directory == directory, directory || overwrite else { throw APAError.message("导入冲突：\(url.lastPathComponent)") }
-                } else if directory { newFolders.insert(try Names.path(parent,url.lastPathComponent)) }
-                known[parent]!.append(Entry(url.lastPathComponent,directory:directory))
+            var overwrite = false
+            if plan.contains(where: { $0.existing != nil }) {
+                DispatchQueue.main.sync {
+                    let alert = NSAlert(); alert.messageText = "发现同名项目"
+                    alert.informativeText = "目标 PFS 目录中发现同名文件或目录。\n选择“全部覆盖”将替换同名文件，并合并同名目录。"
+                    alert.addButton(withTitle:"全部覆盖"); alert.addButton(withTitle:"取消")
+                    overwrite = alert.runModal() == .alertFirstButtonReturn
+                }
+                if !overwrite { c.cancel(); throw APAError.cancelled }
             }
-            for (url,parent,directory,_) in plan {
+            try c.check()
+            let space = try s.space(c)
+            let zone = max(UInt64(1),UInt64(space.zone))
+            var needed: UInt64 = 0
+            for item in plan {
+                let required = item.directory ? (item.existing?.directory == true ? 0:zone) : ((item.size+zone-1)/zone)*zone
+                let old = item.existing.map { $0.directory ? 0 : (($0.size+zone-1)/zone)*zone } ?? 0
+                let net = s is LocalStorage ? required : (required > old ? required-old:0)
+                let (next,overflow) = needed.addingReportingOverflow(net)
+                guard !overflow else { throw APAError.message("导入大小超出支持范围") }; needed = next
+            }
+            guard needed <= space.free else { throw APAError.message("PFS 分区剩余空间不足：需要 \(Self.bytes(needed))，当前可用 \(Self.bytes(space.free))。未执行任何写入。") }
+            self.transferExpected = plan.filter { !$0.directory }.reduce(0) { $0+$1.size }
+            self.transferFiles = plan.filter { !$0.directory }.count
+            DispatchQueue.main.async { self.append("PFS 导入空间预检通过：当前分区剩余 \(Self.bytes(space.free))，预计净占用 \(Self.bytes(needed))。"); self.status = "正在导入 \(plan.count) 个项目…" }
+            for item in plan {
                 try c.check()
-                let existing = try s.list(parent,c).first { $0.name == url.lastPathComponent }
-                if directory {
-                    if let existing { guard existing.directory else { throw APAError.message("目录与文件重名") } }
-                    else { try s.mutate(0x21,[parent,url.lastPathComponent],c) }
+                let existing = try s.list(item.parent,c).first { $0.name == item.url.lastPathComponent }
+                if let existing, existing.directory != item.directory {
+                    guard overwrite else { throw APAError.message("目标已变化，请重新导入") }
+                    try self.delete(existing,parent:item.parent,storage:s,cancel:c,depth:0)
+                }
+                if item.directory {
+                    if existing?.directory != true { try s.mutate(0x21,[item.parent,item.url.lastPathComponent],c) }
                 } else {
-                    if let existing { guard overwrite && !existing.directory else { throw APAError.message("目标已存在：\(url.lastPathComponent)") } }
-                    try s.upload(url,parent:parent,overwrite:overwrite,cancel:c) { self.progress(url.lastPathComponent,$0,$1) }
+                    guard existing == nil || overwrite else { throw APAError.message("目标已存在：\(item.url.lastPathComponent)") }
+                    self.lastFileDone = 0; self.fileIndex += 1
+                    try s.upload(item.url,parent:item.parent,overwrite:overwrite,cancel:c) { self.progress(item.url.lastPathComponent,$0,$1) }
+                    DispatchQueue.main.async { self.append("已导入 \(item.url.lastPathComponent)（\(Self.bytes(item.size))）") }
                 }
             }
             try self.showDirectory(part,folder,c)
@@ -282,27 +417,36 @@ final class AppModel: ObservableObject {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         let folder = path
-        operation("导出文件") { c in
+        operation("正在导出文件…",transfer:true) { c in
             let s = try self.backend(); try s.mount(part,c)
+            try self.measureExport(items,parent:folder,storage:s,cancel:c)
             for entry in items { try self.export(entry,folder,destination,0,storage:s,cancel:c) }
         }
     }
-    private func export(_ entry: Entry, _ remote: String, _ local: URL, _ depth: Int, storage s: Storage, cancel c: Cancellation) throws {
+    private func measureExport(_ items: [Entry], parent: String, storage s: Storage, cancel c: Cancellation, depth: Int = 0) throws {
+        try c.check(); guard depth < 128 else { throw APAError.message("目录嵌套过深") }
+        for item in items {
+            if item.directory { try measureExport(s.list(Names.path(parent,item.name),c),parent:Names.path(parent,item.name),storage:s,cancel:c,depth:depth+1) }
+            else { transferExpected += item.size; transferFiles += 1 }
+        }
+    }
+    private func export(_ entry: Entry, _ remote: String, _ local: URL, _ depth: Int, storage s: Storage, cancel c: Cancellation, targetName: String? = nil) throws {
                 try c.check(); guard depth < 128 else { throw APAError.message("目录嵌套过深") }; try Names.component(entry.name)
-                let target = local.appendingPathComponent(entry.name)
+                let target = local.appendingPathComponent(targetName ?? entry.name)
                 guard !FileManager.default.fileExists(atPath:target.path) else { throw APAError.message("导出目标已存在：\(target.lastPathComponent)。请选择空目录。") }
                 if entry.directory {
                     try FileManager.default.createDirectory(at:target,withIntermediateDirectories:false)
                     for child in try s.list(Names.path(remote,entry.name),c) { try export(child,Names.path(remote,entry.name),target,depth+1,storage:s,cancel:c) }
-                } else { try s.download(entry,parent:remote,to:target,cancel:c) { self.progress(entry.name,$0,$1) } }
+                } else { self.lastFileDone = 0; self.fileIndex += 1; try s.download(entry,parent:remote,to:target,cancel:c) { self.progress(entry.name,$0,$1) } }
             }
 
     func copySelected() {
         let items = entries.filter { selected.contains($0.name) }
         guard let part = partition, !items.isEmpty else { return }
         let folder = path
-        operation("准备文件剪贴板") { c in
+        operation("正在拷贝文件…",transfer:true) { c in
             let s = try self.backend(); try s.mount(part,c)
+            try self.measureExport(items,parent:folder,storage:s,cancel:c)
             let root = FileManager.default.urls(for:.cachesDirectory,in:.userDomainMask)[0]
                 .appendingPathComponent("com.fengge.apa-file-manager.mac/Clipboard/"+UUID().uuidString)
             try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
@@ -312,4 +456,25 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func nextPromise() {
+        guard !busy else { return }
+        if pendingPromises.isEmpty { promising = false; return }
+        pendingPromises.removeFirst().run()
+    }
+    func promiseExport(_ entry: Entry, part: String, folder: String, sourceID: String, to url: URL, completion: @escaping (Error?) -> Void) {
+        guard (!busy || promising), self.sourceID == sourceID else { completion(APAError.message("来源已切换或正在执行其它操作，请重新拖出文件。")); return }
+        promising = true
+        pendingPromises.append((run: {
+            guard self.sourceID == sourceID else { completion(APAError.cancelled); self.nextPromise(); return }
+            self.operation("正在导出文件…",transfer:true) { c in
+                do {
+                    let s = try self.backend(); try s.mount(part,c)
+                    try self.measureExport([entry],parent:folder,storage:s,cancel:c)
+                    try self.export(entry,folder,url.deletingLastPathComponent(),0,storage:s,cancel:c,targetName:url.lastPathComponent)
+                    completion(nil)
+                } catch { completion(error); throw error }
+            }
+        }, cancel: { completion(APAError.cancelled) }))
+        nextPromise()
+    }
 }

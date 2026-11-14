@@ -1,6 +1,6 @@
 # APA File Manager — macOS 原生客户端
 
-独立的 Swift / SwiftUI / AppKit 应用，最低 macOS 12（含 Monterey 12.7.6）。没有第三方 Swift 包，不依赖 .NET、Avalonia、Windows 工程或 Windows 工具。发布包只包含主程序、Info.plist 和 macOS 原生 pfsshell。Windows 源码、测试与发布位于 ../Windows，各自演进。
+独立的 Swift / AppKit / Combine 应用，最低 macOS 12（含 Monterey 12.7.6）。没有第三方 Swift 包，不依赖 .NET、Avalonia、Windows 工程或 Windows 工具。发布包只包含主程序、Info.plist 和 macOS 原生 pfsshell。Windows 源码、测试与发布位于 ../Windows，各自演进。
 
 ## 构建与测试
 
@@ -17,7 +17,7 @@ PFSSHELL_BIN=/path/to/pfsshell ./build.sh
 
 - 连接 APANetServer，独立实现现有 PfsNet V1 线上协议；端口 45061/45062，UTF-8 名称，64 位文件长度。
 - 浏览 APA/PFS 分区、目录、总量和可用空间；网络与本地镜像均支持。
-- 原生文件选择、拖入、Cmd+V 导入、导出、Cmd+C 复制到 Finder。复制先将文件下载到本应用缓存后提供原生 URL 剪贴板，不使用 Windows 的虚拟文件剪贴板实现。
+- 原生文件选择、拖入、Cmd+V 导入、导出、Cmd+C 拷贝到 Finder。拷贝先将文件下载到本应用缓存后提供原生 URL 剪贴板，不使用 Windows 的虚拟文件剪贴板实现。
 - 递归目录导入/导出/删除；冲突与空间预检；覆盖及删除明确确认。
 - 创建、删除、重命名 PFS 分区。写前检查 APA 校验和、链循环、越界、重叠和子分区引用；写后检查预期结果，创建后验证挂载与根目录。复核失败不继续写入、不自动删除未明确确认的分区。
 - 网络取消先重置数据 socket，再发送 ABORT；TCP KeepAlive 为 60/15/10。数据口失败最多重试两次，检查源文件大小/修改时间/标识，使用服务端确认的偏移续传。PUT_END 状态不明时不自动重发提交。
@@ -50,7 +50,7 @@ PS2 实机探针未连接成功（SSH 内超时、本地 Terminal 返回 No rout
 
 ## 旧工作流适配
 
-根目录 `build-release-mac.sh` 设置 `LEGACY_CI=1`，仍调用本目录的 Swift 构建。为满足未修改的旧 yml，CI 使用 `PS2-HDD-File-Manager.app`、同名主程序和 `PS2-HDD-File-Manager-Release-macos.zip`，写入根目录 bin/Release。显示名称仍为 APA File Manager。直接运行本目录 build.sh 则保留新的原生命名。
+根目录 `build-release-mac.sh` 设置 `LEGACY_CI=1`，仍调用本目录的 Swift 构建。为满足未修改的旧 yml，CI 使用 `PS2-HDD-File-Manager.app`、同名主程序和 `PS2-HDD-File-Manager-Release-macos.zip`，写入根目录 bin/Release。窗口标题与 Windows 保持一致。直接运行本目录 build.sh 则保留新的原生命名。
 
 `--run-tests` 在 CI 工作区调用真实的 CoreChecks 二进制，并传入本次打包的原生 pfsshell，执行含本地镜像在内的全部测试；失败返回非零。CoreChecks 放在 app 外，不随 ZIP 发布，因此发行版的 --run-tests 会明确报告测试工具未分发，不会假报通过。
 
@@ -71,3 +71,22 @@ PFSSHELL_BIN=/path/to/pfsshell-universal ./build.sh
 ### 本轮验证（2026-11-14）
 
 在 macOS 27.2.1 / Swift 6.4.2 上，以 12.0 部署目标编译 arm64 和 x86_64 主程序及 pfsshell，合并为通用版。两种架构的 10 组核心/镜像检查均通过（Intel 程序通过 Rosetta 执行），两种架构的窗口启动检查通过，签名校验通过。最终 ZIP 内的 plist、两个 Mach-O 的架构和最低系统版本已重新检查；最低版本为 12.0。负向检查确认拒绝单架构二进制及最低系统为 13.0 的通用二进制。尚未在真实 Monterey 12.7.6 系统或 Intel 硬件上运行，需由目标系统完成最终验收。
+
+## Windows 操作布局对齐（2026-11-14）
+
+原生 macOS 界面以当前分支 Windows/MainForm.cs 为操作参照；不引用 Windows 工程或 .NET。
+
+- 顶部依次为来源下拉框、刷新、加载硬盘镜像、PFS 网络连接/断开、安全弹出硬盘、容量、上级目录、显示系统分区及只读路径。
+- PFS 浏览器 / 诊断输出为独立页签。浏览器列为名称 / 类型 / pfsshell 详情；保留本地与网络后端返回的详情，不从大小伪造。
+- 分区根级菜单为新建 PFS 分区、重命名分区、删除 PFS 分区、刷新；分区内菜单为拷贝、删除、重命名、粘贴、新建目录、刷新。菜单的显示/禁用与当前位置、多选、剪贴板、忙碌状态一致。
+- 右键未选中行会重新选择，右键已选中行保留多选，空白处右键取消选择。双击目录进入；F2、文件双击或再次点击已选名称可行内改名，Escape 取消改名。
+- Cmd+A/C/V（也接受表格内 Ctrl+A/C/V）、F2、向前 Delete、Backspace 返回上级；Mac 的 Cmd+Delete 删除所选项目。文本框保留系统文字编辑快捷键。Escape 取消传输，取消按钮仅在传输中显示。
+- 系统分区默认隐藏，显示前确认，禁止删除或重命名六个系统保留分区（大小写不敏感），允许浏览其中的文件。
+- 分区创建在一个表单填写名称及容量，再勾选来源/备份确认；删除分区两次确认。导入先扫描，有冲突才询问“全部覆盖”，同名目录合并。保留原生后端已有的写入校验和本地临时文件覆盖保护；本地覆盖可能需要完整新文件的临时空间。
+- 多来源保留在下拉框，可在镜像、物理盘和网络之间切换。镜像安全弹出仅移除列表项，网络安全弹出断开网络，物理盘使用 diskutil eject。
+- 拖入文件、Cmd+V 导入、Cmd+C 导出至 Finder；拖出使用原生 NSFilePromiseProvider，多文件串行处理，捕获来源/分区/路径，切换来源后拒绝旧拖放任务。剪贴板拷贝仍先下载至独立缓存，完成后才提供文件 URL。
+- ART2 与未实现的 NBD 不显示。保留 macOS 原生控件、字体、系统主题及 Cmd 快捷键；不模拟 Windows 的非客户区。
+
+构建后运行 `./test-ui.sh`，或传入 app 路径。测试会启动真实 AppKit 窗口，检查菜单/选择/行内改名/忙碌状态和确认表单，再在自建 UUID 临时目录中初始化测试镜像，检查来源切换、目录进退、导入/覆盖/取消、改名、文件导出与回读。不会扫描或初始化用户物理盘，不连接 PS2，不更改系统安全权限。
+
+完整 Finder 接收文件承诺、屏幕最终视觉效果、物理盘弹出和真实 PS2 网络交互需人工验收。PDF/离屏位图缺少部分系统控件文字，不能作为视觉一致性证据；远程会话不具备屏幕捕获权限。Intel 在当前机器通过 Rosetta 测试，不能替代真实 Intel Monterey 12.7.6。

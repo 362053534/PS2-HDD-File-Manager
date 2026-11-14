@@ -21,6 +21,8 @@ final class CoreTests: CheckSuite {
         let text = "> -rw-rw-rw- 6442450944 2026-10-21 12:30 游戏 列传\u{00a0}\n> drwxrwxrwx 512 2026-10-21 12:30 DVD/\n"
         let e = try LocalStorage.parseListing(text)
         XCTAssertEqual(e.count,2); XCTAssertEqual(e[0].name,"游戏 列传\u{00a0}"); XCTAssertEqual(e[0].size,6_442_450_944); XCTAssertTrue(e[1].directory)
+        XCTAssertEqual(e[0].details,"-rw-rw-rw- 6442450944 2026-10-21 12:30 游戏 列传\u{00a0}")
+        XCTAssertTrue(e[1].details.hasSuffix("DVD/"))
     }
     func header(start: UInt32 = 0, next: UInt32 = 0, length: UInt32 = 0x40000) -> Data {
         var d = Data(repeating:0,count:1024)
@@ -78,7 +80,7 @@ final class CoreTests: CheckSuite {
             var bad = Wire(); bad.put(UInt32.max); try self.reply(peer,bad.bytes)
         }
         let client = try NetworkStorage(host:"127.0.0.1",port:port,cancel:Cancellation())
-        let items = try client.list("/DVD",Cancellation()); XCTAssertEqual(items.first?.size,6_442_450_944)
+        let items = try client.list("/DVD",Cancellation()); XCTAssertEqual(items.first?.size,6_442_450_944); XCTAssertEqual(items.first?.details,"file")
         XCTAssertThrowsError(try client.list("/DVD",Cancellation()))
         client.disconnect(); wait(for:[done],timeout:10)
     }
