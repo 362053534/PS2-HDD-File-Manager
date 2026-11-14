@@ -3,7 +3,7 @@
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
-s = p.read_text()
+s = p.read_text(encoding="utf-8")
 marker = "/* APA_NATIVE_SESSION_V1 */"
 if marker in s:
     print("macOS session protocol already applied")
@@ -44,5 +44,5 @@ s = s.replace(needle, r"""static int do_apa_sync(context_t *ctx, int argc, char 
 }
 
 static int do_pwd(""",1)
-p.write_text(s)
+p.write_text(s, encoding="utf-8")
 print("Applied macOS framed session protocol")

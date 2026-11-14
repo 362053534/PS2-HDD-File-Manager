@@ -3,7 +3,7 @@
 from pathlib import Path
 import sys
 p=Path(sys.argv[1])
-s=p.read_text()
+s=p.read_text(encoding="utf-8")
 start=s.index('static int do_mkpart(')
 end=s.index('\nstatic int do_ls(',start)
 body=s[start:end]
@@ -30,5 +30,5 @@ guard='''    /* APA_CREATE_REQUIRE_COMPLETE_V1 */
     }
 
 '''
-p.write_text(s[:start]+body.replace(needle,guard+needle,1)+s[end:])
+p.write_text(s[:start]+body.replace(needle,guard+needle,1)+s[end:], encoding="utf-8")
 print('Applied pfsshell complete-allocation guard')
