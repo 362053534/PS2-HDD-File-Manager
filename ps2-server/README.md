@@ -112,3 +112,9 @@ python3 scripts/pfsnet-transfer-probe.py 192.168.1.10 --put-mib 6144
 `make`、`make all`、`make release` 均生成压缩版 `ApaNetServer.ELF`；处理顺序为链接、去符号、ps2-packer 压缩。PS2 屏显和 ELF 尾部识别名称均为 `ApaNetServer`。旧名称的兼容副本不再生成。
 
 统一工作流中的 PS2 job 执行 `make release`，校验并上传 `ps2-server/ApaNetServer.ELF`，使用 `archive: false` 直接提供 ELF 下载，不再额外包装 ZIP。Windows 和 macOS 客户端保持独立的发布文件名。
+
+### 创建分区的完整性保护
+
+创建主/子分区后必须凑满请求容量，才能开始 PFS 格式化。遇到 `ENOSPC`、`EFBIG` 或关闭失败时，只清理本次新建的未完成分区并返回错误；清理失败同样返回错误，不格式化、不报告成功。Windows 和 macOS 客户端会在写入前独立模拟 APA 分配，正常情况下不可完成的请求不会到达服务端。旧客户端或布局变化造成的短分配由此保护兜底。
+
+`python3 tests/test-create-shortfall.py` 在本机 C 编译器中运行实际创建函数的 I/O 桩检查，覆盖正常创建、子分区耗尽、空间不足与清理失败。它不编译 PS2 ELF，也不连接硬件；ELF 仍仅使用 `ghcr.io/362053534/ps2homebrew:main` 通过 Actions 编译。

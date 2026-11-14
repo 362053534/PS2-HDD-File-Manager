@@ -11,6 +11,7 @@
   <ItemGroup>
     <!-- 旧 Actions 的入口适配：测试源码仍归 Windows 客户端所有。 -->
     <Compile Include="..\Windows\Tests\Program.cs" Link="Program.cs" />
+    <Compile Include="..\Windows\Tests\AllocationChecks.cs" Link="AllocationChecks.cs" />
     <ProjectReference Include="..\Windows\PS2-HDD-File-Manager.csproj" />
   </ItemGroup>
   <Target Name="CopyLegacyReleaseArtifacts" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">

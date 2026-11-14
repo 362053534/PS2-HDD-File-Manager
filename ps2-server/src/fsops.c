@@ -1490,13 +1490,16 @@ static int createApaPfsPartition(const char *name, int sizeMb)
         return PFSNET_ERR_EXIST;
     }
 
-    maxMb = (int)((u32)fileXioDevctl("hdd0:", HDIOC_MAXSECTOR, NULL, 0, NULL, 0) / 2048u);
+    rv = fileXioDevctl("hdd0:", HDIOC_MAXSECTOR, NULL, 0, NULL, 0);
+    if (rv <= 0)
+        return mapErrno(rv < 0 ? rv : -EIO);
+    maxMb = (int)((u32)rv / 2048u);
     for (maxIndex = 0; maxIndex < 9; maxIndex++) {
         if (g_apaSizeMb[maxIndex] == maxMb)
             break;
     }
     if (maxIndex >= 9)
-        maxIndex = 8;
+        return PFSNET_ERR_INVAL;
 
     for (useIndex = maxIndex; useIndex > 0 && g_apaSizeMb[useIndex] > sizeMb; useIndex--)
         ;
@@ -1538,14 +1541,20 @@ static int createApaPfsPartition(const char *name, int sizeMb)
         left -= g_apaSizeMb[useIndex];
     }
 
-    fileXioClose(fd);
+    rv = fileXioClose(fd);
+    /* Never format a short allocation or report it as a successful create.
+       checkStr names only the new partition opened with O_CREAT in this call. */
+    if (left > 0 || rv < 0) {
+        int cleanup = fileXioRemove(checkStr);
+        if (cleanup < 0)
+            return mapErrno(cleanup);
+        return rv < 0 ? mapErrno(rv) : PFSNET_ERR_NOSPC;
+    }
     rv = formatPfsPartition(name);
     if (rv < 0) {
         fileXioRemove(checkStr);
         return mapErrno(rv);
     }
-    /* left>0 表示未能凑满请求容量；与本地核验一致，由 PC 写后校验决定是否回滚 */
-    (void)left;
     return PFSNET_OK;
 }
 

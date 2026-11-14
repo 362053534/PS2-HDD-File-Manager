@@ -91,7 +91,7 @@ jobs:
           path: pfsshell/build-local-win32/pfsshell.exe
           # 上游 SHA 变了自动失效。缓存的是 -static 链接的独立 exe，
           # 换 runner 镜像也不会失配，所以 key 里只放 os/arch。
-          key: pfsshell-exe-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
+          key: pfsshell-exe-apa-create-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
 
       - name: Checkout pfsshell 源码
         if: steps.pfsshell-cache.outputs.cache-hit != 'true'
@@ -120,31 +120,6 @@ jobs:
             mingw-w64-i686-meson
             mingw-w64-i686-ninja
 
-      # 不启用 pfsfuse，因此不需要 external/dokany 等子模块
-      # 失败时把日志尾部塞进 ::error:: annotation（Actions 日志在 blob 存储里，annotation 走 API 可读）
-      - name: 编译 pfsshell.exe
-        if: steps.pfsshell-cache.outputs.cache-hit != 'true'
-        shell: msys2 {0}
-        run: |
-          W="$(cygpath -u "${{ github.workspace }}")"
-          echo "workspace=$W"
-          cd "$W/pfsshell" || { echo "::error::进入 pfsshell 目录失败: $W/pfsshell"; exit 1; }
-          pwd
-          for t in gcc meson ninja python3 pkg-config; do printf '%-11s ' "$t"; command -v "$t" || echo 'NOT FOUND'; done
-          gcc --version | head -1 || true
-          meson --version || true
-          if ! meson setup build-local-win32 -Denable_pfs2tar=true > setup.log 2>&1; then
-            echo "::error::meson setup 失败::$(tail -n 25 setup.log | tr -d '\r' | tr '\n' '|')"
-            exit 1
-          fi
-          if ! meson compile -C build-local-win32 > compile.log 2>&1; then
-            echo "::error::meson compile 失败::$(tail -n 25 compile.log | tr -d '\r' | tr '\n' '|')"
-            exit 1
-          fi
-          # 空文件绝不能进缓存（actions/cache 的 post 步骤不看构建结果）
-          test -s build-local-win32/pfsshell.exe || { echo "::error::pfsshell.exe 没生成或为 0 字节"; exit 1; }
-          ls -l build-local-win32/pfsshell.exe
-
       - name: 取 PFS-BatchKit-Manager 的工具（sparse，仅 3 个文件）
         uses: actions/checkout@v4
         with:
@@ -161,6 +136,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: PFS-BatchKit-Manager/PS2-HDD-File-Manager
+
+      # 不启用 pfsfuse，因此不需要 external/dokany 等子模块
+      # 失败时把日志尾部塞进 ::error:: annotation（Actions 日志在 blob 存储里，annotation 走 API 可读）
+      - name: 编译 pfsshell.exe
+        if: steps.pfsshell-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          W="$(cygpath -u "${{ github.workspace }}")"
+          echo "workspace=$W"
+          cd "$W/pfsshell" || { echo "::error::进入 pfsshell 目录失败: $W/pfsshell"; exit 1; }
+          pwd
+          for t in gcc meson ninja python3 pkg-config; do printf '%-11s ' "$t"; command -v "$t" || echo 'NOT FOUND'; done
+          python3 "$W/PFS-BatchKit-Manager/PS2-HDD-File-Manager/scripts/patch-pfsshell-create.py" "$W/pfsshell/src/shell.c"
+          gcc --version | head -1 || true
+          meson --version || true
+          if ! meson setup build-local-win32 -Denable_pfs2tar=true > setup.log 2>&1; then
+            echo "::error::meson setup 失败::$(tail -n 25 setup.log | tr -d '\r' | tr '\n' '|')"
+            exit 1
+          fi
+          if ! meson compile -C build-local-win32 > compile.log 2>&1; then
+            echo "::error::meson compile 失败::$(tail -n 25 compile.log | tr -d '\r' | tr '\n' '|')"
+            exit 1
+          fi
+          # 空文件绝不能进缓存（actions/cache 的 post 步骤不看构建结果）
+          test -s build-local-win32/pfsshell.exe || { echo "::error::pfsshell.exe 没生成或为 0 字节"; exit 1; }
+          ls -l build-local-win32/pfsshell.exe
 
       - name: 校验 4 个 tools 依赖就位
         working-directory: PFS-BatchKit-Manager/PS2-HDD-File-Manager
@@ -275,7 +276,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pfsshell/build-local-macos/pfsshell
-          key: pfsshell-macos-monterey12-universal-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
+          key: pfsshell-macos-monterey12-universal-apa-create-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
 
       - name: Checkout pfsshell 源码
         if: steps.pfsshell-cache.outputs.cache-hit != 'true'
@@ -360,6 +361,9 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: 检查分区创建失败时禁止格式化
+        run: python3 ps2-server/tests/test-create-shortfall.py
 
       - name: 登录 ghcr（镜像为私有时需要）
         uses: docker/login-action@v3

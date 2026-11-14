@@ -40,8 +40,16 @@ internal sealed class PfsShellClient
     public Task<ProcessResult> ListPartitionsAsync(string device, CancellationToken cancellationToken) =>
         RunSessionAsync(device, [], "ls", cancellationToken);
 
-    public Task<ProcessResult> CreatePfsPartitionAsync(string device, string name, string size, CancellationToken cancellationToken) =>
-        RunSessionAsync(device, [], $"mkpart {Quote(name)} {Quote(size)} PFS", cancellationToken);
+    public async Task<ProcessResult> CreatePfsPartitionAsync(string device, string name, string size, CancellationToken cancellationToken)
+    {
+        var value = size.Trim().ToUpperInvariant();
+        if (value.Length < 2 || !long.TryParse(value[..^1], out var count) || count <= 0 || value[^1] is not ('M' or 'G'))
+            throw new InvalidOperationException("容量格式为 128M、1G 等。");
+        var bytes = checked(count * (value[^1] == 'G' ? 1024L : 1L) * 1048576L);
+        var layout = await new ApaPartitionTableReader().ReadAsync(device, cancellationToken);
+        ApaPartitionPlanner.RequireComplete(layout, bytes);
+        return await RunSessionAsync(device, [], $"mkpart {Quote(name)} {Quote(size)} PFS", cancellationToken);
+    }
 
     public Task<ProcessResult> RemovePartitionAsync(string device, string name, CancellationToken cancellationToken) =>
         RunSessionAsync(device, [], $"rmpart {Quote(name)}", cancellationToken);

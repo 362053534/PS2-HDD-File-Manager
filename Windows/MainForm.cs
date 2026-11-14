@@ -451,7 +451,11 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var request = PartitionCreatePrompt.Show(this, FormatBytes(layout.FreeBytes), FormatPartitionSize(layout.FreeBytes));
+        long maximumCreatable;
+        try { maximumCreatable = ApaPartitionPlanner.Maximum(layout); }
+        catch (Exception ex) { ShowWarning(ex.Message); return; }
+        if (maximumCreatable == 0) { ShowWarning("当前布局没有可完整创建 PFS 分区的空间。"); return; }
+        var request = PartitionCreatePrompt.Show(this, FormatBytes(layout.FreeBytes), FormatPartitionSize(maximumCreatable));
         if (request is null) return;
         if (!TryParsePartitionSize(request.Size, out var requestedBytes, out var normalizedSize, out var sizeError))
         {
@@ -474,6 +478,9 @@ internal sealed class MainForm : Form
             return;
         }
 
+        try { ApaPartitionPlanner.RequireComplete(layout, requestedBytes); }
+        catch (Exception ex) { ShowWarning(ex.Message); return; }
+
         var sourceDisplay = (_deviceCombo.SelectedItem as DeviceItem)?.Display ?? device;
         if (!PartitionCreateConfirmation.Show(this, sourceDisplay, request.Name, FormatBytes(requestedBytes)))
             return;
@@ -487,6 +494,7 @@ internal sealed class MainForm : Form
                 throw new InvalidOperationException($"分区“{request.Name}”已存在，已取消创建。");
             if (requestedBytes > currentLayout.FreeBytes)
                 throw new InvalidOperationException("APA 未分配空间已变化且不足，已取消创建。");
+            ApaPartitionPlanner.RequireComplete(currentLayout, requestedBytes);
 
             if (isNet)
                 await _pfsNet.ApaCreatePfsAsync(request.Name, normalizedSize, CancellationToken.None);
@@ -3199,13 +3207,13 @@ internal static class PartitionCreatePrompt
         };
         var description = new Label
         {
-            Text = $"当前 APA 未分配空间：{freeSpace}\n分区名可使用 DATA 或 +DATA；容量必须是 128MiB 的整数倍。\n大于单个 APA 分区上限时，会由 PS2SDK 自动建立主分区和子分区。",
+            Text = $"当前 APA 未分配空间：{freeSpace}\n当前布局可完整创建：{defaultSize}\n分区名可使用 DATA 或 +DATA；容量必须是 128MiB 的整数倍。\n大于单个 APA 分区上限时，会由 PS2SDK 自动建立主分区和子分区。",
             Left = 18,
             Top = 15,
             Width = 632,
             Height = 108
         };
-        var nameBox = new TextBox { Left = 164, Top = 148, Width = 488, Height = 38, Text = "+DATA" };
+        var nameBox = new TextBox { Left = 164, Top = 148, Width = 488, Height = 38, Text = "+OPL" };
         var sizeBox = new TextBox { Left = 164, Top = 214, Width = 488, Height = 38, Text = defaultSize };
         var ok = new Button { Text = "下一步", DialogResult = DialogResult.OK, Left = 360, Top = 318, Width = 150, Height = 52 };
         var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Left = 520, Top = 318, Width = 150, Height = 52 };

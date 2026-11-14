@@ -22,6 +22,8 @@ elif 'remote_name = argv[2]' not in body and 'remote_name = (argc >= 3) ? argv[2
     raise SystemExit('无法确认 pfsshell put 双参数实现，请检查该 fork 的源码')
 PY
 
+python3 "$ROOT/../scripts/patch-pfsshell-create.py" "$SOURCE/src/shell.c"
+
 mkdir -p "$(dirname "$OUTPUT")"
 # 独立构建目录避免旧架构或旧部署目标的对象文件被复用。
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/apanet-pfsshell.XXXXXX")"

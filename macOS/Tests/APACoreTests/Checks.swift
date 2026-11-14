@@ -36,6 +36,9 @@ class CheckSuite {
     static func main() {
         let tests = CoreTests()
         let cases: [(String,() throws -> Void)] = [
+            ("953728 MiB must be rejected before any write",tests.testCreateRejects953728MiBBeforeAnyWrite),
+            ("existing partition name rejects creation without writes",tests.testCreateRejectsExistingPartitionBeforeAnyWrite),
+            ("APA allocation geometry, 64 slots and 2TB",tests.testAllocationGeometryAndSlotLimits),
             ("UTF8 and truncated frames",tests.testUTF8RoundTripAndTruncatedStrings),
             ("Paths and command injection",tests.testPathsCannotEscapeDestinationOrInjectShellCommands),
             ("Unicode local listing and >4GiB",tests.testPfsshellListingPreservesUnicodeWhitespaceAndLargeSize),

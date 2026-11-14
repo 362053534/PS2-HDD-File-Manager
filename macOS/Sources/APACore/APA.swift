@@ -88,9 +88,13 @@ public enum PartitionOperations {
         let before = try storage.layout(cancel)
         var expected: UInt64 = 0
         if command == 0x50 {
-            guard values.count == 2, before.partition(name) == nil else { throw APAError.message("分区已存在") }
+            guard values.count == 2 else { throw APAError.message("缺少分区容量") }
+            guard !before.partitions.contains(where: { $0.isMain && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+                throw APAError.message("分区“\(name)”已存在，已取消创建。")
+            }
             expected = try Names.size(values[1])
             guard expected <= before.free else { throw APAError.message("APA 未分配空间不足") }
+            try ApaAllocation.requireComplete(before,bytes:expected)
         } else {
             guard let old = before.partition(name), old.type == 0x100 else { throw APAError.message("只能修改 PFS 主分区") }
             if command == 0x52 {

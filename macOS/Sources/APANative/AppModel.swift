@@ -30,6 +30,7 @@ final class AppModel: ObservableObject {
     private let queue = DispatchQueue(label:"com.fengge.apa.storage",qos:.userInitiated)
     private var storage: Storage?
     private var backends = [String:Storage]()
+    private var cachedLayout: Layout?
     private var diskTotal: UInt64 = 0
     private var diskFree: UInt64 = 0
     private var transferExpected: UInt64 = 0
@@ -87,6 +88,7 @@ final class AppModel: ObservableObject {
     private func showPartitions(_ c: Cancellation) throws {
         let s = try backend(); try s.unmount(c); let layout = try s.layout(c)
         diskTotal = layout.total; diskFree = layout.free
+        DispatchQueue.main.async { self.cachedLayout = layout }
         publish(layout.browsable.filter { self.showSystem || !BrowserPolicy.protected($0.name) },partition:nil,path:"/",space:Space(total:layout.total,free:layout.free))
     }
     private func showDirectory(_ part: String, _ path: String, _ c: Cancellation) throws {
@@ -108,7 +110,7 @@ final class AppModel: ObservableObject {
         storage = next; backends[choice.id] = next
         DispatchQueue.main.async {
             if !self.sources.contains(where: { $0.id == choice.id }) { self.sources.append(choice) }
-            self.sourceID = choice.id; self.source = choice.display
+            self.sourceID = choice.id; self.source = choice.display; self.cachedLayout = nil
             self.entries = []; self.selected = []; self.partition = nil; self.path = "/"
             self.capacity = "硬盘总计：—　未分配：—　当前分区：—　当前分区剩余：—"
         }
@@ -277,12 +279,20 @@ final class AppModel: ObservableObject {
     }
     func createPartition() {
         guard !busy, hasSource, partition == nil else { return }
-        guard let (name,size) = NativeDialogs.createPartition(free:diskFree) else { return }
+        guard let layout = cachedLayout else { failure = "请先刷新分区表。"; return }
+        let maximum: UInt64
+        do { maximum = try ApaAllocation.maximum(layout) } catch { failure = error.localizedDescription; return }
+        guard maximum > 0 else { failure = "当前布局没有可完整创建 PFS 分区的空间。"; return }
+        guard let (name,size) = NativeDialogs.createPartition(free:diskFree,maximum:maximum) else { return }
         do {
             try Names.partition(name)
+            guard !layout.partitions.contains(where: { $0.isMain && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+                throw APAError.message("分区“\(name)”已存在，已取消创建。")
+            }
             guard !BrowserPolicy.protected(name) else { throw APAError.message("不能使用系统保留分区名") }
             let bytes = try Names.size(size)
             guard bytes <= diskFree else { throw APAError.message("APA 未分配空间不足。未执行任何写入。") }
+            try ApaAllocation.requireComplete(layout,bytes:bytes)
             guard NativeDialogs.confirmPartition(source:source,name:name,bytes:bytes) else { return }
         } catch { failure = error.localizedDescription; return }
         operation("创建分区 \(name)") { c in

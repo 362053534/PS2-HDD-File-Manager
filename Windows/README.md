@@ -145,3 +145,9 @@ build-release-mac.sh         macOS 发布脚本（生成 .app 与 zip）
 ```
 
 PS2 端的实现状态、协议细节与编译方式见 [`ps2-server/README.md`](ps2-server/README.md) 与 [`PS2 协议`](../ps2-server/PROTOCOL.md)。
+
+## 分区创建容量检查
+
+创建表单默认填入当前布局可以完整分配的容量，分别计算实际磁盘的单段上限、空闲块与对齐和最多 64 个子分区。确认前与写入前都会检查；本地 pfsshell 服务入口还会重新读取布局预检。以 1TB 日志的布局为例，953728M 会在写入前被拒绝，建议 953344M（931G），避免“创建、格式化后再发现容量不符”。2TB 的单段上限按 SDK 规则计算为 32GiB，不存在固定 900 多 GiB 的整盘限制。
+
+`Tests/AllocationChecks.cs` 覆盖原始日志、推荐容量可重放、2TB、碎片占满段数、无写入规划和非法范围；会随原有 Windows 回归入口执行。发行工具由统一工作流应用 `scripts/patch-pfsshell-create.py` 后重新构建，分配不满不格式化、不返回成功。

@@ -53,4 +53,6 @@ Expect(popsErr.Contains("禁止删除以 __ 开头", StringComparison.Ordinal), 
 var genericErr = PfsNetProtocol.FormatCommandError(PfsNetProtocol.CmdPing, PfsNetProtocol.ErrBusy);
 Expect(genericErr.Contains("result=-9", StringComparison.Ordinal), "generic PfsNet errors still include result code");
 
+AllocationChecks.Run(Expect);
+
 Environment.Exit(failed);

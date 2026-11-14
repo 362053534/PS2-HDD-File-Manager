@@ -9,8 +9,10 @@ extension BrowserController {
             print("PASS UI: \(claim)")
         }
         let (form,name,size) = NativeDialogs.partitionForm(free:512*1024*1024)
-        try check(form.messageText == "新建 PFS 分区" && name.stringValue == "+DATA" && size.stringValue == "512M","partition name and size in a single form")
-        let (confirmation,acknowledge) = NativeDialogs.partitionConfirmation(source:"测试.img",name:"+DATA",bytes:512*1024*1024)
+        try check(form.messageText == "新建 PFS 分区" && name.stringValue == "+OPL" && size.stringValue == "512M","partition name and size in a single form")
+        let (_,_,safeSize) = NativeDialogs.partitionForm(free:953728*1048576,maximum:953344*1048576)
+        try check(safeSize.stringValue == "953344M","partition form defaults to allocatable capacity rather than total free bytes")
+        let (confirmation,acknowledge) = NativeDialogs.partitionConfirmation(source:"测试.img",name:"+OPL",bytes:512*1024*1024)
         try check(!confirmation.buttons[0].isEnabled,"partition creation requires acknowledgement")
         acknowledge.box.state = .on; acknowledge.toggle()
         try check(confirmation.buttons[0].isEnabled,"acknowledgement enables creation")
