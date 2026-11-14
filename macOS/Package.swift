@@ -2,7 +2,7 @@
 import PackageDescription
 let package = Package(
     name: "APAFileManagerMac",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v12)],
     products: [.executable(name: "APAFileManager", targets: ["APANative"])],
     targets: [
         .target(name: "APACore"),

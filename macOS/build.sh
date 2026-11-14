@@ -1,11 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-: "${PFSSHELL_BIN:?请指定由 362053534/pfsshell 编译的 macOS 原生 pfsshell}"
-file "$PFSSHELL_BIN" | grep -q 'Mach-O' || { echo 'pfsshell 必须是 macOS Mach-O'; exit 1; }
+: "${PFSSHELL_BIN:?请指定由 362053534/pfsshell 编译的 Monterey 通用 pfsshell}"
+export MACOSX_DEPLOYMENT_TARGET=12.0
+# 工具也必须为 Monterey 通用版，不能仅降低主程序的 plist 门槛。
+python3 "$ROOT/check-compatibility.py" "$PFSSHELL_BIN"
 cd "$ROOT"
-swift build -c release
-BINDIR="$(swift build -c release --show-bin-path)"
+for architecture in arm64 x86_64; do
+  swift build -c release --triple "$architecture-apple-macosx12.0" \
+    --scratch-path "$ROOT/.build/monterey-$architecture"
+done
+ARM_BIN="$(swift build -c release --triple arm64-apple-macosx12.0 --scratch-path "$ROOT/.build/monterey-arm64" --show-bin-path)/APAFileManager"
+INTEL_BIN="$(swift build -c release --triple x86_64-apple-macosx12.0 --scratch-path "$ROOT/.build/monterey-x86_64" --show-bin-path)/APAFileManager"
 OUTPUT="$ROOT/dist"
 APP_NAME="APA File Manager.app"
 EXECUTABLE="APAFileManager"
@@ -23,11 +29,11 @@ APP="$STAGE/$APP_NAME"
 mkdir -p "$APP/Contents/MacOS/tools" "$APP/Contents/Resources"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $EXECUTABLE" "$APP/Contents/Info.plist"
-cp "$BINDIR/APAFileManager" "$APP/Contents/MacOS/$EXECUTABLE"
+xcrun lipo -create "$ARM_BIN" "$INTEL_BIN" -output "$APP/Contents/MacOS/$EXECUTABLE"
 cp "$PFSSHELL_BIN" "$APP/Contents/MacOS/tools/pfsshell"
 chmod +x "$APP/Contents/MacOS/$EXECUTABLE" "$APP/Contents/MacOS/tools/pfsshell"
 strip -x "$APP/Contents/MacOS/$EXECUTABLE"
-# 仅链接系统框架，不复制第三方运行时。
+python3 "$ROOT/check-compatibility.py" "$APP/Contents/MacOS/$EXECUTABLE" "$APP/Contents/MacOS/tools/pfsshell"
 otool -L "$APP/Contents/MacOS/$EXECUTABLE"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
@@ -37,8 +43,9 @@ du -sk "$APP"
 ls -lh "$OUTPUT/$ARCHIVE"
 
 if [[ "${LEGACY_CI:-0}" == 1 ]]; then
-  # 工作流随后执行 app --run-tests；实际测试核心网络与本地镜像，不绕过检查。
-  xcrun swiftc -O -o "$OUTPUT/CoreChecks" "$ROOT"/Sources/APACore/*.swift "$ROOT"/Tests/APACoreTests/*.swift
+  # 测试工具只在当前构建机运行，不随 ZIP 发布。
+  xcrun swiftc -O -target "$(uname -m)-apple-macosx12.0" -o "$OUTPUT/CoreChecks" \
+    "$ROOT"/Sources/APACore/*.swift "$ROOT"/Tests/APACoreTests/*.swift
   if [[ -e "$OUTPUT/$APP_NAME" ]]; then
     mv "$OUTPUT/$APP_NAME" "$OUTPUT/$APP_NAME.backup.$(date +%s).$$"
   fi

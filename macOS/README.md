@@ -1,6 +1,6 @@
 # APA File Manager — macOS 原生客户端
 
-独立的 Swift / SwiftUI / AppKit 应用，最低 macOS 13。没有第三方 Swift 包，不依赖 .NET、Avalonia、Windows 工程或 Windows 工具。发布包只包含主程序、Info.plist 和 macOS 原生 pfsshell。Windows 源码、测试与发布位于 ../Windows，各自演进。
+独立的 Swift / SwiftUI / AppKit 应用，最低 macOS 12（含 Monterey 12.7.6）。没有第三方 Swift 包，不依赖 .NET、Avalonia、Windows 工程或 Windows 工具。发布包只包含主程序、Info.plist 和 macOS 原生 pfsshell。Windows 源码、测试与发布位于 ../Windows，各自演进。
 
 ## 构建与测试
 
@@ -31,7 +31,7 @@ PFSSHELL_BIN=/path/to/pfsshell ./build.sh
 - 不提供格式化任意物理盘入口；集成测试仅初始化其自行创建的 UUID 临时镜像。
 - 物理盘须有当前用户的读写权限；应用不修改系统权限、不索取密码、不自动提权，拒绝内置系统盘。
 - 本地 pfsshell 命令格式无法安全表达含双引号/换行的路径，会明确拒绝，不静默改名。符号链接不递归导入。
-- 当前构建为构建机本机架构（Actions 使用 Apple Silicon）。真实 PS2 的长时间大文件传输、旧版本 macOS、Intel Mac、物理盘权限与热拔插仍需独立验证，模拟测试与镜像测试不替代这些验证。
+- 当前发布构建为 arm64 + x86_64 通用版，包含 Intel 与 Apple Silicon。真实 PS2 的长时间大文件传输、旧版本 macOS、Intel Mac、物理盘权限与热拔插仍需独立验证，模拟测试与镜像测试不替代这些验证。
 
 ## 模块
 
@@ -53,3 +53,21 @@ PS2 实机探针未连接成功（SSH 内超时、本地 Terminal 返回 No rout
 根目录 `build-release-mac.sh` 设置 `LEGACY_CI=1`，仍调用本目录的 Swift 构建。为满足未修改的旧 yml，CI 使用 `PS2-HDD-File-Manager.app`、同名主程序和 `PS2-HDD-File-Manager-Release-macos.zip`，写入根目录 bin/Release。显示名称仍为 APA File Manager。直接运行本目录 build.sh 则保留新的原生命名。
 
 `--run-tests` 在 CI 工作区调用真实的 CoreChecks 二进制，并传入本次打包的原生 pfsshell，执行含本地镜像在内的全部测试；失败返回非零。CoreChecks 放在 app 外，不随 ZIP 发布，因此发行版的 --run-tests 会明确报告测试工具未分发，不会假报通过。
+
+## Monterey 与通用构建
+
+Swift Package、Info.plist、两种 Swift 编译目标和 pfsshell 均以 macOS 12.0 为最低版本，覆盖 Monterey 12.7.6。主程序与 pfsshell 都包含 arm64 和 x86_64。Actions 的 Mac job 设置相同部署目标，并使用新的通用工具缓存键，避免复用旧系统或单架构产物。Windows 与 PS2 的 job 保持不变。
+
+先安装 Meson/Ninja 到独立 Python 虚拟环境（构建需要，不随应用打包），从 362053534/pfsshell 编译原生工具：
+
+```sh
+./build-pfsshell.sh /path/to/362053534-pfsshell /path/to/pfsshell-universal
+PFSSHELL_TEST_BIN=/path/to/pfsshell-universal ./test.sh
+PFSSHELL_BIN=/path/to/pfsshell-universal ./build.sh
+```
+
+打包前自动检查两个可执行文件的架构和 Mach-O 最低系统版本。单架构工具或最低系统高于 12.0 的工具将被拒绝，不通过改写二进制版本头来绕过限制。测试程序按当前构建机架构编译为 macOS 12.0 目标；交叉架构编译和版本检查不等于在 Intel Monterey 实机运行验证。
+
+### 本轮验证（2026-11-14）
+
+在 macOS 27.2.1 / Swift 6.4.2 上，以 12.0 部署目标编译 arm64 和 x86_64 主程序及 pfsshell，合并为通用版。两种架构的 10 组核心/镜像检查均通过（Intel 程序通过 Rosetta 执行），两种架构的窗口启动检查通过，签名校验通过。最终 ZIP 内的 plist、两个 Mach-O 的架构和最低系统版本已重新检查；最低版本为 12.0。负向检查确认拒绝单架构二进制及最低系统为 13.0 的通用二进制。尚未在真实 Monterey 12.7.6 系统或 Intel 硬件上运行，需由目标系统完成最终验收。
