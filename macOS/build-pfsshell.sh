@@ -23,6 +23,7 @@ elif 'remote_name = argv[2]' not in body and 'remote_name = (argc >= 3) ? argv[2
 PY
 
 python3 "$ROOT/../scripts/patch-pfsshell-create.py" "$SOURCE/src/shell.c"
+python3 "$ROOT/../scripts/patch-pfsshell-macos-session.py" "$SOURCE/src/shell.c"
 
 mkdir -p "$(dirname "$OUTPUT")"
 # 独立构建目录避免旧架构或旧部署目标的对象文件被复用。

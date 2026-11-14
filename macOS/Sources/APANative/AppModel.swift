@@ -402,22 +402,26 @@ final class AppModel: ObservableObject {
             self.transferExpected = plan.filter { !$0.directory }.reduce(0) { $0+$1.size }
             self.transferFiles = plan.filter { !$0.directory }.count
             DispatchQueue.main.async { self.append("PFS 导入空间预检通过：当前分区剩余 \(Self.bytes(space.free))，预计净占用 \(Self.bytes(needed))。"); self.status = "正在导入 \(plan.count) 个项目…" }
-            for item in plan {
-                try c.check()
-                let existing = try s.list(item.parent,c).first { $0.name == item.url.lastPathComponent }
-                if let existing, existing.directory != item.directory {
-                    guard overwrite else { throw APAError.message("目标已变化，请重新导入") }
-                    try self.delete(existing,parent:item.parent,storage:s,cancel:c,depth:0)
-                }
-                if item.directory {
-                    if existing?.directory != true { try s.mutate(0x21,[item.parent,item.url.lastPathComponent],c) }
-                } else {
-                    guard existing == nil || overwrite else { throw APAError.message("目标已存在：\(item.url.lastPathComponent)") }
-                    self.lastFileDone = 0; self.fileIndex += 1
-                    try s.upload(item.url,parent:item.parent,overwrite:overwrite,cancel:c) { self.progress(item.url.lastPathComponent,$0,$1) }
-                    DispatchQueue.main.async { self.append("已导入 \(item.url.lastPathComponent)（\(Self.bytes(item.size))）") }
+            let performImport = {
+                for item in plan {
+                    try c.check()
+                    let existing = try s.list(item.parent,c).first { $0.name == item.url.lastPathComponent }
+                    if let existing, existing.directory != item.directory {
+                        guard overwrite else { throw APAError.message("目标已变化，请重新导入") }
+                        try self.delete(existing,parent:item.parent,storage:s,cancel:c,depth:0)
+                    }
+                    if item.directory {
+                        if existing?.directory != true { try s.mutate(0x21,[item.parent,item.url.lastPathComponent],c) }
+                    } else {
+                        guard existing == nil || overwrite else { throw APAError.message("目标已存在：\(item.url.lastPathComponent)") }
+                        self.lastFileDone = 0; self.fileIndex += 1
+                        try s.upload(item.url,parent:item.parent,overwrite:overwrite,cancel:c) { self.progress(item.url.lastPathComponent,$0,$1) }
+                        DispatchQueue.main.async { self.append("已导入 \(item.url.lastPathComponent)（\(Self.bytes(item.size))）") }
+                    }
                 }
             }
+            if let local = s as? LocalStorage { try local.withImportSession(c,performImport) }
+            else { try performImport() }
             try self.showDirectory(part,folder,c)
         }
     }

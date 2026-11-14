@@ -276,7 +276,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pfsshell/build-local-macos/pfsshell
-          key: pfsshell-macos-monterey12-universal-apa-create-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
+          key: pfsshell-macos-monterey12-universal-apa-session-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.pfsshell-sha.outputs.sha }}
 
       - name: Checkout pfsshell 源码
         if: steps.pfsshell-cache.outputs.cache-hit != 'true'

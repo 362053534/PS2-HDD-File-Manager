@@ -39,6 +39,8 @@ public final class LocalStorage: Storage {
     private let tool: URL
     private var partition: String?
     private let total: UInt64
+    private var importSession: PfsShellSession?
+    private var sessionPath = "/"
     public init(device: URL, tool: URL) throws {
         self.device = device; self.tool = tool
         if device.path.hasPrefix("/dev/") {
@@ -70,7 +72,37 @@ public final class LocalStorage: Storage {
         guard !value.contains("\""), !value.contains("\n"), !value.contains("\r"), !value.utf8.contains(0) else { throw APAError.message("本地 pfsshell 不支持名称中的引号或换行") }
         return "\""+value+"\""
     }
-    private func session(_ command: String, path: String = "/", cancel: Cancellation) throws -> String {
+    /// The whole import shares a mount; each command must finish before the next is sent.
+    public func withImportSession(_ cancel: Cancellation, _ work: () throws -> Void) throws {
+        guard importSession == nil, let partition else { throw APAError.message("未选择分区或导入会话已打开") }
+        try cancel.check()
+        let active = try PfsShellSession(tool:tool)
+        importSession = active; sessionPath = "/"
+        defer { importSession = nil; sessionPath = "/" }
+        do {
+            _ = try active.command("device \(try Self.quote(device.path))",cancel:cancel)
+            _ = try active.command("mount \(try Self.quote(partition))",cancel:cancel)
+            try work()
+            try active.finish()
+        } catch {
+            let original = error
+            do { try active.finish() }
+            catch { throw APAError.message(original.localizedDescription+"\n"+error.localizedDescription) }
+            throw original
+        }
+    }
+    private func session(_ command: String, path: String = "/", cancel: Cancellation, progress: (UInt64)->Void = { _ in }) throws -> String {
+        if let active = importSession {
+            if sessionPath != path {
+                _ = try active.command("cd \(try Self.quote(path))",cancel:cancel)
+                sessionPath = path
+            }
+            var text = ""
+            for line in command.split(separator:"\n") {
+                text += try active.command(String(line),cancel:cancel,progress:progress)
+            }
+            return text
+        }
         var script = "device \(try Self.quote(device.path))\n"
         if let partition { script += "mount \(try Self.quote(partition))\n" }
         for component in path.split(separator:"/") { script += "cd \(try Self.quote(String(component)))\n" }
@@ -141,14 +173,18 @@ public final class LocalStorage: Storage {
         let name = local.lastPathComponent; try Names.component(name)
         let existing = try list(parent,cancel).first { $0.name == name }
         if let existing, !overwrite || existing.directory { throw APAError.message("目标已存在：\(name)") }
-        let size = UInt64(try local.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0)
+        // URL resource values may be cached across repeated imports of the same path.
+        let source = try FileHandle(forReadingFrom:local)
+        let size: UInt64
+        do { size = try source.seekToEnd(); try source.close() }
+        catch { try? source.close(); throw error }
         progress(0,size)
         // 先写唯一临时名并校验大小；替换时备份旧文件，提交失败则尽力恢复。
         let staging = ".apanet_" + UUID().uuidString.replacingOccurrences(of:"-",with:"")
         let backup = ".apabackup_" + UUID().uuidString.replacingOccurrences(of:"-",with:"")
         var staged = false; var backedUp = false; var committed = false
         do {
-            _ = try session("put \(try Self.quote(local.path)) \(try Self.quote(staging))",path:parent,cancel:cancel)
+            _ = try session("put \(try Self.quote(local.path)) \(try Self.quote(staging))",path:parent,cancel:cancel) { progress(min($0,size > 0 ? size-1:0),size) }
             staged = true
             guard try list(parent,Cancellation()).contains(where: { $0.name == staging && $0.size == size && !$0.directory }) else { throw APAError.message("本地导入写后大小校验失败") }
             try cancel.check()
@@ -159,11 +195,23 @@ public final class LocalStorage: Storage {
             }
             _ = try session("rename \(try Self.quote(staging)) \(try Self.quote(name))",path:parent,cancel:commit)
             committed = true
-            if backedUp { _ = try session("rm \(try Self.quote(backup))",path:parent,cancel:commit) }
+            if importSession != nil { _ = try session("apa_sync",path:parent,cancel:commit) }
+            if backedUp {
+                _ = try session("rm \(try Self.quote(backup))",path:parent,cancel:commit)
+                backedUp = false
+            }
         } catch {
             if !committed {
-                if backedUp { _ = try? session("rename \(try Self.quote(backup)) \(try Self.quote(name))",path:parent,cancel:Cancellation()) }
+                if backedUp {
+                    do {
+                        _ = try session("rename \(try Self.quote(backup)) \(try Self.quote(name))",path:parent,cancel:Cancellation())
+                        backedUp = false
+                    } catch { /* A failed shared session refuses recovery writes; preserve the backup. */ }
+                }
                 if staged { _ = try? session("rm \(try Self.quote(staging))",path:parent,cancel:Cancellation()) }
+            }
+            if backedUp {
+                throw APAError.message(error.localizedDescription+"\n原文件备份名为“\(parent)/\(backup)”。请重新连接后核对并保留备份。")
             }
             throw error
         }

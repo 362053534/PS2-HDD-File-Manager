@@ -48,6 +48,8 @@ class CheckSuite {
             ("Cancel RST then ABORT then next RPC",tests.testCancelledUploadResetsDataBeforeAbortAndKeepsControlUsable),
             ("Failed GET preserves destination",tests.testFailedDownloadPreservesExistingDestination),
             ("Resume after data reset",tests.testResumeUsesServerOffsetAfterDataReset),
+            ("shared import stops on command, disk and process errors",tests.testSharedImportRejectsFaultBeforeNextFile),
+            ("shared import flush, overwrite, path changes and cancellation",tests.testSharedImportPersistsFilesAndProtectsCancelledOverwrite),
             ("Local APA/PFS image lifecycle",tests.testLocalImageEndToEnd)
         ]
         for (name,run) in cases {
