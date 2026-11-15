@@ -243,3 +243,15 @@ The first error is preserved so an inner scheduler failure is not overwritten
 by an outer link/DHCP timeout label. No healthy-stage/progress logs are restored.
 This is observation only: scheduling and DHCP behavior are unchanged. Native
 tests check first-error retention; the real PS2 failure remains to be captured.
+
+### Launcher priority zero
+
+The real PS2 fallback reported `thread priority (0)`: the DIAG-7 guard rejected
+the startup thread before its first DHCP polling delay. Main now explicitly
+sets priority 0x40 before network startup, following the owner's OPL pattern of
+setting the main thread priority (OPL uses 31). Startup polling temporarily
+lowers it to 0x60 and restores 0x40. It no longer depends on the launcher's
+initial priority. The native harness executes the actual main setup followed
+by the actual delay with initial priority 0: red before this change, green
+after. This reproduces the reported guard failure, not BIOS execution; real
+DHCP lease acquisition and the older long-transfer failure remain unverified.

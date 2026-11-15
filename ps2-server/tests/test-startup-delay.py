@@ -24,6 +24,11 @@ if not old:
     poll=source[a:b]
 else:
     poll=""
+main_source=(subprocess.check_output(["git","show",args.revision+":ps2-server/src/main.c"],cwd=root,text=True,encoding="utf-8")
+             if args.revision else (root/"src/main.c").read_text(encoding="utf-8"))
+# Execute the actual main-thread priority setup, with only fatal UI handling stubbed.
+setup=re.search(r"    /\* Network startup priority begin \*/(.*?)    /\* Network startup priority end \*/",main_source,re.S)
+startup=setup.group(1) if setup else ""
 code=r"""
 #include <assert.h>
 #include <stdint.h>
@@ -42,6 +47,8 @@ static int progress_lines,checking_calls,bound_at;
 int scr_printf(const char *format,...) {(void)format;progress_lines++;return 0;}
 int checking(void) {checking_calls++;return bound_at>0 && checking_calls>=bound_at;}
 int GetThreadId(void) {return 7;}
+static const int g_mainTid=7;
+void waitStartToExit(void) {assert(!"unexpected fatal startup error");}
 int ReferThreadStatus(int tid,ee_thread_status_t *s) {assert(tid==7);s->current_priority=priority;return status_error;}
 int ChangeThreadPriority(int tid,int p) {
  assert(tid==7);changes++;
@@ -60,7 +67,7 @@ s32 __wrap_DelayThread(s32 usec) {
  for(;;)pause();
  return 0;
 }
-"""+observer+function+"\n"+poll
+"""+observer+function+"\n"+poll+"\nstatic void prepareStartup(void) {(void)g_mainTid;\n"+startup+"\n}\n"
 if old:
     code+=r"""
 int main(void) {setbuf(stdout,NULL);(void)original;(void)progress_lines;(void)checking_calls;(void)bound_at;sleepMs(20);return 0;}
@@ -70,6 +77,13 @@ else:
 static void reset(void) {g_bootFailure=NULL;g_bootFailureCode=0;clock_ticks=0;priority=original=64;rotations=changes=status_error=lower_error=rotate_error=restore_error=0;progress_lines=checking_calls=bound_at=0;}
 int main(void) {
  setbuf(stdout,NULL);reset();
+ priority=original=0;
+ prepareStartup();
+ changes=0;
+ if(sleepMs(20)!=0) {puts("FAIL launcher priority 0 aborts DHCP polling before the first wait");return 1;}
+ assert(priority>=ETH_TCPIP_PRIO || priority==64);
+ puts("PASS actual main initializes launcher priority 0 before DHCP polling");
+ reset();
  assert(sleepMs(20)==0 && priority==original && rotations>0 && changes==2);
  assert(clock_ticks>=21000);
  puts("PASS alarm wake unavailable: startup delay still returns and restores priority");

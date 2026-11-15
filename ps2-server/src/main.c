@@ -335,6 +335,14 @@ int main(int argc, char *argv[])
      * 3) 再失败：uLE IPCONFIG.DAT
      * 4) 仍没有可用地址：报错，按 START 退出（不写兜底 IP）
      */
+    /* Network startup priority begin */
+    /* 启动器可能让 root 线程保持 priority 0。参照 OPL 显式设置主线程优先级，
+     * 不依赖启动器；轮询时再降到 TCP/IP 工作线程之后，结束后恢复到 0x40。 */
+    if (ChangeThreadPriority(g_mainTid, 0x40) < 0) {
+        scr_printf("FATAL: main thread priority setup failed\n");
+        waitStartToExit();
+    }
+    /* Network startup priority end */
     pfsnetIpConfigInitDefault(&cfg);
     if (applyDhcp(&cfg) < 0) {
         const char *bootPath = (argc > 0) ? argv[0] : NULL;
