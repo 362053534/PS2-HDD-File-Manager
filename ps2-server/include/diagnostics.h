@@ -2,7 +2,7 @@
 #define APANET_DIAGNOSTICS_H
 #include <stdint.h>
 
-/* DIAG-1: observational only. IRQ hooks only update aligned 32-bit fields.
+/* DIAG-2: observational only. IRQ hooks only update aligned 32-bit fields.
  * Each stage has one writer; byte totals are snapshotted with interrupts off.
  * Do not log, allocate, perform RPC or wait on a lock from hot-path hooks. */
 enum { APA_RX_SLEEP, APA_RX_ALLOC, APA_RX_DMA, APA_RX_ENQUEUE };
@@ -13,6 +13,9 @@ typedef struct ApaDiagnostics {
     uint32_t clockCalls, msgUsed, msgPeak, msgWaits, msgWaiting;
     uint32_t rxStage, recvStage, diskStage, active, banks;
     uint32_t sif0, dstat, rxIndex, rxLen, rxNextLen, rxBusy, cmdSize;
+    uint32_t txRequests, txPolls, txDequeues, txLastLength;
+    uint32_t ipFound, dhcpEnabled, dhcpState;
+    uint8_t address[4];
     uint64_t recvBytes, diskBytes, totalBytes;
     int32_t recvError, diskError;
 } ApaDiagnostics;

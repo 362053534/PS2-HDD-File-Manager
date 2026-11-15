@@ -381,7 +381,7 @@ int main(int argc, char *argv[])
 
     scr_printf("Press START to exit\n");
     if (apaDiagStart() < 0)
-        scr_printf("WARN: DIAG-1 monitor failed to start\n");
+        scr_printf("WARN: DIAG-2 monitor failed to start\n");
     startPadWatch();
     SleepThread();
     safeExitElf();

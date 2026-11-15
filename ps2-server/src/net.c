@@ -478,6 +478,31 @@ static void pfsnetNetManRxThread(void *arg)
     }
 }
 
+extern void __real_NetManNetIFXmit(void);
+extern int __real_NetManTxPacketNext(void **payload);
+extern void __real_NetManTxPacketDeQ(void);
+
+/* Xmit may be called in interrupt context: counters only, no locks/logging. */
+void __wrap_NetManNetIFXmit(void)
+{
+    g_apaDiag.txRequests++;
+    __real_NetManNetIFXmit();
+}
+
+int __wrap_NetManTxPacketNext(void **payload)
+{
+    int length = __real_NetManTxPacketNext(payload);
+    g_apaDiag.txPolls++;
+    g_apaDiag.txLastLength = length > 0 ? (unsigned)length : 0;
+    return length;
+}
+
+void __wrap_NetManTxPacketDeQ(void)
+{
+    __real_NetManTxPacketDeQ();
+    g_apaDiag.txDequeues++;
+}
+
 /* EE-local reads only; caller snapshots with interrupts briefly disabled.
  * Do not query NETMAN via IOP RPC here: that could hang the monitor too. */
 void apaDiagNetSnapshot(ApaDiagnostics *s)
@@ -488,6 +513,17 @@ void apaDiagNetSnapshot(ApaDiagnostics *s)
     s->rxIndex = g_nmRxBufferRdPtr;
     s->rxBusy = g_nmIsProcessingRx;
     s->cmdSize = header != NULL ? header->psize : 0;
+    {
+        t_ip_info info;
+        s->ipFound = ps2ip_getconfig("sm0", &info) > 0;
+        if (s->ipFound) {
+            struct ip4_addr *ip = (struct ip4_addr *)&info.ipaddr;
+            s->address[0] = ip4_addr1(ip); s->address[1] = ip4_addr2(ip);
+            s->address[2] = ip4_addr3(ip); s->address[3] = ip4_addr4(ip);
+            s->dhcpEnabled = info.dhcp_enabled;
+            s->dhcpState = info.dhcp_status;
+        }
+    }
     if (g_nmFrameBufferStatus != NULL) {
         volatile struct NetManBD *bd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
         volatile struct NetManBD *next = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);

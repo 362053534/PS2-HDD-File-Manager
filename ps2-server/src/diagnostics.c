@@ -73,19 +73,56 @@ static void diagLine(int row, const char *format, ...)
     scr_printf("%-78s", line);
 }
 
+/* No thread manipulation: sample status using local EE kernel syscalls.
+ * Priority identifies roles in the canonical NETMAN/ps2ip stack. */
+static int findThread(int priority)
+{
+    int id;
+    ee_thread_status_t status;
+    for (id = 1; id < 256; id++) {
+        if (ReferThreadStatus(id, &status) >= 0 &&
+            status.initial_priority == priority)
+            return id;
+    }
+    return -1;
+}
+
+static void threadLine(int row, const char *name, int *id, int priority,
+                       ee_thread_status_t *sample)
+{
+    ee_thread_status_t status;
+    memset(sample, 0, sizeof(*sample));
+    if (*id < 0) *id = findThread(priority);
+    if (*id >= 0 && ReferThreadStatus(*id, &status) >= 0) {
+        *sample = status;
+        diagLine(row, "%s tid:%d state:%x wait:%u id:%u wake:%u", name, *id,
+                 (unsigned)status.status, (unsigned)status.waitType,
+                 (unsigned)status.waitId, (unsigned)status.wakeupCount);
+    } else {
+        *id = -1;
+        diagLine(row, "%s: not found (priority %02x)", name, priority);
+    }
+}
+
 /* Fixed rows: no scrolling, file writes, network requests or IOP RPC here.
  * Ages mean time since a sampled counter last advanced, not a timeout verdict.
  * If HB freezes too, thread starvation/timer/interrupt failure remain possible. */
 static void diagThread(void *arg)
 {
-    ApaDiagnostics s;
+    ApaDiagnostics s, held;
     unsigned beat = 0, rxAge = 0, diskAge = 0, pktAge = 0;
     uint64_t lastRx = 0, lastDisk = 0;
     uint32_t lastPkt = 0, previous = 0;
+    int txTid = -1, coreTid = -1, rxTid = -1;
+    int heldValid = 0, stallArmed = 0;
+    unsigned heldUptime = 0;
+    ee_thread_status_t liveThreads[3], heldThreads[3];
+    int heldIds[3];
     (void)arg;
     for (;;) {
         uint32_t now = (uint32_t)(GetTimerSystemTime() / ((u64)kBUSCLK / 1000));
         unsigned elapsed = previous ? now - previous : 0;
+        int captureStall = 0;
         int old = DIntr();
         s = g_apaDiag;
         apaDiagNetSnapshot(&s);
@@ -95,8 +132,14 @@ static void diagThread(void *arg)
         diskAge = s.diskBytes != lastDisk || !s.active ? 0 : diskAge + elapsed;
         pktAge = s.rxPackets != lastPkt ? 0 : pktAge + elapsed;
         lastRx = s.recvBytes; lastDisk = s.diskBytes; lastPkt = s.rxPackets;
+        if (rxAge == 0 || diskAge == 0) stallArmed = 0;
+        if (s.active && rxAge >= 10000 && diskAge >= 10000 && !stallArmed) {
+            held = s;
+            heldUptime = now/1000;
+            heldValid = stallArmed = captureStall = 1;
+        }
         int savedX = scr_getX(), savedY = scr_getY();
-        diagLine(12, "DIAG-1 HB:%u up:%us PUT:%u banks:%u",
+        diagLine(12, "DIAG-2 HB:%u up:%us PUT:%u banks:%u",
                    ++beat, now/1000, s.active, s.banks);
         diagLine(13, "RX:%u age:%us SIF:%u stage:%s  ",
                    s.rxPackets, pktAge/1000, s.sifIrqs, rxName(s.rxStage));
@@ -113,6 +156,46 @@ static void diagThread(void *arg)
         diagLine(18, "BD:%u len:%u/%u busy:%u cmd:%u SIF:%03x DS:%08x",
                  s.rxIndex, s.rxLen, s.rxNextLen, s.rxBusy, s.cmdSize,
                  (unsigned)s.sif0, (unsigned)s.dstat);
+        diagLine(19, "LIVE IP:%u.%u.%u.%u found:%u dhcp:%u state:%u",
+                 (unsigned)s.address[0], (unsigned)s.address[1],
+                 (unsigned)s.address[2], (unsigned)s.address[3],
+                 s.ipFound, s.dhcpEnabled, s.dhcpState);
+        diagLine(20, "TX req:%u poll:%u deq:%u last:%u", s.txRequests,
+                 s.txPolls, s.txDequeues, s.txLastLength);
+        threadLine(21, "TX", &txTid, 0x56, &liveThreads[0]);
+        threadLine(22, "CORE", &coreTid, 0x58, &liveThreads[1]);
+        threadLine(23, "RX", &rxTid, 0x59, &liveThreads[2]);
+        if (captureStall) {
+            memcpy(heldThreads, liveThreads, sizeof(heldThreads));
+            heldIds[0] = txTid; heldIds[1] = coreTid; heldIds[2] = rxTid;
+        }
+        if (heldValid) {
+            diagLine(24, "SNAP @%us NET:%s HDD:%s RX:%s", heldUptime,
+                     ioName(held.recvStage), ioName(held.diskStage), rxName(held.rxStage));
+            diagLine(25, "SNAP MiB:%u/%u RX:%u msg:%u TXdeq:%u",
+                     (unsigned)(held.recvBytes>>20), (unsigned)(held.diskBytes>>20),
+                     held.rxPackets, held.msgUsed, held.txDequeues);
+            diagLine(26, "SNAP IP:%u.%u.%u.%u TXreq:%u poll:%u", (unsigned)held.address[0],
+                     (unsigned)held.address[1], (unsigned)held.address[2],
+                     (unsigned)held.address[3], held.txRequests, held.txPolls);
+        } else {
+            diagLine(24, "SNAP: no 10-second NET+HDD stall observed yet");
+            diagLine(25, "");
+            diagLine(26, "");
+        }
+        {
+            int i;
+            static const char *names[] = {"TX", "CORE", "RX"};
+            for (i = 0; i < 3; i++) {
+                if (heldValid)
+                    diagLine(27+i, "SNAP %s tid:%d state:%x wait:%u id:%u wake:%u",
+                             names[i], heldIds[i], (unsigned)heldThreads[i].status,
+                             (unsigned)heldThreads[i].waitType, (unsigned)heldThreads[i].waitId,
+                             (unsigned)heldThreads[i].wakeupCount);
+                else
+                    diagLine(27+i, "");
+            }
+        }
         scr_setXY(savedX, savedY);
         DelayThread(1000000);
     }
