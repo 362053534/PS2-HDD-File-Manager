@@ -149,7 +149,7 @@ static void diagThread(void *arg)
             heldValid = stallArmed = captureStall = 1;
         }
         int savedX = scr_getX(), savedY = scr_getY();
-        diagLine(12, "DIAG-6 HB:%u up:%us PUT:%u banks:%u",
+        diagLine(12, "DIAG-7 HB:%u up:%us PUT:%u banks:%u",
                    ++beat, now/1000, s.active, s.banks);
         diagLine(13, "RX:%u age:%us SIF:%u stage:%s  ",
                    s.rxPackets, pktAge/1000, s.sifIrqs, rxName(s.rxStage));

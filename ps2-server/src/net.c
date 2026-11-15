@@ -27,15 +27,6 @@ extern void NetManToggleGlobalNetIFLinkState(unsigned char state);
 /* GCC14 constructor 写入 .init_array，而 PS2 crt0 只遍历 .ctors，需手动填充 */
 extern void __ps2ipeeOpsInitializeImpl(void);
 
-/* 只在启动主线程输出阶段，避免在中断/后台网络线程中绘屏。 */
-static int g_netBootTrace;
-static int g_netBootTid = -1;
-static void netBootLog(const char *stage)
-{
-    if (g_netBootTrace && GetThreadId() == g_netBootTid)
-        scr_printf("NET: %s\n", stage);
-}
-
 static void pfsnetEnsureTimerInit(void);
 static void pfsnetCheckWaitSlotsIsr(void);
 
@@ -187,7 +178,6 @@ static void expandLwipPool(const struct lwip_memp_desc_min *desc, u32 count, u32
 
 void __wrap_memp_init(void)
 {
-    netBootLog("memory pools init");
     __real_memp_init();
     if (!g_extraMempInitialized) {
         g_extraMempInitialized = 1;
@@ -197,7 +187,6 @@ void __wrap_memp_init(void)
         expandLwipPool(&memp_TCPIP_MSG_API, 256, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_NETBUF, 128, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_SYS_TIMEOUT, 64, PFSNET_SMALL_POOL_STRIDE);
-        netBootLog("memory pools ready");
     }
 }
 
@@ -1105,7 +1094,6 @@ void __wrap_sys_init(void)
     unsigned int i;
     ee_sema_t sema;
 
-    netBootLog("mailbox system init");
     pfsnetEnsureTimerInit();
 
     sema.attr = 0;
@@ -1229,9 +1217,7 @@ u32 __wrap_sys_arch_sem_wait(pfsnet_sys_sem_t *sema, u32 timeout)
 {
     if (timeout == 0) {
         int result;
-        netBootLog("waiting for lwIP init semaphore");
         result = WaitSema(*sema);
-        netBootLog("lwIP init semaphore returned");
         return (result == *sema) ? 0 : PFSNET_SYS_ARCH_TIMEOUT;
     }
     if (timeout == 1)
@@ -1248,36 +1234,40 @@ u32 __wrap_sys_arch_sem_wait(pfsnet_sys_sem_t *sema, u32 timeout)
 
 #define ETH_TCPIP_PRIO 0x58 /* lwIP tcpip 线程，见 PS2SDK lwipopts.h */
 
-static void sleepMs(unsigned int msec)
+/* 启动轮询不能等待依赖闹钟唤醒的信号量，否则外层超时也会一起失效。
+ * 仅降低当前线程优先级并读取计数时钟；网络线程仍可抢占处理 DHCP。
+ * 该路径只供启动使用，传输中的 DelayThread/定时器实现保持不变。 */
+static int sleepMs(unsigned int msec)
 {
-    int tid;
-    int oldPrio;
+    int tid, oldPrio, waitPrio, result = 0;
     ee_thread_status_t status;
-    u64 start;
-    u64 ticks;
+    u64 start, ticks;
 
     if (msec == 0)
-        return;
-    if (__wrap_DelayThread((s32)msec * 1000) == 0)
-        return;
-
+        return 0;
     tid = GetThreadId();
-    oldPrio = 1;
     memset(&status, 0, sizeof(status));
-    if (ReferThreadStatus(tid, &status) >= 0 && status.current_priority > 0)
-        oldPrio = status.current_priority;
-
-    ChangeThreadPriority(tid, ETH_TCPIP_PRIO + 8);
+    if (ReferThreadStatus(tid, &status) < 0 || status.current_priority <= 0)
+        return -1;
+    oldPrio = status.current_priority;
+    waitPrio = oldPrio > ETH_TCPIP_PRIO + 8 ? oldPrio : ETH_TCPIP_PRIO + 8;
+    if (ChangeThreadPriority(tid, waitPrio) < 0)
+        return -1;
 
     start = GetTimerSystemTime();
     ticks = (u64)msec * ((u64)kBUSCLK / 1000ULL);
-    while ((GetTimerSystemTime() - start) < ticks)
-        RotateThreadReadyQueue(ETH_TCPIP_PRIO);
-
-    ChangeThreadPriority(tid, oldPrio);
+    while ((GetTimerSystemTime() - start) < ticks) {
+        if (RotateThreadReadyQueue(waitPrio) < 0) {
+            result = -1;
+            break;
+        }
+    }
+    if (ChangeThreadPriority(tid, oldPrio) < 0)
+        return -1;
+    return result;
 }
 
-/* 1s/次，最多 30s（与 OPL 相同上限）；超时返回 -1，绝不静默死等 */
+/* 启动每秒检查一次，最多 30 轮；休眠不依赖闹钟回调。计数时钟仍须正常运行。 */
 static int WaitValidNetState(int (*checkingFunction)(void))
 {
     int retry_cycles;
@@ -1285,7 +1275,10 @@ static int WaitValidNetState(int (*checkingFunction)(void))
     for (retry_cycles = 0; checkingFunction() == 0; retry_cycles++) {
         if (retry_cycles >= 30)
             return -1;
-        sleepMs(1000);
+        if (sleepMs(1000) < 0) {
+            scr_printf("WARN: network poll scheduler failed\n");
+            return -1;
+        }
     }
     return 0;
 }
@@ -1420,12 +1413,7 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
         initGw = &zeroGw;
     }
 
-    g_netBootTid = GetThreadId();
-    g_netBootTrace = 1;
-    netBootLog("lwIP init begin");
     r = ps2ipInit((struct ip4_addr *)initIp, (struct ip4_addr *)initNm, (struct ip4_addr *)initGw);
-    netBootLog("lwIP init returned");
-    g_netBootTrace = 0;
     if (r != 0) {
         scr_printf("WARN: ps2ipInit failed (%d)\n", r);
         return -1;
@@ -1443,7 +1431,6 @@ int ethWaitLinkAndDhcp(int use_dhcp)
 {
     struct ip4_addr zeroIp, zeroNm, zeroGw;
 
-    scr_printf("NET: waiting for link (EE events, max 30s)\n");
     if (WaitValidNetState(&ethGetLinkStatus) < 0) {
         scr_printf("WARN: link timeout (no carrier)\n");
         return -1;
@@ -1453,23 +1440,19 @@ int ethWaitLinkAndDhcp(int use_dhcp)
         scr_printf("WARN: link mode setup failed\n");
         return -1;
     }
-    scr_printf("NET: link ready\n");
 
     if (use_dhcp) {
         ip4_addr_set_zero(&zeroIp);
         ip4_addr_set_zero(&zeroNm);
         ip4_addr_set_zero(&zeroGw);
-        scr_printf("NET: DHCP start\n");
         if (ethApplyIPConfig(1, &zeroIp, &zeroNm, &zeroGw) < 0) {
             scr_printf("WARN: dhcp start failed\n");
             return -1;
         }
-        scr_printf("NET: waiting for DHCP lease (max 30s)\n");
         if (WaitValidNetState(&ethGetDhcpStatus) < 0) {
             scr_printf("WARN: dhcp timeout\n");
             return -1;
         }
-        scr_printf("NET: DHCP ready\n");
     }
     return 0;
 }

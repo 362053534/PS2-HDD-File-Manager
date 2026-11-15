@@ -328,8 +328,6 @@ int main(int argc, char *argv[])
         NetManInit();
     }
 
-    scr_printf("HDD init complete; starting network config\n");
-
     /*
      * 1) DHCP
      * 2) 失败：OPL conf_network.cfg 里的静态地址（不再跑 OPL DHCP）
@@ -385,7 +383,7 @@ int main(int argc, char *argv[])
     scr_printf("Waiting for PC client...\n");
 
     if (apaDiagAttachOutput() < 0)
-        scr_printf("WARN: DIAG-6 output hook unavailable\n");
+        scr_printf("WARN: DIAG-7 output hook unavailable\n");
     if (pfsnetStartServer() < 0) {
         scr_printf("FATAL: server start failed\n");
         waitStartToExit();
@@ -393,7 +391,7 @@ int main(int argc, char *argv[])
 
     scr_printf("Press START to exit\n");
     if (apaDiagStart() < 0)
-        scr_printf("WARN: DIAG-6 monitor failed to start\n");
+        scr_printf("WARN: DIAG-7 monitor failed to start\n");
     startPadWatch();
     SleepThread();
     safeExitElf();

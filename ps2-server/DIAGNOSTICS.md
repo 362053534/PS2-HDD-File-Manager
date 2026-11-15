@@ -1,4 +1,4 @@
-# APANET-DIAG-6: bounded data I/O and network-stall investigation
+# APANET-DIAG-7: bounded data I/O and network-stall investigation
 
 This revision adds an application-level data inactivity deadline and corrects
 incomplete diagnostic coverage. It does not claim to fix the original packet
@@ -31,11 +31,11 @@ its throughput effect must be measured on hardware.
 
 Use the existing Actions PS2 ELF job and the owner 362053534 toolchain image.
 Output remains the stripped, ps2-packer-compressed `ApaNetServer.ELF`, with an
-`APANET-DIAG-6` marker outside packed loading segments. No client update is needed.
+`APANET-DIAG-7` marker outside packed loading segments. No client update is needed.
 
 Before a long transfer, confirm on the real PS2:
 
-1. `DIAG-6 HB:` advances and LIVE IP is the expected target.
+1. `DIAG-7 HB:` advances and LIVE IP is the expected target.
 2. `OUT hook:1` appears. After host ping, OUT calls/done should advance.
 3. RX shows the actual nonnegative thread ID and a readable kernel status.
 
@@ -186,8 +186,9 @@ synchronous NetManIoctl RPC on every poll. The canonical registration code
 replays the link state after stack/RPC registration. A blocked RPC cannot be
 bounded by the caller's loop count; removing it avoids that failure condition.
 The redundant second link wait and unbounded mode-retry loop are removed.
-Explicit boot messages distinguish completed HDD initialization, lwIP memory/
-mailbox/init-semaphore stages, link wait, DHCP start and DHCP lease wait.
+The temporary detailed boot-stage messages used during investigation have
+been removed at the user's request. Startup keeps its original single
+Waiting for link + DHCP status and actionable warning/error messages.
 No hardware spin-up delay, forced reset, socket behavior or disk settings change.
 
 Verify repeated cold/warm boots with the newly built ELF, and no-carrier/no-DHCP
@@ -197,3 +198,39 @@ SDK waits or a failed timer. Original long-upload diagnosis resumes only after
 startup is reliably usable. Actions also runs the native startup-poll test
 before the ELF build. Do not claim the 90% hardware hang fixed until
 repeated real boot checks pass.
+
+## DIAG-7: startup polling must not sleep on the failed wake mechanism
+
+The user reproduced DIAG-6 stuck at waiting for DHCP lease for more than five
+minutes. While that state was reported, the Mac pinged 192.168.5.3 three times
+successfully and verified the known PS2 MAC 00:04:1f:5d:c9:62. An address was
+active; the screen did not alone prove that DHCP was still acquiring a lease.
+There was no remote reboot or network/file mutation during this observation.
+
+The actual sleepMs first called wrapped DelayThread and returned if it
+succeeded. That wrapper always returned zero after its semaphore wait, so the
+cooperative fallback below it could never run on the normal path. If the alarm
+failed to release that wait, the outer 30-iteration limit could not be reached.
+A native fault-injection test of the actual old sleepMs with a never-returning
+alarm-dependent delay reproduced this indefinite wait; the child was stopped
+by the test runner's timeout. This identifies a matching mechanism, not a PS2
+thread-stack capture or proof of exactly why the hardware alarm failed.
+
+Startup sleepMs now avoids DelayThread and semaphore waits altogether. It
+lowers the caller below the network worker priorities, polls the running time
+counter and rotates its own ready queue, then restores the original priority.
+Status/priority/yield failures return errors rather than spinning at a priority
+that could starve DHCP. This bounded busy wait is confined to startup; it uses
+CPU while waiting and still requires the counter and scheduler to work. It is
+not a hard timeout for a globally frozen timer/CPU or a blocking status getter.
+Temporary per-stage and five-iteration progress output has been removed at
+the user's request; the startup wait implementation and error reporting remain.
+Missing carrier and missing lease retain separate 30-iteration limits.
+
+Tests cover lost alarm wake, zero delay, existing lower priority, scheduler
+errors and priority restoration. The actual link/DHCP polling functions also
+check propagation of delay failure. Actions runs these native checks before
+compilation. Transport timer/wait code, disk sequence and data I/O are unchanged.
+Build and repeated real boot checks remain necessary before claiming the
+reported permanent-wait symptom is fixed. DIAG-6 runtime-initialization fixes
+remain; its hardware boot hang was not resolved by those fixes alone.

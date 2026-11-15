@@ -366,6 +366,7 @@ jobs:
         run: |
           python3 ps2-server/tests/test-create-shortfall.py
           python3 ps2-server/tests/test-boot-link.py
+          python3 ps2-server/tests/test-startup-delay.py
           python3 ps2-server/tests/test-data-io.py
           python3 ps2-server/tests/test-diagnostic-output.py
 

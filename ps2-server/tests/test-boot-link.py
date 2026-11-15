@@ -26,13 +26,13 @@ typedef struct {struct {uint32_t s_addr;} ipaddr;unsigned dhcp_enabled,dhcp_stat
 #define NETMAN_NETIF_ETH_LINK_STATE_UP 1
 #define NETMAN_NETIF_IOCTL_GET_LINK_STATUS 1
 #define NETMAN_NETIF_ETH_LINK_MODE_AUTO 0
-static int link_up,sleeps,mode_error,config_error,lease_at,lease_calls,rpc_calls,starts;
+static int link_up,sleeps,mode_error,config_error,lease_at,lease_calls,rpc_calls,starts,delay_error;
 static int g_lastLinkUp;
 int NetManIoctl(unsigned cmd,void *arg,unsigned len,void *out,unsigned size) {
  (void)cmd;(void)arg;(void)len;(void)out;(void)size;rpc_calls++;return link_up;
 }
 int NetManGetGlobalNetIFLinkState(void) {return link_up;}
-static void sleepMs(unsigned ms) {assert(ms==1000);sleeps++;}
+static int sleepMs(unsigned ms) {assert(ms==1000);sleeps++;return delay_error;}
 static int ethApplyNetIFConfig(int mode) {(void)mode;return mode_error;}
 int ethApplyIPConfig(int dhcp,const struct ip4_addr *ip,const struct ip4_addr *nm,const struct ip4_addr *gw) {
  assert(dhcp==1 && ip->addr==0 && nm->addr==0 && gw->addr==0);starts++;return config_error;
@@ -49,7 +49,7 @@ int scr_printf(const char *format,...) {(void)format;return 0;}
 for sig in ["static int WaitValidNetState(","static int ethGetLinkStatus(","static int ethGetDhcpStatus(","int ethWaitLinkAndDhcp("]:
     code+="\n"+function(sig)
 code+=r"""
-static void reset(void) {link_up=1;sleeps=mode_error=config_error=lease_at=lease_calls=rpc_calls=starts=0;}
+static void reset(void) {link_up=1;sleeps=mode_error=config_error=lease_at=lease_calls=rpc_calls=starts=delay_error=0;}
 int main(void) {
  setbuf(stdout,NULL);
  reset();assert(ethWaitLinkAndDhcp(0)==0);
@@ -69,6 +69,9 @@ int main(void) {
  puts("PASS delayed DHCP lease succeeds after actual BOUND/nonzero address");
  reset();config_error=-1;assert(ethWaitLinkAndDhcp(1)==-1 && sleeps==0 && starts==1);
  puts("PASS DHCP start error returns immediately");
+ reset();link_up=0;delay_error=-1;
+ assert(ethWaitLinkAndDhcp(0)==-1 && sleeps==1 && starts==0);
+ puts("PASS startup scheduler failure exits instead of pretending the delay succeeded");
 }
 """
 cc=os.environ.get("CC") or shutil.which("cc")
