@@ -375,7 +375,7 @@ int main(int argc, char *argv[])
     scr_printf("Waiting for PC client...\n");
 
     if (apaDiagAttachOutput() < 0)
-        scr_printf("WARN: DIAG-3 output hook unavailable\n");
+        scr_printf("WARN: DIAG-5 output hook unavailable\n");
     if (pfsnetStartServer() < 0) {
         scr_printf("FATAL: server start failed\n");
         waitStartToExit();
@@ -383,7 +383,7 @@ int main(int argc, char *argv[])
 
     scr_printf("Press START to exit\n");
     if (apaDiagStart() < 0)
-        scr_printf("WARN: DIAG-3 monitor failed to start\n");
+        scr_printf("WARN: DIAG-5 monitor failed to start\n");
     startPadWatch();
     SleepThread();
     safeExitElf();

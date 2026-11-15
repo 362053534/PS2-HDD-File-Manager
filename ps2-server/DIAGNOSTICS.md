@@ -1,4 +1,4 @@
-# APANET-DIAG-4: bounded data I/O and network-stall investigation
+# APANET-DIAG-5: bounded data I/O and network-stall investigation
 
 This revision adds an application-level data inactivity deadline and corrects
 incomplete diagnostic coverage. It does not claim to fix the original packet
@@ -31,11 +31,11 @@ its throughput effect must be measured on hardware.
 
 Use the existing Actions PS2 ELF job and the owner 362053534 toolchain image.
 Output remains the stripped, ps2-packer-compressed `ApaNetServer.ELF`, with an
-`APANET-DIAG-4` marker outside packed loading segments. No client update is needed.
+`APANET-DIAG-5` marker outside packed loading segments. No client update is needed.
 
 Before a long transfer, confirm on the real PS2:
 
-1. `DIAG-4 HB:` advances and LIVE IP is the expected target.
+1. `DIAG-5 HB:` advances and LIVE IP is the expected target.
 2. `OUT hook:1` appears. After host ping, OUT calls/done should advance.
 3. RX shows the actual nonnegative thread ID and a readable kernel status.
 
@@ -46,7 +46,7 @@ those probes in the linked PS2 runtime, so their missing coverage is corrected.
 
 ## Screen interpretation
 
-Nineteen fixed rows (13–31) refresh about once per second, without scrolling.
+Twenty fixed rows (13–32) refresh about once per second, without scrolling.
 Each row is bounded to 78 characters within the SDK's 80x40 character screen;
 TV overscan still needs visual confirmation. No PS2 disk logs are written.
 
@@ -68,7 +68,8 @@ TV overscan still needs visual confirmation. No PS2 disk logs are written.
   queue is the length of the current NETMAN TX head packet, not total queue bytes.
   It is read through the canonical non-consuming Next API. hook indicates that
   the function pointer is still attached.
-- OUT thread is the latest output producer, not the NETMAN hardware TX worker.
+- IO thread is the actual transfer caller, sampled through GetThreadId; it is
+  independent of the output producer whose callbacks OUT counts.
   RX uses the real thread ID already stored by this program. CORE uses the
   canonical initial priority 0x58 lookup; unavailable never means dead.
   Kernel state 1=running, 2=ready, 4=waiting; wait 1=sleep, 2=semaphore.
@@ -133,3 +134,30 @@ new image's MIPS runtime behavior. After building, confirm the DIAG-4 startup
 probes, initial upload, and repeated 6 GiB transfers on the real PS2. The
 original intermittent long-transfer fault, effective 90-second recovery and
 throughput remain unverified; this change does not claim they are fixed.
+
+## DIAG-5: locate the stalled data operation without changing behavior
+
+DIAG-4 round 1 at 2026-11-15 16:36 +08:00 stopped after PS2 TCP cumulatively
+acknowledged 464115 bytes. It kept replying with window zero and answered ping.
+The client timed out after 120 seconds and froze before retry. The screen showed
+NET:recv, HDD:wait-filled, IP intact, output hook active and a scheduling monitor.
+MiB counters rounded to zero cannot distinguish 0 bytes from a partial first bank.
+This differs from DIAG-1/2's later packet loss; the original cause is unresolved.
+
+The preceding screen omitted the real upload worker. DIAG-5 records the actual
+calling thread ID in the transfer path and displays IO thread status instead of
+the output producer thread status (output counters remain). The IO row records
+getfl/setfl, deadline check, send/recv, returned result, delay, progress callback,
+and fd restoration. It shows call/yield counts, last socket result/errno and
+exact bytes moved within the current bank. A stage names a boundary, not proof
+of the lower-level cause: e.g. recv can wait in an internal semaphore.
+The first qualifying stall snapshot retains the IO trace and IO thread status.
+The BD line moves to the last row; all 20 rows remain within the 80x40 screen.
+The data loop adds only bounded diagnostic field writes, with no new syscalls,
+sleeps, retry/cancel actions or RPC inside that loop. The transfer caller records
+its ID once per data-I/O call using the EE-local GetThreadId syscall. Native tests check those writes
+at actual delay/progress boundaries as well as all prior transfer contracts.
+On real hardware, capture the IO trace plus IO wait/status/ID at the next stall
+before choosing a fix. This revision does not claim the underlying stall or its
+ineffective timeout has been repaired. Startup DHCP investigation is deferred
+at the user's request.

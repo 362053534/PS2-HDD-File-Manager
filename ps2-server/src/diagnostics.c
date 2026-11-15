@@ -7,6 +7,7 @@
 #include <debug.h>
 #include <fileXio_rpc.h>
 #include "diagnostics.h"
+#include "data_io.h"
 
 volatile ApaDiagnostics g_apaDiag;
 extern void *_gp;
@@ -55,6 +56,12 @@ static const char *ioName(uint32_t stage)
     static const char *names[] = {"idle", "wait-free", "recv", "ready",
         "wait-filled", "write", "close", "done", "error"};
     return stage < sizeof(names)/sizeof(names[0]) ? names[stage] : "?";
+}
+static const char *dataName(uint32_t phase)
+{
+    static const char *names[] = {"idle", "getfl", "setfl", "check", "send",
+        "recv", "result", "delay", "progress", "restore", "done", "error"};
+    return phase < sizeof(names)/sizeof(names[0]) ? names[phase] : "?";
 }
 static const char *rxName(uint32_t stage)
 {
@@ -110,10 +117,11 @@ static void threadLine(int row, const char *name, int *id, int priority,
 static void diagThread(void *arg)
 {
     ApaDiagnostics s, held;
+    PfsnetDataIoTrace data, heldData;
     unsigned beat = 0, rxAge = 0, diskAge = 0, pktAge = 0;
     uint64_t lastRx = 0, lastDisk = 0;
     uint32_t lastPkt = 0, previous = 0;
-    int txTid = -1, coreTid = -1, rxTid = -1;
+    int ioTid = -1, coreTid = -1, rxTid = -1;
     int heldValid = 0, stallArmed = 0;
     unsigned heldUptime = 0;
     ee_thread_status_t liveThreads[3], heldThreads[3];
@@ -125,6 +133,7 @@ static void diagThread(void *arg)
         int captureStall = 0;
         int old = DIntr();
         s = g_apaDiag;
+        data = g_pfsnetDataIoTrace;
         apaDiagNetSnapshot(&s);
         if (old) EIntr();
         previous = now;
@@ -135,11 +144,12 @@ static void diagThread(void *arg)
         if (rxAge == 0 || diskAge == 0) stallArmed = 0;
         if (s.active && rxAge >= 10000 && diskAge >= 10000 && !stallArmed) {
             held = s;
+            heldData = data;
             heldUptime = now/1000;
             heldValid = stallArmed = captureStall = 1;
         }
         int savedX = scr_getX(), savedY = scr_getY();
-        diagLine(12, "DIAG-4 HB:%u up:%us PUT:%u banks:%u",
+        diagLine(12, "DIAG-5 HB:%u up:%us PUT:%u banks:%u",
                    ++beat, now/1000, s.active, s.banks);
         diagLine(13, "RX:%u age:%us SIF:%u stage:%s  ",
                    s.rxPackets, pktAge/1000, s.sifIrqs, rxName(s.rxStage));
@@ -153,30 +163,30 @@ static void diagThread(void *arg)
         diagLine(17, "HDD:%u/%u MiB age:%us %s err:%d   ",
                    (unsigned)(s.diskBytes>>20), (unsigned)(s.totalBytes>>20),
                    diskAge/1000, ioName(s.diskStage), (int)s.diskError);
-        diagLine(18, "BD:%u len:%u/%u busy:%u cmd:%u SIF:%03x DS:%08x",
-                 s.rxIndex, s.rxLen, s.rxNextLen, s.rxBusy, s.cmdSize,
-                 (unsigned)s.sif0, (unsigned)s.dstat);
+        diagLine(18, "IO:%s calls:%u yield:%u n:%d e:%d bytes:%u fl:%x",
+                 dataName(data.phase), data.calls, data.yields, (int)data.lastResult,
+                 (int)data.lastError, data.moved, (unsigned)data.fdFlags);
         diagLine(19, "LIVE IP:%u.%u.%u.%u found:%u dhcp:%u state:%u",
                  (unsigned)s.address[0], (unsigned)s.address[1],
                  (unsigned)s.address[2], (unsigned)s.address[3],
                  s.ipFound, s.dhcpEnabled, s.dhcpState);
         diagLine(20, "OUT hook:%u calls:%u done:%u queue:%u err:%d", s.outputHook,
                  s.outputCalls, s.outputReturns, s.txQueueLen, (int)s.outputError);
-        txTid = s.outputThreadId > 0 ? s.outputThreadId : -1;
+        ioTid = s.ioThreadId > 0 ? s.ioThreadId : -1;
         rxTid = s.rxThreadId;
-        threadLine(21, "OUT", &txTid, -1, &liveThreads[0]);
+        threadLine(21, "IO", &ioTid, -1, &liveThreads[0]);
         threadLine(22, "CORE", &coreTid, 0x58, &liveThreads[1]);
         threadLine(23, "RX", &rxTid, -1, &liveThreads[2]);
         if (captureStall) {
             memcpy(heldThreads, liveThreads, sizeof(heldThreads));
-            heldIds[0] = txTid; heldIds[1] = coreTid; heldIds[2] = rxTid;
+            heldIds[0] = ioTid; heldIds[1] = coreTid; heldIds[2] = rxTid;
         }
         if (heldValid) {
             diagLine(24, "SNAP @%us NET:%s HDD:%s RX:%s", heldUptime,
                      ioName(held.recvStage), ioName(held.diskStage), rxName(held.rxStage));
-            diagLine(25, "SNAP MiB:%u/%u RX:%u msg:%u q:%u",
-                     (unsigned)(held.recvBytes>>20), (unsigned)(held.diskBytes>>20),
-                     held.rxPackets, held.msgUsed, held.txQueueLen);
+            diagLine(25, "SNAP IO:%s calls:%u yield:%u n:%d e:%d bytes:%u",
+                     dataName(heldData.phase), heldData.calls, heldData.yields,
+                     (int)heldData.lastResult, (int)heldData.lastError, heldData.moved);
             diagLine(26, "SNAP IP:%u.%u.%u.%u OUT:%u done:%u", (unsigned)held.address[0],
                      (unsigned)held.address[1], (unsigned)held.address[2],
                      (unsigned)held.address[3], held.outputCalls, held.outputReturns);
@@ -187,7 +197,7 @@ static void diagThread(void *arg)
         }
         {
             int i;
-            static const char *names[] = {"OUT", "CORE", "RX"};
+            static const char *names[] = {"IO", "CORE", "RX"};
             for (i = 0; i < 3; i++) {
                 if (heldValid)
                     diagLine(27+i, "SNAP %s tid:%d state:%x wait:%u id:%u wake:%u",
@@ -201,6 +211,9 @@ static void diagThread(void *arg)
         diagLine(30, "RING pending:%u first:%d NMlink:%u flags:%02x SOtimeo:%u",
                  s.rxPending, (int)s.rxFirstPending, s.netmanLink,
                  (unsigned)s.interfaceFlags, s.socketTimeoutMask);
+        diagLine(31, "BD:%u len:%u/%u busy:%u cmd:%u SIF:%03x DS:%08x",
+                 s.rxIndex, s.rxLen, s.rxNextLen, s.rxBusy, s.cmdSize,
+                 (unsigned)s.sif0, (unsigned)s.dstat);
         scr_setXY(savedX, savedY);
         DelayThread(1000000);
     }

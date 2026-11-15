@@ -686,6 +686,7 @@ static int xferSendAll(int sock, const void *buf, int len)
 {
     int result;
     pfsnetTrafficBegin();
+    g_apaDiag.ioThreadId = GetThreadId();
     result = pfsnetDataIoAll(sock, (void *)buf, len, 1, &g_putStop,
                             PFSNET_DATA_IDLE_MS, NULL);
     pfsnetTrafficEnd();
@@ -701,6 +702,7 @@ static int xferRecvAll(int sock, void *buf, int len)
 {
     int result;
     pfsnetTrafficBegin();
+    g_apaDiag.ioThreadId = GetThreadId();
     g_apaDiag.recvStage = APA_IO_RECV;
     result = pfsnetDataIoAll(sock, buf, len, 0, &g_putStop,
                             PFSNET_DATA_IDLE_MS, recvProgress);

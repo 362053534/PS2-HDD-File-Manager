@@ -29,13 +29,18 @@ static volatile int stop;
 static int peer, mode, sum, sleeps;
 uint64_t GetTimerSystemTime(void) { return us; }
 void DelayThread(unsigned delay) {
+    assert(g_pfsnetDataIoTrace.phase == APA_DATA_DELAY);
     us += delay; sleeps++;
     if (mode == 1 && sleeps == 3) stop = 1;
     if (mode == 2 && (sleeps == 8 || sleeps == 16)) {
         assert(write(peer, "abcdefgh", 8) == 8);
     }
 }
-static void progress(int n) { assert(n > 0); sum += n; }
+static void progress(int n) {
+    assert(n > 0 && g_pfsnetDataIoTrace.phase == APA_DATA_PROGRESS);
+    assert(g_pfsnetDataIoTrace.lastResult == n);
+    sum += n;
+}
 static void pair(int fd[2]) {
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     us=0; stop=0; mode=0; sum=0; sleeps=0; peer=fd[1];
@@ -48,6 +53,9 @@ int main(void) {
     pair(fd); flags=fcntl(fd[0], F_GETFL);
     assert(pfsnetDataIoAll(fd[0], b, 16, 0, &stop, 20, progress) == -1);
     assert(errno==ETIMEDOUT && us>=20000 && us<=21000 && sum==0);
+    assert(g_pfsnetDataIoTrace.phase==APA_DATA_ERROR);
+    assert(g_pfsnetDataIoTrace.calls==20 && g_pfsnetDataIoTrace.yields==20);
+    assert(g_pfsnetDataIoTrace.moved==0 && g_pfsnetDataIoTrace.requested==16);
     assert(fcntl(fd[0], F_GETFL)==flags); closePair(fd);
     puts("PASS silent receive times out without SO_RCVTIMEO; fd flags restored");
 
@@ -73,6 +81,9 @@ int main(void) {
 
     pair(fd);
     assert(pfsnetDataIoAll(fd[0], (void *)"hello", 5, 1, &stop, 20, progress)==5);
+    assert(g_pfsnetDataIoTrace.phase==APA_DATA_DONE);
+    assert(g_pfsnetDataIoTrace.calls==1 && g_pfsnetDataIoTrace.yields==0);
+    assert(g_pfsnetDataIoTrace.moved==5 && g_pfsnetDataIoTrace.lastError==0);
     assert(read(fd[1],b,5)==5 && !memcmp(b,"hello",5) && sum==5 && sleeps==0); closePair(fd);
     puts("PASS successful send has an immediate fast path and exact payload");
 
