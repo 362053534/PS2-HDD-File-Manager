@@ -1232,6 +1232,26 @@ u32 __wrap_sys_arch_sem_wait(pfsnet_sys_sem_t *sema, u32 timeout)
     }
 }
 
+static const char *g_bootFailure;
+static int g_bootFailureCode;
+
+/* Preserve the first failure through static fallback and the final screen clear. */
+static int ethBootFail(const char *reason, int code)
+{
+    if (!g_bootFailure) {
+        g_bootFailure = reason;
+        g_bootFailureCode = code;
+    }
+    return -1;
+}
+
+const char *ethBootFailure(int *code)
+{
+    if (code)
+        *code = g_bootFailureCode;
+    return g_bootFailure;
+}
+
 #define ETH_TCPIP_PRIO 0x58 /* lwIP tcpip 线程，见 PS2SDK lwipopts.h */
 
 /* 启动轮询不能等待依赖闹钟唤醒的信号量，否则外层超时也会一起失效。
@@ -1239,7 +1259,7 @@ u32 __wrap_sys_arch_sem_wait(pfsnet_sys_sem_t *sema, u32 timeout)
  * 该路径只供启动使用，传输中的 DelayThread/定时器实现保持不变。 */
 static int sleepMs(unsigned int msec)
 {
-    int tid, oldPrio, waitPrio, result = 0;
+    int tid, oldPrio, waitPrio, result = 0, rc;
     ee_thread_status_t status;
     u64 start, ticks;
 
@@ -1247,23 +1267,29 @@ static int sleepMs(unsigned int msec)
         return 0;
     tid = GetThreadId();
     memset(&status, 0, sizeof(status));
-    if (ReferThreadStatus(tid, &status) < 0 || status.current_priority <= 0)
-        return -1;
+    rc = ReferThreadStatus(tid, &status);
+    if (rc < 0)
+        return ethBootFail("thread status", rc);
+    if (status.current_priority <= 0)
+        return ethBootFail("thread priority", status.current_priority);
     oldPrio = status.current_priority;
     waitPrio = oldPrio > ETH_TCPIP_PRIO + 8 ? oldPrio : ETH_TCPIP_PRIO + 8;
-    if (ChangeThreadPriority(tid, waitPrio) < 0)
-        return -1;
+    rc = ChangeThreadPriority(tid, waitPrio);
+    if (rc < 0)
+        return ethBootFail("lower priority", rc);
 
     start = GetTimerSystemTime();
     ticks = (u64)msec * ((u64)kBUSCLK / 1000ULL);
     while ((GetTimerSystemTime() - start) < ticks) {
-        if (RotateThreadReadyQueue(waitPrio) < 0) {
-            result = -1;
+        rc = RotateThreadReadyQueue(waitPrio);
+        if (rc < 0) {
+            result = ethBootFail("rotate ready queue", rc);
             break;
         }
     }
-    if (ChangeThreadPriority(tid, oldPrio) < 0)
-        return -1;
+    rc = ChangeThreadPriority(tid, oldPrio);
+    if (rc < 0)
+        return ethBootFail("restore priority", rc);
     return result;
 }
 
@@ -1416,7 +1442,7 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
     r = ps2ipInit((struct ip4_addr *)initIp, (struct ip4_addr *)initNm, (struct ip4_addr *)initGw);
     if (r != 0) {
         scr_printf("WARN: ps2ipInit failed (%d)\n", r);
-        return -1;
+        return ethBootFail("ps2ipInit", r);
     }
 
     stackReady = 1;
@@ -1430,28 +1456,31 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
 int ethWaitLinkAndDhcp(int use_dhcp)
 {
     struct ip4_addr zeroIp, zeroNm, zeroGw;
+    int rc;
 
     if (WaitValidNetState(&ethGetLinkStatus) < 0) {
         scr_printf("WARN: link timeout (no carrier)\n");
-        return -1;
+        return ethBootFail("link timeout", -1);
     }
     /* 自动协商模式设置失败时返回，不能在无界 do/while 中反复重试。 */
-    if (ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO) != 0) {
+    rc = ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO);
+    if (rc != 0) {
         scr_printf("WARN: link mode setup failed\n");
-        return -1;
+        return ethBootFail("link mode", rc);
     }
 
     if (use_dhcp) {
         ip4_addr_set_zero(&zeroIp);
         ip4_addr_set_zero(&zeroNm);
         ip4_addr_set_zero(&zeroGw);
-        if (ethApplyIPConfig(1, &zeroIp, &zeroNm, &zeroGw) < 0) {
+        rc = ethApplyIPConfig(1, &zeroIp, &zeroNm, &zeroGw);
+        if (rc < 0) {
             scr_printf("WARN: dhcp start failed\n");
-            return -1;
+            return ethBootFail("DHCP start", rc);
         }
         if (WaitValidNetState(&ethGetDhcpStatus) < 0) {
             scr_printf("WARN: dhcp timeout\n");
-            return -1;
+            return ethBootFail("DHCP timeout", -1);
         }
     }
     return 0;

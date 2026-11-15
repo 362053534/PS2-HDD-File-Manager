@@ -43,6 +43,8 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
 int ethApplyIPConfig(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, const struct ip4_addr *gw);
 int ethWaitLinkAndDhcp(int use_dhcp);
 int ethLinkIsUp(void);
+/* First DHCP startup failure, retained after static fallback; NULL on success. */
+const char *ethBootFailure(int *code);
 void ethGetIpDisplay(char *out, int outLen);
 int ethReadCurrentConfig(struct ip4_addr *ip, struct ip4_addr *nm, struct ip4_addr *gw);
 

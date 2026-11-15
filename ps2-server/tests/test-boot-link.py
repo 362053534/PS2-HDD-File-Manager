@@ -46,10 +46,12 @@ int ps2ip_getconfig(char *name,t_ip_info *info) {
 #define ip4_addr_set_zero(p) ((p)->addr=0)
 int scr_printf(const char *format,...) {(void)format;return 0;}
 """
+if "static const char *g_bootFailure;" in source:
+    code+=source[source.index("static const char *g_bootFailure;"):source.index("#define ETH_TCPIP_PRIO")]
 for sig in ["static int WaitValidNetState(","static int ethGetLinkStatus(","static int ethGetDhcpStatus(","int ethWaitLinkAndDhcp("]:
     code+="\n"+function(sig)
 code+=r"""
-static void reset(void) {link_up=1;sleeps=mode_error=config_error=lease_at=lease_calls=rpc_calls=starts=delay_error=0;}
+static void reset(void) {g_bootFailure=NULL;g_bootFailureCode=0;link_up=1;sleeps=mode_error=config_error=lease_at=lease_calls=rpc_calls=starts=delay_error=0;}
 int main(void) {
  setbuf(stdout,NULL);
  reset();assert(ethWaitLinkAndDhcp(0)==0);
@@ -68,12 +70,22 @@ int main(void) {
  assert(sleeps==3 && starts==1 && rpc_calls==0);
  puts("PASS delayed DHCP lease succeeds after actual BOUND/nonzero address");
  reset();config_error=-1;assert(ethWaitLinkAndDhcp(1)==-1 && sleeps==0 && starts==1);
- puts("PASS DHCP start error returns immediately");
+ assert(!strcmp(ethBootFailure(NULL),"DHCP start") && g_bootFailureCode==-1);
+ puts("PASS DHCP start error returns immediately and retains the failure reason");
  reset();link_up=0;delay_error=-1;
  assert(ethWaitLinkAndDhcp(0)==-1 && sleeps==1 && starts==0);
+ reset();ethBootFail("rotate ready queue",-42);link_up=0;delay_error=-1;
+ assert(ethWaitLinkAndDhcp(0)==-1);
+ assert(!strcmp(ethBootFailure(NULL),"rotate ready queue") && g_bootFailureCode==-42);
  puts("PASS startup scheduler failure exits instead of pretending the delay succeeded");
 }
 """
+if "static const char *g_bootFailure;" not in source:
+    code=code.replace("g_bootFailure=NULL;g_bootFailureCode=0;", "")
+    code=code.replace(' assert(!strcmp(ethBootFailure(NULL),"DHCP start") && g_bootFailureCode==-1);', "")
+    first=code.index(' reset();ethBootFail(')
+    last=code.index(' puts("PASS startup scheduler', first)
+    code=code[:first]+code[last:]
 cc=os.environ.get("CC") or shutil.which("cc")
 if not cc:raise SystemExit("A native C compiler is required")
 with tempfile.TemporaryDirectory(prefix="apa-boot-link-") as folder:

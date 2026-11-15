@@ -285,7 +285,8 @@ int main(int argc, char *argv[])
 {
     char ipText[32];
     PfsNetIpConfig cfg;
-    int hddStandbyResult;
+    int hddStandbyResult, bootFailureCode;
+    const char *bootFailure;
 
     /* 先 init_scr 再 SifIopReset（与 HDDTester 一致），复位前挂死时仍有屏显。 */
     g_mainTid = GetThreadId();
@@ -364,6 +365,9 @@ int main(int argc, char *argv[])
     scr_clear();
     scr_printf("ApaNetServer\n");
     scr_printf("IP: %s (%s)\n", ipText, pfsnetIpSourceName(cfg.source));
+    bootFailure = ethBootFailure(&bootFailureCode);
+    if (bootFailure)
+        scr_printf("DHCP fallback: %s (%d)\n", bootFailure, bootFailureCode);
     if (hddStandbyResult == 0)
         scr_printf("HDD automatic standby: disabled\n");
     else

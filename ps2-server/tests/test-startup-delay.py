@@ -12,6 +12,7 @@ start=re.search(r"static (?:void|int) sleepMs\(",source).start()
 opening=source.index("{",start);depth=1;end=opening+1
 while depth:
     depth+=(source[end]=="{")-(source[end]=="}");end+=1
+observer=source[source.index("static const char *g_bootFailure;"):source.index("#define ETH_TCPIP_PRIO")] if "static const char *g_bootFailure;" in source else ""
 function=source[start:end];old="static void sleepMs(" in function
 # Include the actual outer poll loop too, so the timeout test does not replace
 # the very delay implementation that can prevent that loop from advancing.
@@ -59,14 +60,14 @@ s32 __wrap_DelayThread(s32 usec) {
  for(;;)pause();
  return 0;
 }
-"""+function+"\n"+poll
+"""+observer+function+"\n"+poll
 if old:
     code+=r"""
 int main(void) {setbuf(stdout,NULL);(void)original;(void)progress_lines;(void)checking_calls;(void)bound_at;sleepMs(20);return 0;}
 """
 else:
     code+=r"""
-static void reset(void) {clock_ticks=0;priority=original=64;rotations=changes=status_error=lower_error=rotate_error=restore_error=0;progress_lines=checking_calls=bound_at=0;}
+static void reset(void) {g_bootFailure=NULL;g_bootFailureCode=0;clock_ticks=0;priority=original=64;rotations=changes=status_error=lower_error=rotate_error=restore_error=0;progress_lines=checking_calls=bound_at=0;}
 int main(void) {
  setbuf(stdout,NULL);reset();
  assert(sleepMs(20)==0 && priority==original && rotations>0 && changes==2);
@@ -80,7 +81,8 @@ int main(void) {
  reset();lower_error=-1;assert(sleepMs(10)==-1 && priority==64 && rotations==0);
  puts("PASS status/priority setup failures return without spinning at high priority");
  reset();rotate_error=-1;assert(sleepMs(10)==-1 && priority==original && changes==2);
- puts("PASS yield failure restores original priority before reporting failure");
+ assert(!strcmp(ethBootFailure(NULL),"rotate ready queue") && g_bootFailureCode==-1);
+ puts("PASS yield failure restores original priority and preserves exact failure");
  reset();restore_error=-1;assert(sleepMs(10)==-1);
  puts("PASS priority restoration failure is reported");
  reset();assert(WaitValidNetState(checking)==-1);
@@ -91,6 +93,9 @@ int main(void) {
  puts("PASS actual poll sees a later ready state while alarm wakes remain unavailable");
 }
 """
+if not observer:
+    code=code.replace("g_bootFailure=NULL;g_bootFailureCode=0;", "")
+    code=code.replace(' assert(!strcmp(ethBootFailure(NULL),"rotate ready queue") && g_bootFailureCode==-1);', "")
 cc=os.environ.get("CC") or shutil.which("cc")
 if not cc:raise SystemExit("A native C compiler is required")
 with tempfile.TemporaryDirectory(prefix="apa-startup-delay-") as folder:

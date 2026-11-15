@@ -234,3 +234,12 @@ compilation. Transport timer/wait code, disk sequence and data I/O are unchanged
 Build and repeated real boot checks remain necessary before claiming the
 reported permanent-wait symptom is fixed. DIAG-6 runtime-initialization fixes
 remain; its hardware boot hang was not resolved by those fixes alone.
+
+### Retained startup failure (after DIAG-7)
+
+An immediate OPL fallback is not evidence of a normal DHCP timeout. The final
+screen now retains one `DHCP fallback: <operation> (<return code>)` line.
+The first error is preserved so an inner scheduler failure is not overwritten
+by an outer link/DHCP timeout label. No healthy-stage/progress logs are restored.
+This is observation only: scheduling and DHCP behavior are unchanged. Native
+tests check first-error retention; the real PS2 failure remains to be captured.
