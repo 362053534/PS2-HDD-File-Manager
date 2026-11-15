@@ -365,6 +365,7 @@ jobs:
       - name: 检查分区安全、数据超时和诊断回调
         run: |
           python3 ps2-server/tests/test-create-shortfall.py
+          python3 ps2-server/tests/test-boot-link.py
           python3 ps2-server/tests/test-data-io.py
           python3 ps2-server/tests/test-diagnostic-output.py
 

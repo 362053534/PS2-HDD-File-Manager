@@ -1,4 +1,4 @@
-# APANET-DIAG-5: bounded data I/O and network-stall investigation
+# APANET-DIAG-6: bounded data I/O and network-stall investigation
 
 This revision adds an application-level data inactivity deadline and corrects
 incomplete diagnostic coverage. It does not claim to fix the original packet
@@ -31,11 +31,11 @@ its throughput effect must be measured on hardware.
 
 Use the existing Actions PS2 ELF job and the owner 362053534 toolchain image.
 Output remains the stripped, ps2-packer-compressed `ApaNetServer.ELF`, with an
-`APANET-DIAG-5` marker outside packed loading segments. No client update is needed.
+`APANET-DIAG-6` marker outside packed loading segments. No client update is needed.
 
 Before a long transfer, confirm on the real PS2:
 
-1. `DIAG-5 HB:` advances and LIVE IP is the expected target.
+1. `DIAG-6 HB:` advances and LIVE IP is the expected target.
 2. `OUT hook:1` appears. After host ping, OUT calls/done should advance.
 3. RX shows the actual nonnegative thread ID and a readable kernel status.
 
@@ -161,3 +161,39 @@ On real hardware, capture the IO trace plus IO wait/status/ID at the next stall
 before choosing a fix. This revision does not claim the underlying stall or its
 ineffective timeout has been repaired. Startup DHCP investigation is deferred
 at the user's request.
+
+## DIAG-6: restore required runtime initialization and remove RPC link polling
+
+The application previously replaced _libcglue_init with an empty function.
+The canonical SDK crt0 calls that function before main; its normal initializer
+creates newlib locks and the descriptor manager. The application uses the EE
+network library, malloc and POSIX sockets across multiple threads, so skipping
+those gates is invalid. DIAG-6 calls __locks_init then __fdman_init, preserving
+the deliberate exclusion of RTC, pthread and other full runtime startup work.
+These are EE-local initialization steps and require no disk readiness or IOP
+RPC. They run before the application's IOP reset, which leaves EE gates intact.
+
+A native regression extracted the actual application initializer, SDK lock and
+descriptor initialization, and application lock wrappers. Mock kernel gates
+reproduced a network allocation using uninitialized gate0 (an unrelated busy
+I/O gate), and descriptor gate -1. After the fix, the heap/descriptor gates are
+valid and distinct; recursion and standard descriptor reservation also pass.
+This proves a startup defect and its correction, not the exact branch of the
+reported hardware hang. The test does not run the PS2 BIOS or linked SDK image.
+
+Link polling now reads canonical NETMAN's EE event state instead of making a
+synchronous NetManIoctl RPC on every poll. The canonical registration code
+replays the link state after stack/RPC registration. A blocked RPC cannot be
+bounded by the caller's loop count; removing it avoids that failure condition.
+The redundant second link wait and unbounded mode-retry loop are removed.
+Explicit boot messages distinguish completed HDD initialization, lwIP memory/
+mailbox/init-semaphore stages, link wait, DHCP start and DHCP lease wait.
+No hardware spin-up delay, forced reset, socket behavior or disk settings change.
+
+Verify repeated cold/warm boots with the newly built ELF, and no-carrier/no-DHCP
+failure paths. A remaining stall at a named SDK initialization call still needs
+its own diagnosis; the external polling limits cannot bound arbitrary internal
+SDK waits or a failed timer. Original long-upload diagnosis resumes only after
+startup is reliably usable. Actions also runs the native startup-poll test
+before the ELF build. Do not claim the 90% hardware hang fixed until
+repeated real boot checks pass.

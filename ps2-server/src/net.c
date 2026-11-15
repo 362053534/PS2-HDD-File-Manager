@@ -27,6 +27,15 @@ extern void NetManToggleGlobalNetIFLinkState(unsigned char state);
 /* GCC14 constructor 写入 .init_array，而 PS2 crt0 只遍历 .ctors，需手动填充 */
 extern void __ps2ipeeOpsInitializeImpl(void);
 
+/* 只在启动主线程输出阶段，避免在中断/后台网络线程中绘屏。 */
+static int g_netBootTrace;
+static int g_netBootTid = -1;
+static void netBootLog(const char *stage)
+{
+    if (g_netBootTrace && GetThreadId() == g_netBootTid)
+        scr_printf("NET: %s\n", stage);
+}
+
 static void pfsnetEnsureTimerInit(void);
 static void pfsnetCheckWaitSlotsIsr(void);
 
@@ -178,6 +187,7 @@ static void expandLwipPool(const struct lwip_memp_desc_min *desc, u32 count, u32
 
 void __wrap_memp_init(void)
 {
+    netBootLog("memory pools init");
     __real_memp_init();
     if (!g_extraMempInitialized) {
         g_extraMempInitialized = 1;
@@ -187,6 +197,7 @@ void __wrap_memp_init(void)
         expandLwipPool(&memp_TCPIP_MSG_API, 256, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_NETBUF, 128, PFSNET_SMALL_POOL_STRIDE);
         expandLwipPool(&memp_SYS_TIMEOUT, 64, PFSNET_SMALL_POOL_STRIDE);
+        netBootLog("memory pools ready");
     }
 }
 
@@ -1094,6 +1105,7 @@ void __wrap_sys_init(void)
     unsigned int i;
     ee_sema_t sema;
 
+    netBootLog("mailbox system init");
     pfsnetEnsureTimerInit();
 
     sema.attr = 0;
@@ -1215,8 +1227,13 @@ u32 __wrap_sys_arch_mbox_tryfetch(pfsnet_sys_mbox_t *pMBox, void **ppvMSG)
 
 u32 __wrap_sys_arch_sem_wait(pfsnet_sys_sem_t *sema, u32 timeout)
 {
-    if (timeout == 0)
-        return (WaitSema(*sema) == *sema) ? 0 : PFSNET_SYS_ARCH_TIMEOUT;
+    if (timeout == 0) {
+        int result;
+        netBootLog("waiting for lwIP init semaphore");
+        result = WaitSema(*sema);
+        netBootLog("lwIP init semaphore returned");
+        return (result == *sema) ? 0 : PFSNET_SYS_ARCH_TIMEOUT;
+    }
     if (timeout == 1)
         return (PollSema(*sema) == *sema) ? 0 : PFSNET_SYS_ARCH_TIMEOUT;
     {
@@ -1277,8 +1294,9 @@ static int g_lastLinkUp;
 
 static int ethGetLinkStatus(void)
 {
-    int up = NetManIoctl(NETMAN_NETIF_IOCTL_GET_LINK_STATUS, NULL, 0, NULL, 0)
-             == NETMAN_NETIF_ETH_LINK_STATE_UP;
+    /* NETMAN 注册网络栈后会补发链路状态；该读取仅访问 EE 缓存。
+     * 同步 Ioctl 可能卡在 IOP RPC 内，使外层 30 次重试永远无法执行。 */
+    int up = NetManGetGlobalNetIFLinkState() != 0;
 
     g_lastLinkUp = up;
     return up;
@@ -1402,7 +1420,12 @@ int ethInit(int use_dhcp, const struct ip4_addr *ip, const struct ip4_addr *nm, 
         initGw = &zeroGw;
     }
 
+    g_netBootTid = GetThreadId();
+    g_netBootTrace = 1;
+    netBootLog("lwIP init begin");
     r = ps2ipInit((struct ip4_addr *)initIp, (struct ip4_addr *)initNm, (struct ip4_addr *)initGw);
+    netBootLog("lwIP init returned");
+    g_netBootTrace = 0;
     if (r != 0) {
         scr_printf("WARN: ps2ipInit failed (%d)\n", r);
         return -1;
@@ -1420,31 +1443,33 @@ int ethWaitLinkAndDhcp(int use_dhcp)
 {
     struct ip4_addr zeroIp, zeroNm, zeroGw;
 
-    /* OPL ethInitApplyConfig：先等到链路，必要时重试 SetLinkMode，再启动 DHCP */
-    do {
-        if (WaitValidNetState(&ethGetLinkStatus) < 0) {
-            scr_printf("WARN: link timeout (no carrier)\n");
-            return -1;
-        }
-    } while (ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO) != 0);
-
+    scr_printf("NET: waiting for link (EE events, max 30s)\n");
     if (WaitValidNetState(&ethGetLinkStatus) < 0) {
         scr_printf("WARN: link timeout (no carrier)\n");
         return -1;
     }
+    /* 自动协商模式设置失败时返回，不能在无界 do/while 中反复重试。 */
+    if (ethApplyNetIFConfig(NETMAN_NETIF_ETH_LINK_MODE_AUTO) != 0) {
+        scr_printf("WARN: link mode setup failed\n");
+        return -1;
+    }
+    scr_printf("NET: link ready\n");
 
     if (use_dhcp) {
         ip4_addr_set_zero(&zeroIp);
         ip4_addr_set_zero(&zeroNm);
         ip4_addr_set_zero(&zeroGw);
+        scr_printf("NET: DHCP start\n");
         if (ethApplyIPConfig(1, &zeroIp, &zeroNm, &zeroGw) < 0) {
             scr_printf("WARN: dhcp start failed\n");
             return -1;
         }
+        scr_printf("NET: waiting for DHCP lease (max 30s)\n");
         if (WaitValidNetState(&ethGetDhcpStatus) < 0) {
             scr_printf("WARN: dhcp timeout\n");
             return -1;
         }
+        scr_printf("NET: DHCP ready\n");
     }
     return 0;
 }

@@ -27,8 +27,16 @@ void _libcglue_timezone_update(void)
 {
 }
 
+extern void __locks_init(void);
+extern void __fdman_init(void);
+
 void _libcglue_init(void)
 {
+    /* 多线程网络栈需要堆锁和描述符互斥量。只跳过 RTC/pthread 等初始化，
+     * 不能把 SDK 必需的锁也跳过；否则零初始化的锁可能等到其他模块的信号量。
+     * crt0 在 main/IOP 复位前调用；这些 EE 信号量不受 IOP 复位影响。 */
+    __locks_init();
+    __fdman_init();
 }
 
 void _libcglue_deinit(void)
@@ -320,6 +328,8 @@ int main(int argc, char *argv[])
         NetManInit();
     }
 
+    scr_printf("HDD init complete; starting network config\n");
+
     /*
      * 1) DHCP
      * 2) 失败：OPL conf_network.cfg 里的静态地址（不再跑 OPL DHCP）
@@ -375,7 +385,7 @@ int main(int argc, char *argv[])
     scr_printf("Waiting for PC client...\n");
 
     if (apaDiagAttachOutput() < 0)
-        scr_printf("WARN: DIAG-5 output hook unavailable\n");
+        scr_printf("WARN: DIAG-6 output hook unavailable\n");
     if (pfsnetStartServer() < 0) {
         scr_printf("FATAL: server start failed\n");
         waitStartToExit();
@@ -383,7 +393,7 @@ int main(int argc, char *argv[])
 
     scr_printf("Press START to exit\n");
     if (apaDiagStart() < 0)
-        scr_printf("WARN: DIAG-5 monitor failed to start\n");
+        scr_printf("WARN: DIAG-6 monitor failed to start\n");
     startPadWatch();
     SleepThread();
     safeExitElf();
