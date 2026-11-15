@@ -1,2 +1,2 @@
 ApaNetServer
-APANET-DIAG-3
+APANET-DIAG-4

@@ -1,4 +1,4 @@
-# APANET-DIAG-3: bounded data I/O and network-stall investigation
+# APANET-DIAG-4: bounded data I/O and network-stall investigation
 
 This revision adds an application-level data inactivity deadline and corrects
 incomplete diagnostic coverage. It does not claim to fix the original packet
@@ -31,11 +31,11 @@ its throughput effect must be measured on hardware.
 
 Use the existing Actions PS2 ELF job and the owner 362053534 toolchain image.
 Output remains the stripped, ps2-packer-compressed `ApaNetServer.ELF`, with an
-`APANET-DIAG-3` marker outside packed loading segments. No client update is needed.
+`APANET-DIAG-4` marker outside packed loading segments. No client update is needed.
 
 Before a long transfer, confirm on the real PS2:
 
-1. `DIAG-3 HB:` advances and LIVE IP is the expected target.
+1. `DIAG-4 HB:` advances and LIVE IP is the expected target.
 2. `OUT hook:1` appears. After host ping, OUT calls/done should advance.
 3. RX shows the actual nonnegative thread ID and a readable kernel status.
 
@@ -107,3 +107,29 @@ Actions runs the socket/output/partition tests before compiling the ELF. These
 native checks use SDK-boundary stubs and cannot validate MIPS linkage or actual
 PS2 stack internals; Actions build and the startup checks plus real transfer are
 still required. Instrumentation and extra screen output may change fault timing.
+
+## DIAG-4 SDK requirement and hardware validation
+
+DIAG-4 requires the owner 362053534 SDK EE network library rebuilt with
+LWIP_SOCKET_SET_ERRNO=1. Its libc socket adapters depend on errno being set
+when a raw lwIP operation fails. The previous configuration could turn an
+errno-disabled would-block result into a false zero-byte receive. DIAG-3's
+new nonblocking loop exposed that mismatch and introduced an immediate upload
+failure; this was a regression introduced by the application change.
+
+The user confirmed that the SDK/toolchain image was updated. The temporary
+application error-code wrappers and their dedicated test have been removed.
+The program now uses the SDK's socket error contract directly. The actual
+nonblocking data loop, inactivity deadline, cancellation and network probes
+remain unchanged; no macOS or Windows client update is needed.
+
+The SDK change must be compiled into libps2ip.a installed in the image:
+changing headers alone cannot update a precompiled library. The existing
+Actions job pulls ghcr.io/362053534/ps2homebrew:main and performs a clean
+Release ELF build with stripping and ps2-packer compression.
+
+Native data-loop, output-observer and partition-safety checks do not prove the
+new image's MIPS runtime behavior. After building, confirm the DIAG-4 startup
+probes, initial upload, and repeated 6 GiB transfers on the real PS2. The
+original intermittent long-transfer fault, effective 90-second recovery and
+throughput remain unverified; this change does not claim they are fixed.
