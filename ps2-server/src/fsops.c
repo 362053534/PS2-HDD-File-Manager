@@ -18,6 +18,7 @@
 
 #include "pfsnet.h"
 #include "diagnostics.h"
+#include "data_io.h"
 
 #define PFSNET_XFER_NONE 0
 #define PFSNET_XFER_PUT 1
@@ -683,52 +684,29 @@ static int handleRename(struct PfsNetClient *client, const uint8_t *payload, uin
 
 static int xferSendAll(int sock, const void *buf, int len)
 {
-    const char *ptr = (const char *)buf;
-    int sent = 0;
-    int ok = 1;
-
+    int result;
     pfsnetTrafficBegin();
-    while (sent < len) {
-        int n;
-        if (g_putStop) {
-            ok = 0;
-            break;
-        }
-        n = send(sock, ptr + sent, len - sent, 0);
-        if (n <= 0) {
-            ok = 0;
-            break;
-        }
-        sent += n;
-    }
+    result = pfsnetDataIoAll(sock, (void *)buf, len, 1, &g_putStop,
+                            PFSNET_DATA_IDLE_MS, NULL);
     pfsnetTrafficEnd();
-    return ok ? sent : -1;
+    return result;
+}
+
+static void recvProgress(int bytes)
+{
+    apaDiagRecvResult(bytes, 0);
 }
 
 static int xferRecvAll(int sock, void *buf, int len)
 {
-    char *ptr = (char *)buf;
-    int got = 0;
-    int ok = 1;
-
+    int result;
     pfsnetTrafficBegin();
-    while (got < len) {
-        int n;
-        if (g_putStop) {
-            ok = 0;
-            break;
-        }
-        g_apaDiag.recvStage = APA_IO_RECV;
-        n = recv(sock, ptr + got, len - got, 0);
-        apaDiagRecvResult(n, n < 0 ? errno : 0);
-        if (n <= 0) {
-            ok = 0;
-            break;
-        }
-        got += n;
-    }
+    g_apaDiag.recvStage = APA_IO_RECV;
+    result = pfsnetDataIoAll(sock, buf, len, 0, &g_putStop,
+                            PFSNET_DATA_IDLE_MS, recvProgress);
+    if (result < 0) apaDiagRecvResult(result, errno);
     pfsnetTrafficEnd();
-    return ok ? got : -1;
+    return result;
 }
 
 static void ioWorker(void *arg)
@@ -863,12 +841,15 @@ static void tuneDataSocket(int sock)
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
 
-    /* 数据口空闲超时设为 90 秒，兼容无线 WiFi 中继重关联/重协商及 PFS 大文件元数据刷盘停顿；
-     * 客户端取消时先关闭数据口；新控制连接通过 pfsnetFsAbortActiveSocket 协作唤醒旧传输。 */
+    /* Best effort socket timeouts; some SDK builds return ENOPROTOOPT.
+     * data_io.c enforces the actual 90-second no-progress deadline and checks
+     * cancellation independently of these optional kernel settings. */
     tv.tv_sec = 90;
     tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    g_apaDiag.socketTimeoutMask =
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 ? 1u : 0u;
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0)
+        g_apaDiag.socketTimeoutMask |= 2u;
 }
 
 /* 向控制连接对端（PC）的 45062 回连数据通道 */

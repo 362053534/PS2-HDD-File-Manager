@@ -478,31 +478,6 @@ static void pfsnetNetManRxThread(void *arg)
     }
 }
 
-extern void __real_NetManNetIFXmit(void);
-extern int __real_NetManTxPacketNext(void **payload);
-extern void __real_NetManTxPacketDeQ(void);
-
-/* Xmit may be called in interrupt context: counters only, no locks/logging. */
-void __wrap_NetManNetIFXmit(void)
-{
-    g_apaDiag.txRequests++;
-    __real_NetManNetIFXmit();
-}
-
-int __wrap_NetManTxPacketNext(void **payload)
-{
-    int length = __real_NetManTxPacketNext(payload);
-    g_apaDiag.txPolls++;
-    g_apaDiag.txLastLength = length > 0 ? (unsigned)length : 0;
-    return length;
-}
-
-void __wrap_NetManTxPacketDeQ(void)
-{
-    __real_NetManTxPacketDeQ();
-    g_apaDiag.txDequeues++;
-}
-
 /* EE-local reads only; caller snapshots with interrupts briefly disabled.
  * Do not query NETMAN via IOP RPC here: that could hang the monitor too. */
 void apaDiagNetSnapshot(ApaDiagnostics *s)
@@ -511,6 +486,10 @@ void apaDiagNetSnapshot(ApaDiagnostics *s)
     s->sif0 = _lw(0x1000c000);
     s->dstat = _lw(0x1000e010);
     s->rxIndex = g_nmRxBufferRdPtr;
+    s->rxThreadId = g_nmRxThreadID;
+    s->rxFirstPending = (uint32_t)-1;
+    s->rxPending = 0;
+    apaDiagOutputSnapshot(s);
     s->rxBusy = g_nmIsProcessingRx;
     s->cmdSize = header != NULL ? header->psize : 0;
     {
@@ -527,8 +506,16 @@ void apaDiagNetSnapshot(ApaDiagnostics *s)
     if (g_nmFrameBufferStatus != NULL) {
         volatile struct NetManBD *bd = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferRdPtr]);
         volatile struct NetManBD *next = UNCACHED_SEG(&g_nmFrameBufferStatus[g_nmRxBufferNextRdPtr]);
+        int i;
         s->rxLen = bd->length;
         s->rxNextLen = next->length;
+        for (i = 0; i < NETMAN_RPC_BLOCK_SIZE; i++) {
+            volatile struct NetManBD *item = UNCACHED_SEG(&g_nmFrameBufferStatus[i]);
+            if (item->length > 0) {
+                s->rxPending++;
+                if (s->rxFirstPending == (uint32_t)-1) s->rxFirstPending = (unsigned)i;
+            }
+        }
     }
 }
 

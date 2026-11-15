@@ -362,8 +362,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 检查分区创建失败时禁止格式化
-        run: python3 ps2-server/tests/test-create-shortfall.py
+      - name: 检查分区安全、数据超时和诊断回调
+        run: |
+          python3 ps2-server/tests/test-create-shortfall.py
+          python3 ps2-server/tests/test-data-io.py
+          python3 ps2-server/tests/test-diagnostic-output.py
 
       - name: 登录 ghcr（镜像为私有时需要）
         uses: docker/login-action@v3

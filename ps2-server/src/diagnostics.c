@@ -92,7 +92,7 @@ static void threadLine(int row, const char *name, int *id, int priority,
 {
     ee_thread_status_t status;
     memset(sample, 0, sizeof(*sample));
-    if (*id < 0) *id = findThread(priority);
+    if (*id < 0 && priority >= 0) *id = findThread(priority);
     if (*id >= 0 && ReferThreadStatus(*id, &status) >= 0) {
         *sample = status;
         diagLine(row, "%s tid:%d state:%x wait:%u id:%u wake:%u", name, *id,
@@ -100,7 +100,7 @@ static void threadLine(int row, const char *name, int *id, int priority,
                  (unsigned)status.waitId, (unsigned)status.wakeupCount);
     } else {
         *id = -1;
-        diagLine(row, "%s: not found (priority %02x)", name, priority);
+        diagLine(row, "%s: not available", name);
     }
 }
 
@@ -139,7 +139,7 @@ static void diagThread(void *arg)
             heldValid = stallArmed = captureStall = 1;
         }
         int savedX = scr_getX(), savedY = scr_getY();
-        diagLine(12, "DIAG-2 HB:%u up:%us PUT:%u banks:%u",
+        diagLine(12, "DIAG-3 HB:%u up:%us PUT:%u banks:%u",
                    ++beat, now/1000, s.active, s.banks);
         diagLine(13, "RX:%u age:%us SIF:%u stage:%s  ",
                    s.rxPackets, pktAge/1000, s.sifIrqs, rxName(s.rxStage));
@@ -160,11 +160,13 @@ static void diagThread(void *arg)
                  (unsigned)s.address[0], (unsigned)s.address[1],
                  (unsigned)s.address[2], (unsigned)s.address[3],
                  s.ipFound, s.dhcpEnabled, s.dhcpState);
-        diagLine(20, "TX req:%u poll:%u deq:%u last:%u", s.txRequests,
-                 s.txPolls, s.txDequeues, s.txLastLength);
-        threadLine(21, "TX", &txTid, 0x56, &liveThreads[0]);
+        diagLine(20, "OUT hook:%u calls:%u done:%u queue:%u err:%d", s.outputHook,
+                 s.outputCalls, s.outputReturns, s.txQueueLen, (int)s.outputError);
+        txTid = s.outputThreadId > 0 ? s.outputThreadId : -1;
+        rxTid = s.rxThreadId;
+        threadLine(21, "OUT", &txTid, -1, &liveThreads[0]);
         threadLine(22, "CORE", &coreTid, 0x58, &liveThreads[1]);
-        threadLine(23, "RX", &rxTid, 0x59, &liveThreads[2]);
+        threadLine(23, "RX", &rxTid, -1, &liveThreads[2]);
         if (captureStall) {
             memcpy(heldThreads, liveThreads, sizeof(heldThreads));
             heldIds[0] = txTid; heldIds[1] = coreTid; heldIds[2] = rxTid;
@@ -172,12 +174,12 @@ static void diagThread(void *arg)
         if (heldValid) {
             diagLine(24, "SNAP @%us NET:%s HDD:%s RX:%s", heldUptime,
                      ioName(held.recvStage), ioName(held.diskStage), rxName(held.rxStage));
-            diagLine(25, "SNAP MiB:%u/%u RX:%u msg:%u TXdeq:%u",
+            diagLine(25, "SNAP MiB:%u/%u RX:%u msg:%u q:%u",
                      (unsigned)(held.recvBytes>>20), (unsigned)(held.diskBytes>>20),
-                     held.rxPackets, held.msgUsed, held.txDequeues);
-            diagLine(26, "SNAP IP:%u.%u.%u.%u TXreq:%u poll:%u", (unsigned)held.address[0],
+                     held.rxPackets, held.msgUsed, held.txQueueLen);
+            diagLine(26, "SNAP IP:%u.%u.%u.%u OUT:%u done:%u", (unsigned)held.address[0],
                      (unsigned)held.address[1], (unsigned)held.address[2],
-                     (unsigned)held.address[3], held.txRequests, held.txPolls);
+                     (unsigned)held.address[3], held.outputCalls, held.outputReturns);
         } else {
             diagLine(24, "SNAP: no 10-second NET+HDD stall observed yet");
             diagLine(25, "");
@@ -185,7 +187,7 @@ static void diagThread(void *arg)
         }
         {
             int i;
-            static const char *names[] = {"TX", "CORE", "RX"};
+            static const char *names[] = {"OUT", "CORE", "RX"};
             for (i = 0; i < 3; i++) {
                 if (heldValid)
                     diagLine(27+i, "SNAP %s tid:%d state:%x wait:%u id:%u wake:%u",
@@ -196,6 +198,9 @@ static void diagThread(void *arg)
                     diagLine(27+i, "");
             }
         }
+        diagLine(30, "RING pending:%u first:%d NMlink:%u flags:%02x SOtimeo:%u",
+                 s.rxPending, (int)s.rxFirstPending, s.netmanLink,
+                 (unsigned)s.interfaceFlags, s.socketTimeoutMask);
         scr_setXY(savedX, savedY);
         DelayThread(1000000);
     }

@@ -3,7 +3,7 @@ EE_BIN = ApaNetServer-debug.ELF
 EE_BIN_STRIPPED = ApaNetServer-stripped.ELF
 EE_BIN_PACKED = ApaNetServer.ELF
 
-EE_OBJS = main.o net.o netcfg.o server.o fsops.o diagnostics.o \
+EE_OBJS = main.o net.o netcfg.o server.o fsops.o diagnostics.o data_io.o diagnostic_output.o \
 	IOMANX_irx.o FILEXIO_irx.o POWEROFF_irx.o DEV9_irx.o ATAD_irx.o HDD_irx.o PFS_irx.o \
 	SIO2MAN_irx.o MCMAN_irx.o MCSERV_irx.o \
 	BDM_irx.o BDMFS_FATFS_irx.o USBD_irx.o USBMASS_BD_irx.o \
@@ -22,9 +22,6 @@ EE_LDFLAGS := -L$(PS2SDK)/ee/lib -L$(PS2SDK)/ports/lib -Wl,--gc-sections \
 	-Wl,--wrap=SifSendCmd \
 	-Wl,--wrap=iSifSendCmd \
 	-Wl,--wrap=DelayThread \
-	-Wl,--wrap=NetManNetIFXmit \
-	-Wl,--wrap=NetManTxPacketNext \
-	-Wl,--wrap=NetManTxPacketDeQ \
 	-Wl,--wrap=NetManInitRPCServer \
 	-Wl,--wrap=NetManDeinitRPCServer \
 	-Wl,--wrap=NetManRPCAllocRxBuffers \

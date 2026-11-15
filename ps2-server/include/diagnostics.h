@@ -2,7 +2,7 @@
 #define APANET_DIAGNOSTICS_H
 #include <stdint.h>
 
-/* DIAG-2: observational only. IRQ hooks only update aligned 32-bit fields.
+/* DIAG-3: observational only. IRQ hooks only update aligned 32-bit fields.
  * Each stage has one writer; byte totals are snapshotted with interrupts off.
  * Do not log, allocate, perform RPC or wait on a lock from hot-path hooks. */
 enum { APA_RX_SLEEP, APA_RX_ALLOC, APA_RX_DMA, APA_RX_ENQUEUE };
@@ -13,7 +13,9 @@ typedef struct ApaDiagnostics {
     uint32_t clockCalls, msgUsed, msgPeak, msgWaits, msgWaiting;
     uint32_t rxStage, recvStage, diskStage, active, banks;
     uint32_t sif0, dstat, rxIndex, rxLen, rxNextLen, rxBusy, cmdSize;
-    uint32_t txRequests, txPolls, txDequeues, txLastLength;
+    uint32_t outputCalls, outputReturns, outputErrors, outputHook, txQueueLen;
+    uint32_t rxPending, rxFirstPending, socketTimeoutMask, interfaceFlags, netmanLink;
+    int32_t outputError, outputThreadId, rxThreadId;
     uint32_t ipFound, dhcpEnabled, dhcpState;
     uint8_t address[4];
     uint64_t recvBytes, diskBytes, totalBytes;
@@ -24,5 +26,7 @@ void apaDiagPutBegin(uint64_t total, uint64_t offset, uint32_t banks);
 void apaDiagRecvResult(int result, int error);
 int apaDiagWrite(int fd, const void *buffer, int bytes);
 int apaDiagStart(void);
+int apaDiagAttachOutput(void);
+void apaDiagOutputSnapshot(ApaDiagnostics *snapshot);
 void apaDiagNetSnapshot(ApaDiagnostics *snapshot);
 #endif
