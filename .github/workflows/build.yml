@@ -372,6 +372,7 @@ jobs:
           python3 ps2-server/tests/test-data-io.py
           python3 ps2-server/tests/test-diagnostic-output.py
           python3 ps2-server/tests/test-diagnostic-screen.py
+          python3 ps2-server/tests/test-iop-rx-observer.py
 
       - name: 登录 ghcr（镜像为私有时需要）
         uses: docker/login-action@v3

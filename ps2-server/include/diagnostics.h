@@ -16,6 +16,7 @@ typedef struct ApaDiagnostics {
     uint32_t sif0, dstat, rxIndex, rxLen, rxNextLen, rxBusy, cmdSize;
     uint32_t outputCalls, outputReturns, outputErrors, outputHook, txQueueLen;
     uint32_t rxPending, rxFirstPending, socketTimeoutMask, interfaceFlags, netmanLink;
+    uint32_t iopValid, iopPending, iopFirstPending, iopAtRead, iopMismatch;
     int32_t outputError, outputThreadId, rxThreadId, ioThreadId;
     uint32_t ipFound, dhcpEnabled, dhcpState;
     uint8_t address[4];

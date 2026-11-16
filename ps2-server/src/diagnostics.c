@@ -150,7 +150,7 @@ static void diagThread(void *arg)
             heldValid = stallArmed = captureStall = 1;
         }
         int savedX = scr_getX(), savedY = scr_getY();
-        diagLine(6, "DIAG-9 HB:%u up:%us PUT:%u banks:%u",
+        diagLine(6, "DIAG-10 HB:%u up:%us PUT:%u banks:%u",
                    ++beat, now/1000, s.active, s.banks);
         diagLine(7, "RX:%u age:%us SIF:%u stage:%s  ",
                    s.rxPackets, pktAge/1000, s.sifIrqs, rxName(s.rxStage));
@@ -167,10 +167,9 @@ static void diagThread(void *arg)
         diagLine(12, "IO:%s calls:%u yield:%u n:%d e:%d bytes:%u fl:%x",
                  dataName(data.phase), data.calls, data.yields, (int)data.lastResult,
                  (int)data.lastError, data.moved, (unsigned)data.fdFlags);
-        diagLine(13, "LIVE IP:%u.%u.%u.%u found:%u dhcp:%u state:%u",
-                 (unsigned)s.address[0], (unsigned)s.address[1],
-                 (unsigned)s.address[2], (unsigned)s.address[3],
-                 s.ipFound, s.dhcpEnabled, s.dhcpState);
+        diagLine(13, "IOP valid:%u busy:%u first:%d at:%u mismatch:%u",
+                 s.iopValid, s.iopPending, (int)s.iopFirstPending,
+                 s.iopAtRead, s.iopMismatch);
         diagLine(14, "OUT hook:%u calls:%u done:%u queue:%u err:%d", s.outputHook,
                  s.outputCalls, s.outputReturns, s.txQueueLen, (int)s.outputError);
         ioTid = s.ioThreadId > 0 ? s.ioThreadId : -1;
@@ -188,9 +187,9 @@ static void diagThread(void *arg)
             diagLine(19, "SNAP IO:%s calls:%u yield:%u n:%d e:%d bytes:%u",
                      dataName(heldData.phase), heldData.calls, heldData.yields,
                      (int)heldData.lastResult, (int)heldData.lastError, heldData.moved);
-            diagLine(20, "SNAP OUT:%u/%u R:%u S:%08x D:%08x K:%u",
-                     held.outputCalls, held.outputReturns, held.rxPending,
-                     (unsigned)held.sif0, (unsigned)held.dstat, held.sifKickAttempts);
+            diagLine(20, "SNAP E:%u V:%u I:%u at:%u M:%u S:%08x K:%u",
+                     held.rxPending, held.iopValid, held.iopPending, held.iopAtRead,
+                     held.iopMismatch, (unsigned)held.sif0, held.sifKickAttempts);
         } else {
             diagLine(18, "SNAP: no 10-second NET+HDD stall observed yet");
             diagLine(19, "");

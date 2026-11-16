@@ -373,7 +373,7 @@ int main(int argc, char *argv[])
     scr_clear();
     /* Compact final header within the same TV-safe margins as the monitor. */
     scr_setXY(4, 2);
-    scr_printf("ApaNetServer DIAG-9   START: exit");
+    scr_printf("ApaNetServer DIAG-10   START: exit");
     scr_setXY(4, 3);
     scr_printf("IP: %s (%s)  Link: %s", ipText,
                pfsnetIpSourceName(cfg.source), ethLinkIsUp() ? "UP" : "DOWN");
@@ -400,7 +400,7 @@ int main(int argc, char *argv[])
 
     if (apaDiagAttachOutput() < 0) {
         scr_setXY(4, 5);
-        scr_printf("%-70s", "WARN: DIAG-9 output hook unavailable");
+        scr_printf("%-70s", "WARN: DIAG-10 output hook unavailable");
     }
     if (pfsnetStartServer() < 0) {
         scr_setXY(4, 5);
@@ -410,7 +410,7 @@ int main(int argc, char *argv[])
 
     if (apaDiagStart() < 0) {
         scr_setXY(4, 5);
-        scr_printf("%-70s", "WARN: DIAG-9 monitor failed to start");
+        scr_printf("%-70s", "WARN: DIAG-10 monitor failed to start");
     }
     startPadWatch();
     SleepThread();

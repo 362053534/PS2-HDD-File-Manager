@@ -478,7 +478,41 @@ static void pfsnetNetManRxThread(void *arg)
     }
 }
 
-/* EE-local reads only; caller snapshots with interrupts briefly disabled.
+/* IOP_RX_OBSERVE_BEGIN */
+/* Owner SDK ee/sbv/src/smem.c documents privileged reads of IOP RAM at
+ * 0xbc000000. Caller has interrupts disabled; preserve that state. Read only
+ * the 64 length fields, never registers, never RPC and never write IOP RAM.
+ * IOP may run concurrently: a mismatch is evidence only if it persists.
+ * The private IOP producer index is NOT inferred from the first busy slot. */
+static void pfsnetObserveIopRx(ApaDiagnostics *s)
+{
+    uintptr_t base = (uintptr_t)g_nmRxIOPFrameBufferStatus;
+    unsigned i;
+    s->iopValid = s->iopPending = s->iopAtRead = s->iopMismatch = 0;
+    s->iopFirstPending = (uint32_t)-1;
+    if (!g_nmIsInitialized || g_nmFrameBufferStatus == NULL ||
+        base == 0 || (base & 3) != 0 || sizeof(struct NetManBD) != 16 ||
+        base > 0x00200000u - NETMAN_RPC_BLOCK_SIZE * sizeof(struct NetManBD))
+        return;
+    ee_kmode_enter();
+    for (i = 0; i < NETMAN_RPC_BLOCK_SIZE; i++) {
+        volatile const struct NetManBD *iop =
+            (volatile const struct NetManBD *)(0xbc000000u + base + i * sizeof(struct NetManBD));
+        volatile const struct NetManBD *ee = UNCACHED_SEG(&g_nmFrameBufferStatus[i]);
+        unsigned length = iop->length;
+        if (length != 0) {
+            s->iopPending++;
+            if (s->iopFirstPending == (uint32_t)-1) s->iopFirstPending = i;
+            if (ee->length == 0) s->iopMismatch++;
+        }
+        if (i == g_nmRxBufferRdPtr) s->iopAtRead = length;
+    }
+    ee_kmode_exit();
+    s->iopValid = 1;
+}
+/* IOP_RX_OBSERVE_END */
+
+/* EE-local and bounded IOP RAM reads; caller disables interrupts briefly.
  * Do not query NETMAN via IOP RPC here: that could hang the monitor too. */
 void apaDiagNetSnapshot(ApaDiagnostics *s)
 {
@@ -490,6 +524,7 @@ void apaDiagNetSnapshot(ApaDiagnostics *s)
     s->rxFirstPending = (uint32_t)-1;
     s->rxPending = 0;
     apaDiagOutputSnapshot(s);
+    pfsnetObserveIopRx(s);
     s->rxBusy = g_nmIsProcessingRx;
     s->cmdSize = header != NULL ? header->psize : 0;
     {
