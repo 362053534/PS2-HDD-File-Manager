@@ -255,3 +255,22 @@ initial priority. The native harness executes the actual main setup followed
 by the actual delay with initial priority 0: red before this change, green
 after. This reproduces the reported guard failure, not BIOS execution; real
 DHCP lease acquisition and the older long-transfer failure remain unverified.
+
+### DIAG-7 transfer reproduction: timeout-slot ownership
+
+2026-11-16 run `diag7-loop-20261116-140532`, source `9adaef6`:
+- PS2 ACKed 413,015 payload bytes, then kept advertising a zero receive window.
+- Client timed out after 120 seconds (524,288 bytes accepted locally); no retry
+  or file deletion occurred. PS2 and router ping were 3/3; raw ARP was 4/4.
+- Screen: IO delay, calls 81, yields 49, last recv -1/errno 11, current-bank
+  bytes 347,490. Actual IO tid 16 waited on semaphore 29; HB and TCP stayed live.
+
+The actual timeout-slot functions reproduce a lost wakeup with this schedule:
+ISR releases waiter A and makes its slot free; B acquires that slot before A
+runs; A's cleanup erases B's deadline. B can then remain in WaitSema forever.
+`test-wait-slots.py` fails on the old code with this schedule. The ISR now marks
+a released slot as still owned (state 2); only its original waiter frees it.
+The native replay passes after this change and is included in the existing CI
+workflow. This proves an application race and repairs it; the photo cannot
+prove the exact slot transitions on PS2. Hardware retest is still required,
+and the older multi-GiB network-silence failure is not declared solved.

@@ -730,7 +730,7 @@ static void freeMsg(pfsnet_arch_message_t *msg)
 typedef struct pfsnet_wait_slot {
     volatile s32 tid;
     volatile u64 deadlineTicks;
-    volatile int active;
+    volatile int active; /* 0: free, 1: armed, 2: released but still owned */
 } pfsnet_wait_slot_t;
 
 #define PFSNET_WAIT_SLOTS 12
@@ -743,10 +743,13 @@ static void pfsnetCheckWaitSlotsIsr(void)
     int i;
 
     for (i = 0; i < PFSNET_WAIT_SLOTS; i++) {
-        if (g_waitSlots[i].active && nowTicks >= g_waitSlots[i].deadlineTicks) {
+        if (g_waitSlots[i].active == 1 && nowTicks >= g_waitSlots[i].deadlineTicks) {
             s32 tid = g_waitSlots[i].tid;
             if (tid >= 0 && iReleaseWaitThread(tid) >= 0)
-                g_waitSlots[i].active = 0;
+                /* Released is still owned: the awakened thread has not yet
+                 * returned from WaitSema and cleared its slot. Reusing it here
+                 * lets that old cleanup erase another thread's timeout. */
+                g_waitSlots[i].active = 2;
         }
     }
 }
