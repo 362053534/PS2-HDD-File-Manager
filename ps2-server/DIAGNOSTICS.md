@@ -1,4 +1,4 @@
-# APANET-DIAG-8: bounded data I/O and network-stall investigation
+# APANET-DIAG-9: bounded data I/O and network-stall investigation
 
 This revision adds an application-level data inactivity deadline and corrects
 incomplete diagnostic coverage. It does not claim to fix the original packet
@@ -31,11 +31,11 @@ its throughput effect must be measured on hardware.
 
 Use the existing Actions PS2 ELF job and the owner 362053534 toolchain image.
 Output remains the stripped, ps2-packer-compressed `ApaNetServer.ELF`, with an
-`APANET-DIAG-8` marker outside packed loading segments. No client update is needed.
+`APANET-DIAG-9` marker outside packed loading segments. No client update is needed.
 
 Before a long transfer, confirm on the real PS2:
 
-1. `DIAG-8 HB:` advances and LIVE IP is the expected target.
+1. `DIAG-9 HB:` advances and LIVE IP is the expected target.
 2. `OUT hook:1` appears. After host ping, OUT calls/done should advance.
 3. RX shows the actual nonnegative thread ID and a readable kernel status.
 
@@ -294,3 +294,37 @@ returns matched (2,166,520), queue 0, error 0; RX was asleep and message use 0,
 not pool exhaustion. These EE observations do not yet distinguish empty EE RX
 ring / stopped upstream delivery from pending descriptors with a missed wake.
 The missing RING/BD information must be captured before selecting a new fix.
+
+### DIAG-9: independent guarded SIF0 receiver rearm
+
+DIAG-8 run `diag8-loop-20261116-171627` (3efc652) failed at client count
+5,748,293,632 bytes. Last PS2 ACK still advertised window65,023; PS2 then
+stopped responding to data, ping and raw ARP while the router responded.
+The full photo shows RX asleep, empty EE ring (pending0, first-1, len0/0),
+busy0/cmd0, SIF0 CHCR read as0x01000084, DSTAT read as0x00a00044. The canonical
+SDK ee_regs.h defines CHCR STR as bit8 (0x100); that bit is clear in the photo.
+No SIF0 pending-interrupt bit0x20 appears in that DSTAT value. NETMAN link is
+a cached EE value, not a fresh PHY measurement.
+
+Previously, receiver rearm was reachable from the SIF0 interrupt handler or
+from an already-running RX thread. A permanently stopped chain with RX asleep
+had no independent rearm path. The native test of the real periodic callbacks
+reproduces that missing path. DIAG-9 adds an IRQ-context guard to the existing
+periodic timer and VBlank callbacks. NETMAN must be initialized; the receiver
+must stay stopped for20ms with an empty SIFCMD buffer, no pending SIF0 IRQ and
+no intervening SIF handler activity. Registers/buffer are rechecked before
+calling iSifSetDChain. Attempts are rate-limited to once per250ms. No RPC,
+command dispatch, polling loop, allocation or network-stack reset occurs here.
+
+The native test checks running/unfinished states, initialization, new SIF
+activity, the final recheck, interrupt-state preservation and cooldown. It
+proves the application recovery path, not real DMA delivery or the event that
+originally stopped the chain. All hardware interaction still needs ELF retest.
+
+`SIFkick` is a count of attempted guarded rearms, not successful recoveries.
+The SNAP summary now retains OUT calls/returns, ring pending, SIF0 CHCR, DSTAT
+and kick count together. The TV-safe layout remains unchanged. If a transient
+stall is followed by kick growth and resumed RX/transfer, that supports the
+stopped-chain hypothesis; kicks without renewed traffic leave the upstream
+IOP/SMAP/link causes unresolved. A stopped receiver observed only after failure
+is not proof of the original trigger. No SDK or client changes are required.

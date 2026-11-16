@@ -150,12 +150,12 @@ static void diagThread(void *arg)
             heldValid = stallArmed = captureStall = 1;
         }
         int savedX = scr_getX(), savedY = scr_getY();
-        diagLine(6, "DIAG-8 HB:%u up:%us PUT:%u banks:%u",
+        diagLine(6, "DIAG-9 HB:%u up:%us PUT:%u banks:%u",
                    ++beat, now/1000, s.active, s.banks);
         diagLine(7, "RX:%u age:%us SIF:%u stage:%s  ",
                    s.rxPackets, pktAge/1000, s.sifIrqs, rxName(s.rxStage));
-        diagLine(8, "pbuf-miss:%u alloc-retry:%u clock:%u",
-                   s.pbufMisses, s.rxAllocRetries, s.clockCalls);
+        diagLine(8, "pbuf:%u retry:%u clock:%u SIFkick:%u",
+                   s.pbufMisses, s.rxAllocRetries, s.clockCalls, s.sifKickAttempts);
         diagLine(9, "msg:%u/1024 peak:%u calls:%u waiting:%u",
                    s.msgUsed, s.msgPeak, s.msgWaits, s.msgWaiting);
         diagLine(10, "NET:%u/%u MiB age:%us %s err:%d   ",
@@ -188,9 +188,9 @@ static void diagThread(void *arg)
             diagLine(19, "SNAP IO:%s calls:%u yield:%u n:%d e:%d bytes:%u",
                      dataName(heldData.phase), heldData.calls, heldData.yields,
                      (int)heldData.lastResult, (int)heldData.lastError, heldData.moved);
-            diagLine(20, "SNAP IP:%u.%u.%u.%u OUT:%u done:%u", (unsigned)held.address[0],
-                     (unsigned)held.address[1], (unsigned)held.address[2],
-                     (unsigned)held.address[3], held.outputCalls, held.outputReturns);
+            diagLine(20, "SNAP OUT:%u/%u R:%u S:%08x D:%08x K:%u",
+                     held.outputCalls, held.outputReturns, held.rxPending,
+                     (unsigned)held.sif0, (unsigned)held.dstat, held.sifKickAttempts);
         } else {
             diagLine(18, "SNAP: no 10-second NET+HDD stall observed yet");
             diagLine(19, "");

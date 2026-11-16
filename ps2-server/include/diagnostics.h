@@ -11,6 +11,7 @@ enum { APA_IO_IDLE, APA_IO_FREE, APA_IO_RECV, APA_IO_READY,
 typedef struct ApaDiagnostics {
     uint32_t sifIrqs, rxPackets, pbufMisses, rxAllocRetries;
     uint32_t clockCalls, msgUsed, msgPeak, msgWaits, msgWaiting;
+    uint32_t sifKickAttempts; /* guarded restart attempts, not proof of recovery */
     uint32_t rxStage, recvStage, diskStage, active, banks;
     uint32_t sif0, dstat, rxIndex, rxLen, rxNextLen, rxBusy, cmdSize;
     uint32_t outputCalls, outputReturns, outputErrors, outputHook, txQueueLen;

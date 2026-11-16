@@ -57,6 +57,7 @@ void scr_printf(const char *fmt,...){char b[256];va_list a;va_start(a,fmt);vsnpr
 int fileXioWrite(int fd,const void *buf,int n){(void)fd;(void)buf;(void)n;assert(g_apaDiag.diskStage==APA_IO_WRITE);return result;}
 int main(void){
  uint64_t offset=5ULL<<30;
+ g_apaDiag.sifKickAttempts=7;
  g_pfsnetDataIoTrace.phase=APA_DATA_RECV;
  g_pfsnetDataIoTrace.calls=1;g_pfsnetDataIoTrace.moved=123456;
  apaDiagPutBegin(6ULL<<30,offset,16);
@@ -68,7 +69,7 @@ int main(void){
  createResult=4;startResult=-2;assert(apaDiagStart()==-2&&deleted==1);
  startResult=0;assert(apaDiagStart()==0);assert(thread.initial_priority==0x78&&thread.stack_size>=0x2000);
  if(!setjmp(done))thread.func(NULL);
- assert(lines==20&&strstr(screen,"DIAG-8 HB:1")&&strstr(screen,"5120/6144 MiB"));
+ assert(lines==20&&strstr(screen,"DIAG-9 HB:1")&&strstr(screen,"5120/6144 MiB"));
  assert(strstr(screen,"LIVE IP:192.168.5.3")&&strstr(screen,"IO tid:8")&&strstr(screen,"CORE tid:6")&&strstr(screen,"RX tid:7"));
  assert(strstr(screen,"IO:recv calls:1"));
  assert(strstr(screen,"RING pending:")&&strstr(screen,"BD:"));
@@ -100,7 +101,7 @@ int StartThread(int id,void *arg){(void)id;(void)arg;return startResult;}
 int DeleteThread(int id){(void)id;deleted++;return 0;}
 uint64_t GetTimerSystemTime(void){
  if(snapshotMode){ticks++;lines=0;screen[0]=0;
-  if(ticks==13){g_pfsnetDataIoTrace.phase=APA_DATA_DONE;g_apaDiag.active=0;g_apaDiag.recvStage=APA_IO_DONE;g_apaDiag.diskStage=APA_IO_DONE;}
+  if(ticks==13){g_apaDiag.sifKickAttempts=9;g_pfsnetDataIoTrace.phase=APA_DATA_DONE;g_apaDiag.active=0;g_apaDiag.recvStage=APA_IO_DONE;g_apaDiag.diskStage=APA_IO_DONE;}
   return 147456000ULL*ticks;
  }
  return 147456000ULL;
@@ -112,6 +113,7 @@ void scr_printf(const char *fmt,...){char b[256];va_list a;va_start(a,fmt);vsnpr
 int fileXioWrite(int fd,const void *buf,int n){(void)fd;(void)buf;(void)n;assert(g_apaDiag.diskStage==APA_IO_WRITE);return result;}
 int main(void){
  uint64_t offset=5ULL<<30;
+ g_apaDiag.sifKickAttempts=7;
  g_pfsnetDataIoTrace.phase=APA_DATA_RECV;
  g_pfsnetDataIoTrace.calls=1;g_pfsnetDataIoTrace.moved=123456;
  apaDiagPutBegin(6ULL<<30,offset,16);
@@ -123,12 +125,13 @@ int main(void){
  createResult=4;startResult=-2;assert(apaDiagStart()==-2&&deleted==1);
  startResult=0;assert(apaDiagStart()==0);assert(thread.initial_priority==0x78&&thread.stack_size>=0x2000);
  if(!setjmp(done))thread.func(NULL);
- assert(lines==20&&strstr(screen,"DIAG-8 HB:1")&&strstr(screen,"5120/6144 MiB"));
+ assert(lines==20&&strstr(screen,"DIAG-9 HB:1")&&strstr(screen,"5120/6144 MiB"));
  assert(strstr(screen,"LIVE IP:192.168.5.3")&&strstr(screen,"IO tid:8")&&strstr(screen,"CORE tid:6")&&strstr(screen,"RX tid:7"));
  snapshotMode=1;
  if(!setjmp(done))thread.func(NULL);
  assert(lines==20&&strstr(screen,"PUT:0")&&strstr(screen,"SNAP @11s NET:error HDD:error")&&strstr(screen,"SNAP IO tid:8 state:4 wait:1"));
  assert(strstr(screen,"SNAP IO:recv calls:1")&&strstr(screen,"bytes:123456"));
+ assert(strstr(screen,"SIFkick:9")&&strstr(screen,"SNAP OUT:0/0 R:0 S:00000100 D:00000000 K:7"));
  assert(strstr(screen,"RING pending:")&&strstr(screen,"BD:"));
  assert(enabled);puts("PASS: >4GiB progress, recv/write errors, monitor start failures, twenty bounded display rows; real IO ID and exact partial bytes");
 }

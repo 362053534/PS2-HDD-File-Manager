@@ -368,6 +368,7 @@ jobs:
           python3 ps2-server/tests/test-boot-link.py
           python3 ps2-server/tests/test-startup-delay.py
           python3 ps2-server/tests/test-wait-slots.py
+          python3 ps2-server/tests/test-sif-recovery.py
           python3 ps2-server/tests/test-data-io.py
           python3 ps2-server/tests/test-diagnostic-output.py
           python3 ps2-server/tests/test-diagnostic-screen.py

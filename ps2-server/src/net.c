@@ -754,6 +754,56 @@ static void pfsnetCheckWaitSlotsIsr(void)
     }
 }
 
+/* SIF_RX_WATCH_BEGIN */
+static u64 g_sifRxIdleSince, g_sifRxLastKick;
+static u32 g_sifRxWatchIrq;
+
+/* Independent progress source: an asleep RX thread cannot repair a stopped
+ * SIF0 receiver itself. Never dispatch commands or perform RPC from here.
+ * Wait for 20ms of stopped DMA, no pending SIF0 IRQ and an empty command buffer.
+ * A pending command/IRQ belongs to the normal handler and MUST NOT be bypassed. */
+static void pfsnetWatchSif0Isr(void)
+{
+    volatile SifCmdHeader_t *header = (volatile SifCmdHeader_t *)_sif_cmd_data.pktbuf;
+    int old = DIntr();
+    u64 now;
+    u32 irq = g_apaDiag.sifIrqs;
+
+    if (!g_nmIsInitialized || g_nmFrameBufferStatus == NULL || header == NULL) {
+        g_sifRxIdleSince = g_sifRxLastKick = 0;
+        g_sifRxWatchIrq = irq;
+        goto out;
+    }
+    if ((_lw(0x1000c000) & 0x100) != 0 ||
+        (_lw(0x1000e010) & 0x20) != 0 || header->psize != 0) {
+        g_sifRxIdleSince = 0;
+        g_sifRxWatchIrq = irq;
+        goto out;
+    }
+    now = iGetTimerSystemTime();
+    if (g_sifRxIdleSince == 0 || g_sifRxWatchIrq != irq) {
+        g_sifRxIdleSince = now;
+        g_sifRxWatchIrq = irq;
+        goto out;
+    }
+    if (now - g_sifRxIdleSince < MSec2TimerBusClock(20) ||
+        (g_sifRxLastKick != 0 && now - g_sifRxLastKick < MSec2TimerBusClock(250)))
+        goto out;
+
+    /* Recheck hardware immediately before rearming; DMA runs independently
+     * of CPU interrupt masking. Retain the normal SIFCMD buffer ownership. */
+    if ((_lw(0x1000c000) & 0x100) == 0 &&
+        (_lw(0x1000e010) & 0x20) == 0 && header->psize == 0) {
+        iSifSetDChain();
+        g_apaDiag.sifKickAttempts++;
+        g_sifRxLastKick = now;
+    }
+    g_sifRxIdleSince = 0;
+out:
+    if (old) EIntr();
+}
+/* SIF_RX_WATCH_END */
+
 static u64 pfsnetTimerTickAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, void *arg, void *pc_value)
 {
     u64 step = MSec2TimerBusClock(2);
@@ -763,6 +813,7 @@ static u64 pfsnetTimerTickAlarmCb(s32 id, u64 scheduled_time, u64 actual_time, v
     (void)pc_value;
 
     pfsnetCheckWaitSlotsIsr();
+    pfsnetWatchSif0Isr();
 
     /*
      * TimerHandler_callback 将返回值累加在 scheduled_time (timer_schedule) 而非 actual_time 上；
@@ -779,6 +830,7 @@ static s32 pfsnetVblankBackupIsr(s32 cause)
 {
     (void)cause;
     pfsnetCheckWaitSlotsIsr();
+    pfsnetWatchSif0Isr();
     ExitHandler();
     return 0;
 }
