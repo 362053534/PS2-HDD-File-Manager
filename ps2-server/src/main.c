@@ -371,39 +371,47 @@ int main(int argc, char *argv[])
     /* 清屏后只保留最终状态；链路用 DHCP 阶段缓存，不再 NetManIoctl */
     ethGetIpDisplay(ipText, sizeof(ipText));
     scr_clear();
-    scr_printf("ApaNetServer\n");
-    scr_printf("IP: %s (%s)\n", ipText, pfsnetIpSourceName(cfg.source));
+    /* Compact final header within the same TV-safe margins as the monitor. */
+    scr_setXY(4, 2);
+    scr_printf("ApaNetServer DIAG-8   START: exit");
+    scr_setXY(4, 3);
+    scr_printf("IP: %s (%s)  Link: %s", ipText,
+               pfsnetIpSourceName(cfg.source), ethLinkIsUp() ? "UP" : "DOWN");
+    scr_setXY(4, 4);
+    if (hddStandbyResult == 0)
+        scr_printf("HDD standby: off  Control:%u Data:%u", PFSNET_COMMAND_PORT, PFSNET_DATA_PORT);
+    else
+        scr_printf("HDD standby err:%d  Control:%u Data:%u", hddStandbyResult, PFSNET_COMMAND_PORT, PFSNET_DATA_PORT);
+    scr_setXY(4, 5);
     bootFailure = ethBootFailure(&bootFailureCode);
     if (bootFailure)
-        scr_printf("DHCP fallback: %s (%d)\n", bootFailure, bootFailureCode);
-    if (hddStandbyResult == 0)
-        scr_printf("HDD automatic standby: disabled\n");
+        scr_printf("DHCP fallback: %s (%d)", bootFailure, bootFailureCode);
     else
-        scr_printf("WARN: disable HDD standby failed (%d)\n", hddStandbyResult);
-    scr_printf("NM: %u.%u.%u.%u  GW: %u.%u.%u.%u\n",
-               (unsigned)ip4_addr1(&cfg.nm), (unsigned)ip4_addr2(&cfg.nm),
-               (unsigned)ip4_addr3(&cfg.nm), (unsigned)ip4_addr4(&cfg.nm),
-               (unsigned)ip4_addr1(&cfg.gw), (unsigned)ip4_addr2(&cfg.gw),
-               (unsigned)ip4_addr3(&cfg.gw), (unsigned)ip4_addr4(&cfg.gw));
-    scr_printf("Link: %s\n", ethLinkIsUp() ? "UP" : "DOWN");
+        scr_printf("NM: %u.%u.%u.%u  GW: %u.%u.%u.%u",
+                   (unsigned)ip4_addr1(&cfg.nm), (unsigned)ip4_addr2(&cfg.nm),
+                   (unsigned)ip4_addr3(&cfg.nm), (unsigned)ip4_addr4(&cfg.nm),
+                   (unsigned)ip4_addr1(&cfg.gw), (unsigned)ip4_addr2(&cfg.gw),
+                   (unsigned)ip4_addr3(&cfg.gw), (unsigned)ip4_addr4(&cfg.gw));
     if (!ethLinkIsUp()) {
-        scr_printf("FATAL: no ethernet link (SMAP)\n");
-        scr_printf("Check cable/switch, reboot PS2\n");
+        scr_setXY(4, 5);
+        scr_printf("FATAL: no ethernet link; check cable/switch, reboot PS2");
         waitStartToExit();
     }
-    scr_printf("Control :%u  Data(PC listen):%u\n", PFSNET_COMMAND_PORT, PFSNET_DATA_PORT);
-    scr_printf("Waiting for PC client...\n");
 
-    if (apaDiagAttachOutput() < 0)
-        scr_printf("WARN: DIAG-7 output hook unavailable\n");
+    if (apaDiagAttachOutput() < 0) {
+        scr_setXY(4, 5);
+        scr_printf("%-70s", "WARN: DIAG-8 output hook unavailable");
+    }
     if (pfsnetStartServer() < 0) {
-        scr_printf("FATAL: server start failed\n");
+        scr_setXY(4, 5);
+        scr_printf("%-70s", "FATAL: server start failed");
         waitStartToExit();
     }
 
-    scr_printf("Press START to exit\n");
-    if (apaDiagStart() < 0)
-        scr_printf("WARN: DIAG-7 monitor failed to start\n");
+    if (apaDiagStart() < 0) {
+        scr_setXY(4, 5);
+        scr_printf("%-70s", "WARN: DIAG-8 monitor failed to start");
+    }
     startPadWatch();
     SleepThread();
     safeExitElf();

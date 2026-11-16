@@ -1,4 +1,4 @@
-# APANET-DIAG-7: bounded data I/O and network-stall investigation
+# APANET-DIAG-8: bounded data I/O and network-stall investigation
 
 This revision adds an application-level data inactivity deadline and corrects
 incomplete diagnostic coverage. It does not claim to fix the original packet
@@ -31,11 +31,11 @@ its throughput effect must be measured on hardware.
 
 Use the existing Actions PS2 ELF job and the owner 362053534 toolchain image.
 Output remains the stripped, ps2-packer-compressed `ApaNetServer.ELF`, with an
-`APANET-DIAG-7` marker outside packed loading segments. No client update is needed.
+`APANET-DIAG-8` marker outside packed loading segments. No client update is needed.
 
 Before a long transfer, confirm on the real PS2:
 
-1. `DIAG-7 HB:` advances and LIVE IP is the expected target.
+1. `DIAG-8 HB:` advances and LIVE IP is the expected target.
 2. `OUT hook:1` appears. After host ping, OUT calls/done should advance.
 3. RX shows the actual nonnegative thread ID and a readable kernel status.
 
@@ -46,8 +46,8 @@ those probes in the linked PS2 runtime, so their missing coverage is corrected.
 
 ## Screen interpretation
 
-Twenty fixed rows (13–32) refresh about once per second, without scrolling.
-Each row is bounded to 78 characters within the SDK's 80x40 character screen;
+Twenty fixed rows (zero-based 6–25) refresh about once per second, without scrolling.
+Each row is bounded to 70 characters in columns 4–73, leaving TV overscan margins;
 TV overscan still needs visual confirmation. No PS2 disk logs are written.
 
 - HB/up: monitor scheduling and local timer; frozen HB alone cannot distinguish
@@ -274,3 +274,23 @@ The native replay passes after this change and is included in the existing CI
 workflow. This proves an application race and repairs it; the photo cannot
 prove the exact slot transitions on PS2. Hardware retest is still required,
 and the older multi-GiB network-silence failure is not declared solved.
+
+### DIAG-8: TV-safe display, no network behavior changes
+
+The user confirmed that the DIAG-7 screen loses the first characters on the
+left and ends at SNAP IO: the CORE/RX snapshot and RING/BD rows were off-screen.
+DIAG-8 uses columns 4..73, header rows 2..5, and all 20 diagnostic rows 6..25.
+The native monitor render test rejects any line outside this rectangle, and
+checks that RING/BD and the frozen IO/CORE/RX records remain visible together.
+It fails on the old layout; live and post-cleanup snapshot cases pass on the
+new layout. Actual TV margins still need user verification. The test does not
+claim PS2 video emulation. Scheduling, timers, protocol and IOP/SDK unchanged.
+
+The 25ac150 retest photo confirms the receive loop retried 46,057 times before
+ETIMEDOUT (116), with the HDD waiting for a filled bank in the stall snapshot.
+The previous permanently blocked DelayThread signature did not recur. Snapshot
+IO was delay/errno11 with 425,280 bytes in the partial bank. Live OUT calls and
+returns matched (2,166,520), queue 0, error 0; RX was asleep and message use 0,
+not pool exhaustion. These EE observations do not yet distinguish empty EE RX
+ring / stopped upstream delivery from pending descriptors with a missed wake.
+The missing RING/BD information must be captured before selecting a new fix.
