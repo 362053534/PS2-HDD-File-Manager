@@ -69,7 +69,7 @@ int main(void){
  createResult=4;startResult=-2;assert(apaDiagStart()==-2&&deleted==1);
  startResult=0;assert(apaDiagStart()==0);assert(thread.initial_priority==0x78&&thread.stack_size>=0x2000);
  if(!setjmp(done))thread.func(NULL);
- assert(lines==20&&strstr(screen,"DIAG-10 HB:1")&&strstr(screen,"5120/6144 MiB"));
+ assert(lines==20&&strstr(screen,"DIAG-11 HB:1")&&strstr(screen,"5120/6144 MiB"));
  assert(strstr(screen,"IOP valid:")&&strstr(screen,"IO tid:8")&&strstr(screen,"CORE tid:6")&&strstr(screen,"RX tid:7"));
  assert(strstr(screen,"IO:recv calls:1"));
  assert(strstr(screen,"RING pending:")&&strstr(screen,"BD:"));
@@ -125,7 +125,7 @@ int main(void){
  createResult=4;startResult=-2;assert(apaDiagStart()==-2&&deleted==1);
  startResult=0;assert(apaDiagStart()==0);assert(thread.initial_priority==0x78&&thread.stack_size>=0x2000);
  if(!setjmp(done))thread.func(NULL);
- assert(lines==20&&strstr(screen,"DIAG-10 HB:1")&&strstr(screen,"5120/6144 MiB"));
+ assert(lines==20&&strstr(screen,"DIAG-11 HB:1")&&strstr(screen,"5120/6144 MiB"));
  assert(strstr(screen,"IOP valid:")&&strstr(screen,"IO tid:8")&&strstr(screen,"CORE tid:6")&&strstr(screen,"RX tid:7"));
  snapshotMode=1;
  if(!setjmp(done))thread.func(NULL);

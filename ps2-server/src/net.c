@@ -301,6 +301,7 @@ unsigned int __wrap_iSifSendCmd(int cmd, void *packet, int packet_size,
 
 static int g_nmRpcSvrThreadID = -1;
 static int g_nmRxThreadID = -1;
+static int g_nmRxEventSema = -1;
 static int g_nmSifHandlerID = -1;
 static unsigned char g_nmRpcSvrThreadStack[0x1000] __attribute__((aligned(16)));
 static unsigned char g_nmRxThreadStack[0x1000] __attribute__((aligned(16)));
@@ -384,7 +385,10 @@ static s32 pfsnetNetManHandleRxEvent(s32 channel)
         if (bdRd->length > 0 || bdNext->length > 0 || dchainStopped) {
             if (!g_nmIsProcessingRx && g_nmRxThreadID >= 0) {
                 g_nmIsProcessingRx = 1;
-                iWakeupThread(g_nmRxThreadID);
+                /* A semaphore retains this notification even when the IRQ
+                 * interrupts RX after EI() but before its wait. Unpatched
+                 * iWakeupThread cannot wake the currently running thread. */
+                iSignalSema(g_nmRxEventSema);
             }
         }
     }
@@ -451,7 +455,7 @@ static void pfsnetNetManRxThread(void *arg)
 
             if (!run) {
                 g_apaDiag.rxStage = APA_RX_SLEEP;
-                SleepThread();
+                WaitSema(g_nmRxEventSema);
             }
         } while (!run);
 
@@ -628,8 +632,16 @@ static void pfsnetNetManRpcThread(void *arg)
 int __wrap_NetManInitRPCServer(void)
 {
     ee_thread_t ThreadData;
+    ee_sema_t sema;
+    int result;
 
     if (!g_nmIsInitialized) {
+        memset(&sema, 0, sizeof(sema));
+        sema.init_count = 0;
+        sema.max_count = 1;
+        g_nmRxEventSema = CreateSema(&sema);
+        if (g_nmRxEventSema < 0)
+            return g_nmRxEventSema;
         ThreadData.func = &pfsnetNetManRpcThread;
         ThreadData.stack = g_nmRpcSvrThreadStack;
         ThreadData.stack_size = sizeof(g_nmRpcSvrThreadStack);
@@ -638,11 +650,19 @@ int __wrap_NetManInitRPCServer(void)
         ThreadData.attr = ThreadData.option = 0;
 
         if ((g_nmRpcSvrThreadID = CreateThread(&ThreadData)) >= 0) {
-            StartThread(g_nmRpcSvrThreadID, NULL);
-            g_nmIsInitialized = 1;
-            return 0;
+            result = StartThread(g_nmRpcSvrThreadID, NULL);
+            if (result >= 0) {
+                g_nmIsInitialized = 1;
+                return 0;
+            }
+            DeleteThread(g_nmRpcSvrThreadID);
+            g_nmRpcSvrThreadID = -1;
+        } else {
+            result = g_nmRpcSvrThreadID;
         }
-        return g_nmRpcSvrThreadID;
+        DeleteSema(g_nmRxEventSema);
+        g_nmRxEventSema = -1;
+        return result;
     }
     return 0;
 }
@@ -665,6 +685,10 @@ void __wrap_NetManDeinitRPCServer(void)
             TerminateThread(g_nmRxThreadID);
             DeleteThread(g_nmRxThreadID);
             g_nmRxThreadID = -1;
+        }
+        if (g_nmRxEventSema >= 0) {
+            DeleteSema(g_nmRxEventSema);
+            g_nmRxEventSema = -1;
         }
         g_nmIsInitialized = 0;
     }
